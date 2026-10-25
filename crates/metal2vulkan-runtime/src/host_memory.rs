@@ -382,8 +382,41 @@ pub(super) fn host_page() -> Option<u64> {
     u64::try_from(page).ok().filter(|&page| page > 0)
 }
 
+/// The host's page size on Windows: `GetSystemInfo`'s `dwPageSize` (4 KiB on x86-64), the
+/// granule `VK_EXT_external_memory_host` imports are made of. The allocation granularity
+/// (64 KiB) is not the page: placeholder views (`MapViewOfFile3`) and `VirtualAlloc2` take
+/// page-aligned ranges.
+#[cfg(windows)]
+pub(super) fn host_page() -> Option<u64> {
+    #[repr(C)]
+    struct SystemInfo {
+        processor_architecture: u16,
+        reserved: u16,
+        page_size: u32,
+        minimum_application_address: *mut std::ffi::c_void,
+        maximum_application_address: *mut std::ffi::c_void,
+        active_processor_mask: usize,
+        number_of_processors: u32,
+        processor_type: u32,
+        allocation_granularity: u32,
+        processor_level: u16,
+        processor_revision: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemInfo(info: *mut SystemInfo);
+    }
+    let mut info = std::mem::MaybeUninit::<SystemInfo>::zeroed();
+    // SAFETY: `GetSystemInfo` fills the structure it is given and cannot fail.
+    let info = unsafe {
+        GetSystemInfo(info.as_mut_ptr());
+        info.assume_init()
+    };
+    Some(u64::from(info.page_size)).filter(|&page| page > 0)
+}
+
 /// The host's page size, where the runtime knows how to ask for it: not on this system.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(super) fn host_page() -> Option<u64> {
     None
 }

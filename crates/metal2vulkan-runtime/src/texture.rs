@@ -155,7 +155,6 @@ pub(super) mod heap_two_planes;
 pub(crate) mod held_depth;
 pub(crate) mod host_copy;
 pub(super) mod kept_image;
-#[cfg(unix)]
 mod rotation;
 mod shared;
 pub(super) mod signed_depth;

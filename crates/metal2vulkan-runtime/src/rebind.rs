@@ -642,6 +642,9 @@ impl ImportHold {
             ImportHold::Held(held) => *self = ImportHold::Waiting(Arc::downgrade(held)),
             #[cfg(unix)]
             ImportHold::Waiting(_) => {}
+            // Off unix the hold has no variant: nothing is ever held.
+            #[cfg(not(unix))]
+            _ => {}
         }
     }
 

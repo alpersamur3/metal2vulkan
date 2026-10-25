@@ -3058,3 +3058,16 @@ impl Device {
         })
     }
 }
+
+/// The queue family a first move of an image over dma-buf pages acquires it for, off unix: the
+/// same choice as `dma_buf.rs`'s (which is unix-only), for the rebind branch that runs only for
+/// pages imported as dma-bufs, which never happens here.
+#[cfg(not(unix))]
+impl Device {
+    fn foreign_acquirer(&self) -> u32 {
+        match &self.shared().queue_families[..] {
+            [family] => *family,
+            _ => vk::QUEUE_FAMILY_IGNORED,
+        }
+    }
+}
