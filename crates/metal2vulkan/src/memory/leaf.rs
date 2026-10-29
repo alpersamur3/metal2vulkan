@@ -183,6 +183,16 @@ fn not_lowered() -> Error {
     Unsupported::not_implemented(Feature::Lowering(LowerFamily::Access)).into()
 }
 
+/// Whether a 16-byte leaf of AIR alignment 16 takes [`Path::Vec4`]: off. Metal on iOS binds a
+/// `constant` buffer at any multiple of 4 bytes (Apple's `setVertexBuffer:offset:atIndex:`: "In
+/// iOS, align the offset to 4 bytes"), while its compiler still marks a `float4` or `float4x4`
+/// member's loads `align 16`, so the Metal address of such a leaf is a multiple of 4 alone: iOS
+/// 26's wallpaper (`space::rasterizeBackgroundVertex` of MercuryPoster) binds its uniforms at
+/// offsets 4 past a multiple of 16, where unit `off / 16` read every matrix 4 bytes early and
+/// put every vertex out of the clip volume. [`Path::Aligned`]'s four words are exact at any
+/// multiple of 4.
+pub(crate) const VEC4_TRUSTS_AIR_ALIGNMENT: bool = false;
+
 /// How a leaf is composed from words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Path {
@@ -329,7 +339,7 @@ pub fn leaf_of(
     ) {
         return Err(not_lowered());
     }
-    let path = if bytes == 16 && align >= 16 {
+    let path = if bytes == 16 && align >= 16 && VEC4_TRUSTS_AIR_ALIGNMENT {
         Path::Vec4
     } else if align >= 4 {
         Path::Aligned

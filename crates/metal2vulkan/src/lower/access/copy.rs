@@ -344,7 +344,13 @@ fn unit_leaf(n: u32) -> Leaf {
                 lanes: 4,
             },
             bytes: 16,
-            path: Path::Vec4,
+            // Four words where a buffer endpoint's call-site `align` of 16 does not make its
+            // Metal address a multiple of 16 (`memory::leaf::VEC4_TRUSTS_AIR_ALIGNMENT`).
+            path: if crate::memory::leaf::VEC4_TRUSTS_AIR_ALIGNMENT {
+                Path::Vec4
+            } else {
+                Path::Aligned
+            },
         };
     }
     Leaf {
