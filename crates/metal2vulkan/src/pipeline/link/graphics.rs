@@ -414,6 +414,13 @@ pub fn graphics_state(
                     if blended {
                         usages.insert(FormatUsage::ColorAttachmentBlend);
                     }
+                    if blended
+                        && metal::format::ycbcr_renders(a.pixel_format)
+                        && metal::format::ycbcr_format(a.pixel_format)
+                            .is_some_and(|f| f.reads != metal::format::YCbCrReads::Codes)
+                    {
+                        return Err(Unsupported::not_implemented(Feature::Format).into());
+                    }
                     let descriptor_mask = color_write_mask(a.write_mask)?;
                     // A YCbCr attachment's store is matched for writes of its red, green and
                     // blue together (`metal::format::ycbcr_renders`); a mask of some of them is

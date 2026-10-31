@@ -161,7 +161,8 @@ pub enum FormatEmulation {
     /// which the consumer encodes into the surface's planes as the pass stores
     /// (`bind::ycbcr_store`, the encode kernel's store of every texel). Exact for an attachment
     /// a fragment function writes unblended through a mask of red, green and blue; admitted for
-    /// that usage only (no blend: the pipeline refuses one).
+    /// that usage only (no blend: the pipeline refuses one), but a code format's blend, not
+    /// measured, which iOS 26 asks of `RGB8_444_2P` soon after an app leaves the screen.
     YCbCrRendered,
     /// A pipeline's color attachment of a packed 10-bit two-plane YCbCr format whose pass is
     /// refused ([`ycbcr_pass_refused`]): `R32G32B32A32_SFLOAT`, which no pass renders into.
@@ -241,9 +242,11 @@ impl FormatEmulation {
             FormatEmulation::YCbCr => {
                 matches!(usage, U::SampledImage | U::SampledImageFilterLinear)
             }
-            FormatEmulation::YCbCrRendered | FormatEmulation::YCbCrPassRefused => {
-                usage == U::ColorAttachment
+            // A blend only of the code formats (`pipeline::link::graphics`).
+            FormatEmulation::YCbCrRendered => {
+                matches!(usage, U::ColorAttachment | U::ColorAttachmentBlend)
             }
+            FormatEmulation::YCbCrPassRefused => usage == U::ColorAttachment,
             FormatEmulation::XChannel => matches!(
                 usage,
                 U::SampledImage
@@ -1970,12 +1973,19 @@ pub fn ycbcr_writes_stored(pf: PixelFormat) -> bool {
 /// of the 10-bit formats' draws and clears over `x420`, `xf20`, `x422`, `xf22`, `x444` and `xf44`).
 /// Such an attachment renders into `R32G32B32A32_SFLOAT` ([`FormatEmulation::YCbCrRendered`]),
 /// unblended, through a mask of red, green and blue (the pipeline refuses a blend or a partial
-/// mask, `NotImplemented(Format)`). Not the `_sRGB`, code or packed formats, whose stores no rule
-/// matches yet (a packed one's pass is refused, [`ycbcr_pass_refused`]).
+/// mask, `NotImplemented(Format)`). The 4:4:4 code formats too (`RGB8_444_2P` and `RGB10_444_2P`),
+/// not measured: iOS 26 draws into `RGB8_444_2P`, and a pass stores each texel's codes as a
+/// function's write does (`bind::ycbcr_write`, green, blue and red as codes), which is what their
+/// planes hold. Not the `_sRGB`, other code or packed formats, whose stores no rule matches yet (a
+/// packed one's pass is refused, [`ycbcr_pass_refused`]).
 pub fn ycbcr_renders(pf: PixelFormat) -> bool {
     // Every such layout is held ([`ycbcr`]), whose representation asks this.
-    ycbcr_format(pf)
-        .is_some_and(|f| !f.packed && matches!(f.bits, 8 | 10) && f.reads == YCbCrReads::Converted)
+    ycbcr_format(pf).is_some_and(|f| {
+        !f.packed
+            && matches!(f.bits, 8 | 10)
+            && (f.reads == YCbCrReads::Converted
+                || (f.reads == YCbCrReads::Codes && f.subsampling == ChromaSubsampling::Chroma444))
+    })
 }
 
 /// Whether `pf` is a packed 10-bit two-plane YCbCr format this crate holds ([`ycbcr`]), whose

@@ -2563,7 +2563,9 @@ fn a_pass_renders_only_the_ycbcr_formats_whose_store_is_matched() {
             P::YCBCR84442P,
             P::YCBCR104202P,
             P::YCBCR104222P,
-            P::YCBCR104442P
+            P::YCBCR104442P,
+            P::RGB84442P,
+            P::RGB104442P
         ]
     );
     let refused: Vec<PixelFormat> = PixelFormat::ALL
@@ -2592,7 +2594,15 @@ fn a_pass_renders_only_the_ycbcr_formats_whose_store_is_matched() {
             );
             let not_implemented: Result<FormatMapping, Error> =
                 Err(Unsupported::not_implemented(Feature::Format).into());
-            assert_eq!(blended, not_implemented, "{stem} {pf:?}");
+            // The floats a pass renders into may blend, as far as the device's format does; the
+            // pipeline refuses a blend but a code format's (`pipeline::link::graphics`).
+            if ycbcr_renders(pf) {
+                if let Ok(m) = &blended {
+                    assert_eq!(m.emulation, FormatEmulation::YCbCrRendered, "{stem} {pf:?}");
+                }
+            } else {
+                assert_eq!(blended, not_implemented, "{stem} {pf:?}");
+            }
             let emulation = match (ycbcr_renders(pf), ycbcr_pass_refused(pf)) {
                 (true, false) => FormatEmulation::YCbCrRendered,
                 (false, true) => FormatEmulation::YCbCrPassRefused,

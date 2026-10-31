@@ -144,8 +144,10 @@ use std::ops::Range;
 /// range, and `xf20`, `xf22` and `xf44` the same, full range; `p420`, `p422` and `p444`, and
 /// `pf20`, `pf22` and `pf44`, the same packed three to a 32-bit word. A format reads a surface
 /// whose chroma plane holds its own: a 4:2:0 format a 4:2:2 or 4:4:4 surface's, a 4:2:2 format a
-/// 4:4:4 one's, each at the surface's rows.
-const SURFACES: [(&[u8; 4], u32, bool, YCbCrRange, ChromaSubsampling); 18] = {
+/// 4:4:4 one's, each at the surface's rows. `_RB4`, not CoreVideo's public list, is what iOS 26
+/// asks `RGB8_444_2P` (542) of soon after an app leaves the screen: 8-bit 4:4:4 by that format's codes,
+/// green in plane 0, blue and red in plane 1 (seen in the guest, not measured on a Mac).
+const SURFACES: [(&[u8; 4], u32, bool, YCbCrRange, ChromaSubsampling); 19] = {
     use ChromaSubsampling::{Chroma420 as C420, Chroma422 as C422, Chroma444 as C444};
     [
         (b"420v", 8, false, YCbCrRange::Video, C420),
@@ -154,6 +156,7 @@ const SURFACES: [(&[u8; 4], u32, bool, YCbCrRange, ChromaSubsampling); 18] = {
         (b"422f", 8, false, YCbCrRange::Full, C422),
         (b"444v", 8, false, YCbCrRange::Video, C444),
         (b"444f", 8, false, YCbCrRange::Full, C444),
+        (b"_RB4", 8, false, YCbCrRange::Full, C444),
         (b"x420", 10, false, YCbCrRange::Video, C420),
         (b"xf20", 10, false, YCbCrRange::Full, C420),
         (b"x422", 10, false, YCbCrRange::Video, C422),
