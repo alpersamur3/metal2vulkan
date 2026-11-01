@@ -834,6 +834,20 @@ struct Slot {
     generation: u64,
 }
 
+/// A texture slot whose live holder a new texture took ([`IdHold::hold`]): an argument buffer
+/// naming the ID reaches the new texture from then on, where the program may have meant the one
+/// it placed or was handed the ID before (the module docs' slots). Said in one diagnostic line
+/// ([`Device::say_slot_taken`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SlotTaken {
+    pub(super) id: u64,
+    /// Whether plain allocation handed the new texture the ID, else it was placed at it.
+    pub(super) plain: bool,
+    /// The hold serials of the texture that held the slot and of the new one.
+    pub(super) from: u64,
+    pub(super) to: u64,
+}
+
 /// A resource's ID, held until the resource is gone.
 #[derive(Debug)]
 pub(super) struct IdHold {
@@ -892,13 +906,27 @@ impl IdHold {
         }
     }
 
-    /// Make `holder`, the resource of this ID, its slot's holder.
-    pub(super) fn hold(&self, holder: Holder) {
+    /// Make `holder`, the resource of this ID, its slot's holder: the texture slot it took from
+    /// a live texture, if it did ([`SlotTaken`]).
+    pub(super) fn hold(&self, holder: Holder) -> Option<SlotTaken> {
         let mut all = lock(&self.ids);
         let generation = all.next();
         if self.space == IdSpace::Pipeline {
             all.released_pipelines.remove(&self.id);
         }
+        let taken = match all.space(self.space).slots.get(&self.id) {
+            Some(Slot {
+                holder: Holder::Texture(held),
+                serial,
+                ..
+            }) if *serial != self.serial && held.strong_count() > 0 => Some(SlotTaken {
+                id: self.id,
+                plain: self.plain,
+                from: *serial,
+                to: self.serial,
+            }),
+            _ => None,
+        };
         all.space(self.space).slots.insert(
             self.id,
             Slot {
@@ -910,6 +938,7 @@ impl IdHold {
         if self.space == IdSpace::Sampler {
             all.sampler_slot_changed();
         }
+        taken
     }
 
     /// The ID.
@@ -1255,6 +1284,26 @@ impl Device {
                 VkLimit::MaxPerStageDescriptorUpdateAfterBindSamplers,
             ),
         ])
+    }
+
+    /// Say that a new texture took the slot of a live one ([`SlotTaken`]), in one diagnostic line
+    /// (a general warning, `metal2vulkan-texture-slot-taken`). Ours: Metal says nothing.
+    pub(super) fn say_slot_taken(&self, taken: SlotTaken) {
+        let SlotTaken {
+            id,
+            plain,
+            from,
+            to,
+        } = taken;
+        let how = if plain { "plain" } else { "placed" };
+        self.diagnose(
+            "metal2vulkan-texture-slot-taken",
+            format!(
+                "metal2vulkan: texture ID {id}: a {how} texture (hold {to}) took the slot of a \
+                 live texture (hold {from}): an argument buffer naming the ID reaches the new \
+                 one [metal2vulkan-texture-slot-taken]"
+            ),
+        );
     }
 
     /// Say `text`, a general warning `code` names: through the device's message sink, else on

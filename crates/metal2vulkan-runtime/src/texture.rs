@@ -3800,11 +3800,14 @@ impl Texture {
             }
             // An `Outside` texture has no ID, so no slot (`IdHold::take`).
             if placement != IdPlacement::Outside {
-                texture
+                let taken = texture
                     .0
                     .id
                     .hold(Holder::Texture(Arc::downgrade(&texture.0)));
                 heap_sets::place(device, &texture);
+                if let Some(taken) = taken {
+                    device.say_slot_taken(taken);
+                }
             }
         }
         texture
