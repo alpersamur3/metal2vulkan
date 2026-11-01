@@ -99,6 +99,13 @@
 //!   A call holding an ID of 2^32 or more is dropped whole, silently, and a later call is the
 //!   reservation (2^32 to 2^63, alone or beside 10, for textures, sampler states and indirect
 //!   command buffers).
+//! - **Late keeps** ([`Device::keep_resource_ids`](super::Device::keep_resource_ids), ours, a
+//!   runtime extension with no Metal counterpart) are reservations of textures, sampler states
+//!   and pipeline states honoured whenever they come: the first is the reservation Metal takes,
+//!   and one once the space started keeps its IDs from plain allocation for good all the same. A
+//!   free ID leaves every free range holding it, and one handed out then is not handed out again
+//!   once its holder is gone. For a caller whose programs share one device where each had one of
+//!   its own on Metal, so that a program's reservation comes after the others' allocations.
 //! - **Limits.** A placement ([`At`](IdPlacement::At)) of [`ID_LIMIT`] or more ended Metal's
 //!   process for every kind (probes 3 and 4), and of [`PIPELINE_ID_LIMIT`] or more for pipeline
 //!   states (a probe): it is refused `Invalid`. Metal itself was unreliable above about 9000 forced
@@ -381,6 +388,13 @@ impl ResourceIds {
         self.space(space).reserve(ids)
     }
 
+    /// Ours: keep `ids` of `space` from plain allocation for good, whenever the call comes: the
+    /// space's reservation ([`ResourceIds::reserve`], true) while it takes one, else a late keep
+    /// ([`Pool::keep_late`], false).
+    pub(super) fn keep(&mut self, space: IdSpace, ids: &[ResourceId]) -> bool {
+        self.space(space).keep(ids)
+    }
+
     /// Take the sampler ID Metal's device keeps for itself as it makes its first object of a
     /// kind that keeps one (the module docs): the ID a live pipeline state's numbered device
     /// sampler has, kept now for good (a queue or a texture made after a render
@@ -519,6 +533,16 @@ impl Space {
         reserved
     }
 
+    /// Keep `ids` ([`ResourceIds::keep`]): true where it was the space's reservation.
+    fn keep(&mut self, ids: &[ResourceId]) -> bool {
+        let reserved = self.plain.reserve(ids.iter().map(|id| id.0));
+        if !reserved {
+            self.plain.keep_late(ids.iter().map(|id| id.0));
+        }
+        self.pool_size.store(self.plain.size, Ordering::Release);
+        reserved
+    }
+
     /// The ID plain allocation hands out next ([`Pool::take`]), now handed out.
     fn take_plain(&mut self) -> u64 {
         let id = self.plain.take();
@@ -558,6 +582,9 @@ pub(super) struct Pool {
     started: bool,
     /// Whether the device made the pool before anything started it ([`Pool::make`]).
     made: bool,
+    /// Ours: the IDs a late keep ([`Pool::keep_late`]) kept from plain allocation for good,
+    /// handed out then or not: one given back stays out.
+    kept: BTreeSet<u64>,
 }
 
 impl Pool {
@@ -571,6 +598,7 @@ impl Pool {
             fits: BTreeMap::new(),
             started: false,
             made: false,
+            kept: BTreeSet::new(),
         };
         pool.add(1, size);
         pool
@@ -684,6 +712,35 @@ impl Pool {
         }
     }
 
+    /// Ours ([`Device::keep_resource_ids`]): keep `ids` from plain allocation for good, whether
+    /// or not the pool started, which a reservation ([`Pool::reserve`]) is not once it did. The
+    /// pool grows past each ID, every free range holding it (overlapping ones too: a made pool's
+    /// first range) splits around it, and one handed out now stays out once given back
+    /// ([`Pool::give`]). 0, the null handle, is no ID. The caller bounds the IDs (below 2^32).
+    pub(super) fn keep_late(&mut self, ids: impl IntoIterator<Item = u64>) {
+        for id in ids.into_iter().filter(|&id| id != 0) {
+            self.started = true;
+            while id >= self.size {
+                self.grow();
+            }
+            while let Some((start, end)) = self.range_holding(id) {
+                self.remove(start, end);
+                self.add(start, id);
+                self.add(id + 1, end);
+            }
+            self.kept.insert(id);
+        }
+    }
+
+    /// A free range holding `id`, as (start, end): the one starting nearest below it first.
+    fn range_holding(&self, id: u64) -> Option<(u64, u64)> {
+        self.ranges
+            .range(..=(id, u64::MAX))
+            .rev()
+            .map(|(&range, _)| range)
+            .find(|&(_, end)| id < end)
+    }
+
     /// The ID plain allocation hands out next, now handed out: the lowest of the smallest free
     /// range, the lower range of two alike; the pool doubles where none is free. An ID that is
     /// out where overlapping ranges hold it twice is handed out again, as Metal's pool hands it
@@ -710,8 +767,12 @@ impl Pool {
 
     /// `id`, handed out, free again: it joins the free ranges either side of it, the one ending
     /// at it and the one starting past it, which change in place; with neither, it is a new
-    /// range (the type's docs).
+    /// range (the type's docs). An ID a late keep kept ([`Pool::keep_late`]) stays out.
     pub(super) fn give(&mut self, id: u64) {
+        // Ours: a late keep keeps it out (`Pool::keep_late`).
+        if self.kept.contains(&id) {
+            return;
+        }
         let below = self.ending_at(id);
         let above = self
             .ranges
@@ -948,23 +1009,8 @@ impl Device {
         ids: &[ResourceId],
     ) -> Result<(), Error> {
         const CALL: &str = "reserve_resource_ids";
-        if ids.iter().any(|id| id.0 > u64::from(u32::MAX)) {
+        if !self.check_reservation(CALL, kind, ids)? {
             return Ok(());
-        }
-        for &ResourceId(id) in ids {
-            match kind {
-                // Whatever texture is placed at it: an ID no texture array can hold.
-                ResourceIdKind::Texture => {
-                    check_limit(CALL, id, RESERVED_POOL_LIMIT)?;
-                    let [sampled, storage] = self.texture_arrays();
-                    self.check_capacity(id, sampled.max(storage))?;
-                }
-                ResourceIdKind::SamplerState => check_limit(CALL, id, RESERVED_POOL_LIMIT)?,
-                ResourceIdKind::IndirectCommandBuffer => {
-                    check_limit(CALL, id, RECORDS_RESERVED_LIMIT)?
-                }
-                ResourceIdKind::PipelineState => {}
-            }
         }
         let space = |space| lock(&self.shared().resource_ids).reserve(space, ids);
         let taken = match kind {
@@ -987,6 +1033,64 @@ impl Device {
             );
         }
         Ok(())
+    }
+
+    /// Ours, a runtime extension with no Metal counterpart: [`Device::reserve_resource_ids`]
+    /// honoured whenever the call comes (the module docs' late keeps). The first call of a kind
+    /// with an ID, before the device handed out one of it, is the reservation Metal takes; a
+    /// later one keeps its IDs of textures, sampler states or pipeline states from plain
+    /// allocation for good all the same: a free one is not handed out, and one handed out now is
+    /// not handed out again once its holder is gone. A live resource with such an ID keeps it,
+    /// and a resource placed at it then takes its slot (the module docs' slots). Indirect command
+    /// buffer IDs are reserved as [`Device::reserve_resource_ids`] reserves them. Refused, and
+    /// dropped whole, as that call's.
+    ///
+    /// For a caller whose programs share this device where each had a device of its own on
+    /// Metal: a program's reservation, the first on its own device, comes after the others'
+    /// allocations here.
+    pub fn keep_resource_ids(&self, kind: ResourceIdKind, ids: &[ResourceId]) -> Result<(), Error> {
+        const CALL: &str = "keep_resource_ids";
+        let space = match kind {
+            ResourceIdKind::Texture => IdSpace::Texture,
+            ResourceIdKind::SamplerState => IdSpace::Sampler,
+            ResourceIdKind::PipelineState => IdSpace::Pipeline,
+            ResourceIdKind::IndirectCommandBuffer => return self.reserve_resource_ids(kind, ids),
+        };
+        if !self.check_reservation(CALL, kind, ids)? {
+            return Ok(());
+        }
+        lock(&self.shared().resource_ids).keep(space, ids);
+        Ok(())
+    }
+
+    /// The limits of a reservation of `ids` of `kind` for `call`, checked
+    /// ([`Device::reserve_resource_ids`]): false where the call is dropped whole, holding an ID
+    /// of 2^32 or more.
+    fn check_reservation(
+        &self,
+        call: &'static str,
+        kind: ResourceIdKind,
+        ids: &[ResourceId],
+    ) -> Result<bool, Error> {
+        if ids.iter().any(|id| id.0 > u64::from(u32::MAX)) {
+            return Ok(false);
+        }
+        for &ResourceId(id) in ids {
+            match kind {
+                // Whatever texture is placed at it: an ID no texture array can hold.
+                ResourceIdKind::Texture => {
+                    check_limit(call, id, RESERVED_POOL_LIMIT)?;
+                    let [sampled, storage] = self.texture_arrays();
+                    self.check_capacity(id, sampled.max(storage))?;
+                }
+                ResourceIdKind::SamplerState => check_limit(call, id, RESERVED_POOL_LIMIT)?,
+                ResourceIdKind::IndirectCommandBuffer => {
+                    check_limit(call, id, RECORDS_RESERVED_LIMIT)?
+                }
+                ResourceIdKind::PipelineState => {}
+            }
+        }
+        Ok(true)
     }
 
     /// How many sampler IDs the device holds now: one for each holder of one (the module docs'

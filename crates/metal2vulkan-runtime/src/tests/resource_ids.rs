@@ -403,6 +403,63 @@ fn only_the_first_reservation_with_an_id_counts() {
     assert_eq!(got, expand(&[(1, 15), (17, 18)]));
 }
 
+/// Ours: a late keep (`Device::keep_resource_ids`) keeps its IDs from plain allocation once the
+/// space handed IDs out, where a reservation then reserves nothing; an ID handed out then stays
+/// out once given back, and the others come back as before. The first keep is the reservation.
+#[test]
+fn a_late_keep_keeps_its_ids_out_once_the_space_started() {
+    let ids = ids();
+    let one = id(&ids, IdSpace::Texture);
+    let two = id(&ids, IdSpace::Texture);
+    assert!(!ids
+        .lock()
+        .unwrap()
+        .reserve(IdSpace::Texture, &[ResourceId(3)]));
+    assert!(!ids
+        .lock()
+        .unwrap()
+        .keep(IdSpace::Texture, &[2, 3, 5, 0].map(ResourceId)));
+    let next: Vec<IdHold> = (0..3).map(|_| id(&ids, IdSpace::Texture)).collect();
+    let got: Vec<u64> = next.iter().map(|held| held.id().0).collect();
+    assert_eq!(got, [4, 6, 7]);
+    drop(two);
+    drop(one);
+    let again = id(&ids, IdSpace::Texture);
+    let after = id(&ids, IdSpace::Texture);
+    assert_eq!([again.id().0, after.id().0], [1, 8]);
+    // Past the pool: it grows, and the kept ID stays out of the new range.
+    assert!(!ids
+        .lock()
+        .unwrap()
+        .keep(IdSpace::Texture, &[ResourceId(40)]));
+    let rest: Vec<IdHold> = (0..40).map(|_| id(&ids, IdSpace::Texture)).collect();
+    assert!(rest.iter().all(|held| held.id().0 != 40));
+
+    let first = self::ids();
+    assert!(first
+        .lock()
+        .unwrap()
+        .keep(IdSpace::Sampler, &[ResourceId(1)]));
+    assert_eq!(id(&first, IdSpace::Sampler).id(), ResourceId(2));
+}
+
+/// Ours: a late keep takes an ID out of every free range holding it, overlapping ones too (a
+/// texture pool made before its reservation keeps its first range beside the reservation's).
+#[test]
+fn a_late_keep_takes_its_ids_out_of_overlapping_ranges() {
+    let ids = ids();
+    ids.lock().unwrap().make_texture_pool();
+    assert!(ids
+        .lock()
+        .unwrap()
+        .reserve(IdSpace::Texture, &[ResourceId(20)]));
+    assert!(!ids.lock().unwrap().keep(IdSpace::Texture, &[ResourceId(3)]));
+    let held: Vec<IdHold> = (0..60).map(|_| id(&ids, IdSpace::Texture)).collect();
+    assert!(held
+        .iter()
+        .all(|held| held.id().0 != 3 && held.id().0 != 20));
+}
+
 /// Visible-function tables' first pool is 32, as Metal's (2 to 4 of 1 to 5
 /// given back come back before 6, 2 to 6 of 1 to 13 before 14, and 2 to 10 of 1 to 29 after 30
 /// and 31).
