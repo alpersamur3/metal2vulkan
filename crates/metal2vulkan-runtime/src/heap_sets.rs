@@ -3,21 +3,30 @@
 //! read through its ID in an argument buffer is reached with no encoder naming it, and through a
 //! later encoder's `use_resource`).
 //!
-//! - **The texture table.** One buffer per device of [`TABLE_ENTRIES`] handle-table entries
-//!   (`bind::handle_entry`), entry `i` for resource ID `i`: `{i, i, flags}` while a live texture
-//!   holds the ID's slot (`resource_ids.rs`), its flags the texture's (`bind::handle_entry_flags`),
-//!   else `{i, 0, 0}`, the neutral element. So the table is sorted, starts with the null entry, and
-//!   maps every ID a heap array can reach, the handle search's reach (`HANDLE_TABLE_CAPACITY`,
-//!   the most any pipeline's heap arrays have; 1 MiB): a texture Metal numbers past its
-//!   placement limit after a reservation (`resource_ids.rs`) is reached too. Each command binds
-//!   it at every texture handle table of its layout (`Synthetic(HandleTable)`) over the entries
-//!   its heap arrays' count reaches ([`texture_table`]): the shader's search reads its length
-//!   from the range, and an ID past the arrays misses, announced
-//!   ([`Degradation::UnnamedTexturesPastCapacity`]).
+//! - **The texture table.** One buffer per space of texture IDs, the device's own and each texture
+//!   scope's (`resource_ids.rs`), of [`TABLE_ENTRIES`] handle-table entries
+//!   (`bind::handle_entry`), entry `i` for resource ID `i`: `{i, e, flags}` while a live texture
+//!   holds the ID's slot (`resource_ids.rs`), `e` its element of the heap arrays and its flags the
+//!   texture's (`bind::handle_entry_flags`), else `{i, 0, 0}`, the neutral element. So the table is
+//!   sorted, starts with the null entry, and maps every ID a heap array can reach, the handle
+//!   search's reach (`HANDLE_TABLE_CAPACITY`, the most any pipeline's heap arrays have; 1 MiB): a
+//!   texture Metal numbers past its placement limit after a reservation (`resource_ids.rs`) is
+//!   reached too. Each command binds its handle's table (its command buffer's queue's device
+//!   handle: a scope's handle binds the scope's) at every texture handle table of its layout
+//!   (`Synthetic(HandleTable)`) over the entries its heap arrays' count reaches
+//!   ([`texture_table`]): the shader's search reads its length from the range, and an ID past the
+//!   arrays misses, announced ([`Degradation::UnnamedTexturesPastCapacity`]). A scope's table is
+//!   made at its first such command, and kept for a later scope's once no handle of the scope is
+//!   left (no command of the scope is pending then: each holds its handle until it completes).
+//! - **Elements.** Each placed texture, of whichever space, holds one element of the heap arrays,
+//!   the lowest above 0 no other placed texture holds, from its ID's first holder until the slot
+//!   has none (a later holder of the slot takes its element): the device's table and its scopes'
+//!   share the heap sets, so an ID of one space and the same ID of another reach their own
+//!   textures.
 //! - **Heap sets.** One per set-1 layout ([`HeapSet`], which each variant of that layout holds),
 //!   shared by every command buffer. Element 0 of each array is its class's neutral (an image's,
 //!   the neutral sampler, the null function table: zeros in the table's buffer). Element `i` of
-//!   each image array holds the texture at ID `i` as the array's class takes it
+//!   each image array holds the texture of element `i` as the array's class takes it
 //!   (`bind::heap_element`: its view where it fits the class, else the neutral), written as the
 //!   texture takes the slot ([`place`]), for each set that lives then, and by a set made later
 //!   for each texture that lives then. A batch holds those writes from its first work's take
@@ -33,8 +42,8 @@
 //!   element is its shadow image's view, which holds the texels an encoder that named it last
 //!   copied in ([`Degradation::UnnamedShadowedTexture`], announced at the first command that
 //!   binds a set holding it while neither naming it nor making it resident, [`bind`]: one that
-//!   does has its shadow copied in). An element whose ID no texture holds
-//!   is never read: the table maps the ID to element 0. The argument samplers' and function
+//!   does has its shadow copied in). An element no placed texture holds
+//!   is never read: no table maps an ID to it. The argument samplers' and function
 //!   tables' elements are the commands' writes ([`bind`]), each written where the set held
 //!   another there.
 //! - **Who reads an element while it changes.** The arrays are `UPDATE_AFTER_BIND` and, where
@@ -50,7 +59,8 @@
 //!   there). A gone texture's elements turn neutral in every version no submission of its command
 //!   buffer took yet, committed or not: its set is `UPDATE_AFTER_BIND`, and nothing pending binds
 //!   it.
-//! - **Retirement.** A texture going clears its table entry. A command buffer submitted before
+//! - **Retirement.** A texture going clears its table entry and frees its element. A command
+//!   buffer submitted before
 //!   then may still read the element, so the texture's image (which holds the view) is kept
 //!   until every such command buffer completed: each command buffer that binds a heap set, or
 //!   whose host steps may, takes a [`Ticket`] as its first batch is submitted, and an image
@@ -68,7 +78,7 @@
 //!   encoded. Until it completes, a command buffer whose commands list them is counted in the
 //!   device's `sampler_tables` (`sampler.rs` announces a state made meanwhile).
 //! - **Release.** A heap set goes with the last variant of its layout and the last command buffer
-//!   that bound it; the table with the device.
+//!   that bound it; the tables with the device.
 
 use super::binding::{write_sets, Info, Write};
 use super::degradation::Degradation;
@@ -80,6 +90,7 @@ use super::memory::{Memory, MemoryClass, Placement};
 use super::pipeline::{set_needs, VariantObjects};
 use super::release;
 use super::resource::ResourceKey;
+use super::resource_ids::{Elements, ResourceIds, TextureScope};
 use super::sampler::SamplerState;
 use super::texture::{Texture, TextureShared};
 use super::tracker::{Access, Use};
@@ -97,7 +108,7 @@ use metal2vulkan::pipeline::{
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 /// The heap's set number.
 pub(super) const HEAP_SET: u32 = 1;
@@ -116,10 +127,18 @@ pub(super) type Keeper = Box<dyn Any + Send + Sync>;
 /// before its resource IDs' lock, never under it.
 #[derive(Default)]
 pub(super) struct DeviceHeaps {
-    /// By resource ID, the textures placed: each live slot's holder.
-    textures: BTreeMap<u64, Placed>,
-    /// Made at the first command that binds a texture handle table or a heap set.
+    /// By texture scope key (0 for the device's own IDs, `resource_ids.rs`) and resource ID, the
+    /// textures placed: each live slot's holder.
+    textures: BTreeMap<SlotKey, Placed>,
+    /// The heap arrays' elements the placed textures hold (the module docs).
+    elements: Elements,
+    /// The device's own texture table: made at the first command of a handle of no scope that
+    /// binds a texture handle table, or at the first heap set.
     table: Option<Table>,
+    /// The texture scopes whose textures were placed or whose commands bound a table, by key.
+    scopes: BTreeMap<u64, Scope>,
+    /// The tables of scopes no handle is left of, each kept for a later scope's.
+    spare: Vec<Table>,
     /// The live heap sets, by key ([`HeapSet`]).
     sets: BTreeMap<u64, SetEntry>,
     /// The live heap sets by layout, so the variants of one layout share one.
@@ -137,12 +156,25 @@ pub(super) struct DeviceHeaps {
     deferred: VecDeque<Slots>,
 }
 
+/// A texture slot: its texture scope's key (0 for the device's own IDs) and its resource ID.
+type SlotKey = (u64, u64);
+
+/// A texture scope's place in the heap (`resource_ids.rs`): its IDs, its handles (held by none),
+/// and its texture table, made at the first command of the scope that binds one.
+struct Scope {
+    ids: Weak<Mutex<ResourceIds>>,
+    handle: Weak<TextureScope>,
+    table: Option<Table>,
+}
+
 /// A texture the table and the heap sets hold: its slot's generation and hold serial when it
-/// was written, its table entry's flags, and the texture (not held: its ID stays the program's
-/// to release; upgraded only where the caller drops it once the lock is free).
+/// was written, its element and table entry's flags, and the texture (not held: its ID stays the
+/// program's to release; upgraded only where the caller drops it once the lock is free).
 struct Placed {
     generation: u64,
     serial: u64,
+    /// Its element of the heap arrays (the module docs).
+    element: u32,
     flags: u32,
     /// Whether a heap write stores the device's conversion of a NaN in it ([`NanResidue::of`]).
     residue: [bool; 2],
@@ -298,13 +330,18 @@ impl Table {
             table.destroy(raw, &mut lock(&shared.memory));
             return Err(error);
         }
-        for id in 0..u64::from(TABLE_ENTRIES) {
-            table.put(id, 0, 0);
-        }
+        table.reset();
         let start = table.start()?;
         // SAFETY: the null table's words lie inside the placement, which nothing reads yet.
         unsafe { std::ptr::write_bytes(start.add(TABLE_BYTES as usize), 0, null as usize) };
         Ok(table)
+    }
+
+    /// Every entry the neutral's: no command binds the table.
+    fn reset(&self) {
+        for id in 0..u64::from(TABLE_ENTRIES) {
+            self.put(id, 0, 0);
+        }
     }
 
     /// The host address of the table's first byte.
@@ -352,25 +389,101 @@ impl Table {
 }
 
 impl DeviceHeaps {
-    /// Destroy the texture table, freeing its memory into `memory`: the device is idle.
+    /// Destroy the texture tables, freeing their memory into `memory`: the device is idle.
     pub(super) fn destroy(&self, raw: &ash::Device, memory: &mut Memory) {
-        if let Some(table) = &self.table {
+        let scopes = self
+            .scopes
+            .values()
+            .filter_map(|scope| scope.table.as_ref());
+        for table in self.table.iter().chain(scopes).chain(&self.spare) {
             table.destroy(raw, memory);
         }
     }
 
-    /// The texture table of `device`, made at its first use.
+    /// The device's own texture table, made at its first use.
     fn table(&mut self, device: &Device) -> Result<&Table, Error> {
         if self.table.is_none() {
             let table = Table::make(device)?;
-            for (&id, placed) in &self.textures {
-                table.put(id, id as u32, placed.flags);
+            for (&(_, id), placed) in self.textures.range(scope_keys(0)) {
+                table.put(id, placed.element, placed.flags);
             }
             self.table = Some(table);
         }
         self.table
             .as_ref()
             .ok_or_else(|| internal("a texture table not made"))
+    }
+
+    /// The texture table of texture scope `scope`, made at its first use (a spare one where
+    /// one is kept), holding the scope's placed textures.
+    fn scope_table(&mut self, device: &Device, scope: &Arc<TextureScope>) -> Result<&Table, Error> {
+        let key = scope.key;
+        if self.scopes.get(&key).is_none_or(|of| of.table.is_none()) {
+            self.prune();
+            let table = match self.spare.pop() {
+                Some(table) => {
+                    table.reset();
+                    table
+                }
+                None => Table::make(device)?,
+            };
+            for (&(_, id), placed) in self.textures.range(scope_keys(key)) {
+                table.put(id, placed.element, placed.flags);
+            }
+            let of = self.scopes.entry(key).or_insert_with(|| Scope {
+                ids: Arc::downgrade(&scope.ids),
+                handle: Weak::new(),
+                table: None,
+            });
+            of.handle = Arc::downgrade(scope);
+            of.table = Some(table);
+        }
+        self.scopes
+            .get(&key)
+            .and_then(|of| of.table.as_ref())
+            .ok_or_else(|| internal("a texture scope's table not made"))
+    }
+
+    /// Keep the tables of the scopes no handle is left of for later scopes: no command of such a
+    /// scope can bind its table any more, and none pending does (each holds its command
+    /// buffer's handle until it completes). Forget a scope with no table and no IDs left (its
+    /// textures, which hold its IDs, are gone, so none is placed).
+    fn prune(&mut self) {
+        let spare = &mut self.spare;
+        self.scopes.retain(|_, scope| {
+            if scope.handle.strong_count() == 0 {
+                spare.extend(scope.table.take());
+            }
+            scope.table.is_some() || scope.ids.strong_count() > 0
+        });
+    }
+
+    /// Note texture scope `key`, whose IDs are `ids`, as one whose textures may be placed (the
+    /// device's own, 0, needs none).
+    fn note_scope(&mut self, key: u64, ids: &Arc<Mutex<ResourceIds>>) {
+        if key != 0 {
+            self.scopes.entry(key).or_insert_with(|| Scope {
+                ids: Arc::downgrade(ids),
+                handle: Weak::new(),
+                table: None,
+            });
+        }
+    }
+
+    /// The IDs of texture scope `key` (0 for the device's own), while they live.
+    fn scope_ids(&self, device: &Device, key: u64) -> Option<Arc<Mutex<ResourceIds>>> {
+        match key {
+            0 => Some(Arc::clone(&device.shared().resource_ids)),
+            _ => self.scopes.get(&key)?.ids.upgrade(),
+        }
+    }
+
+    /// The texture table of texture scope `key` (0 for the device's own), where it was made.
+    fn table_of(&self, key: u64) -> Option<&Table> {
+        match key {
+            0 => self.table.as_ref(),
+            _ => self.scopes.get(&key)?.table.as_ref(),
+        }
     }
 
     /// Write `slots` ([`sync`]): the slots that failed, each with its error, their entries the
@@ -382,46 +495,51 @@ impl DeviceHeaps {
         held: &mut Vec<Texture>,
         notes: &mut Notes,
     ) -> Vec<(u64, Error)> {
-        let (ids, force): (Vec<u64>, bool) = match slots {
-            Slots::Changed(id) => (vec![id], false),
+        let (keys, force): (Vec<SlotKey>, bool) = match slots {
+            Slots::Changed(key) => (vec![key], false),
             Slots::All => (self.textures.keys().copied().collect(), true),
-            Slots::Over(key) => {
+            Slots::Over(bytes) => {
                 let over = self.textures.iter();
-                let over = over.filter(|(_, placed)| placed.bytes == Some(key));
-                (over.map(|(&id, _)| id).collect(), true)
+                let over = over.filter(|(_, placed)| placed.bytes == Some(bytes));
+                (over.map(|(&key, _)| key).collect(), true)
             }
         };
         if force {
-            device.shared().counts.heap_slots_rewritten(ids.len());
+            device.shared().counts.heap_slots_rewritten(keys.len());
         }
         let mut failed = Vec::new();
-        for id in ids {
-            if let Err(error) = self.sync(device, id, force, held, notes) {
-                let cleared = self.clear(device, id);
-                failed.push((id, cleared.err().unwrap_or(error)));
+        for key in keys {
+            // A slot that fails is cleared as it fails.
+            if let Err(error) = self.sync(device, key, force, held, notes) {
+                failed.push((key.1, error));
             }
         }
         failed
     }
 
-    /// Write texture slot `id` into the table and every heap set where its holder changed since
-    /// (whatever changed where `force`, a rebind's): its holder's elements, or the neutral's entry where
-    /// it has none. The holder goes to `held`, to drop once the lock is free.
+    /// Write texture slot `key` into its scope's table and every heap set where its holder
+    /// changed since (whatever changed where `force`, a rebind's): its holder's elements, or the
+    /// neutral's entry where it has none. The holder goes to `held`, to drop once the lock is
+    /// free. A slot whose write fails is cleared.
     fn sync(
         &mut self,
         device: &Device,
-        id: u64,
+        key: SlotKey,
         force: bool,
         held: &mut Vec<Texture>,
         notes: &mut Notes,
     ) -> Result<(), Error> {
+        let (scope, id) = key;
         if id == 0 || id >= u64::from(TABLE_ENTRIES) {
             return Ok(());
         }
-        let (generation, holder) = lock(&device.shared().resource_ids).texture(id);
+        let Some(ids) = self.scope_ids(device, scope) else {
+            return self.clear(device, key);
+        };
+        let (generation, holder) = lock(&ids).texture(id);
         let unchanged = self
             .textures
-            .get(&id)
+            .get(&key)
             .is_some_and(|placed| placed.generation == generation);
         if unchanged && !force {
             return Ok(());
@@ -430,7 +548,7 @@ impl DeviceHeaps {
             let texture = Texture::upgrade(&weak)?;
             Some((serial, weak, texture))
         }) else {
-            return self.clear(device, id);
+            return self.clear(device, key);
         };
         // The holder may be a texture's last handle: it goes once the lock is free.
         held.push(texture.clone());
@@ -438,25 +556,29 @@ impl DeviceHeaps {
         let flags = handle_entry_flags(&facts);
         let residue = NanResidue::of(&facts);
         let bytes = texture.bytes_key();
-        // The neutral's entry until every set holds the texture.
-        if let Some(table) = &self.table {
+        // The neutral's entry until every set holds the texture, at the element the slot's last
+        // holder had, else at a new one.
+        if let Some(table) = self.table_of(scope) {
             table.put(id, 0, 0);
         }
-        self.unplace(device, id);
-        for entry in self.sets.values_mut() {
-            let (writes, shadow) = texture_writes(device, &entry.images, id, &texture, notes)?;
-            entry.write(device, writes)?;
-            entry.shadow(id, &texture, shadow);
+        let element = match self.unplace(device, key) {
+            Some(element) => element,
+            None => u32::try_from(self.elements.take()).unwrap_or(u32::MAX),
+        };
+        if let Err(error) = self.write_texture(device, key, element, &texture, notes) {
+            let cleared = self.clear_at(device, key, Some(element));
+            return Err(cleared.err().unwrap_or(error));
         }
-        if let Some(table) = &self.table {
-            table.put(id, id as u32, flags);
+        if let Some(table) = self.table_of(scope) {
+            table.put(id, element, flags);
         }
         device.shared().heap_nan_residue.add(residue);
         self.textures.insert(
-            id,
+            key,
             Placed {
                 generation,
                 serial,
+                element,
                 flags,
                 residue,
                 bytes,
@@ -467,26 +589,57 @@ impl DeviceHeaps {
         Ok(())
     }
 
-    /// Forget the texture placed at ID `id`, and its count in the device's [`NanResidue`].
-    fn unplace(&mut self, device: &Device, id: u64) {
-        if let Some(placed) = self.textures.remove(&id) {
-            device.shared().heap_nan_residue.remove(placed.residue);
+    /// Write `texture`, the holder of slot `key`, at `element` of every heap set.
+    fn write_texture(
+        &mut self,
+        device: &Device,
+        key: SlotKey,
+        element: u32,
+        texture: &Texture,
+        notes: &mut Notes,
+    ) -> Result<(), Error> {
+        for entry in self.sets.values_mut() {
+            let (writes, shadow) =
+                texture_writes(device, &entry.images, element, key.1, texture, notes)?;
+            entry.write(device, writes)?;
+            entry.shadow(element, key, texture, shadow);
         }
+        Ok(())
     }
 
-    /// Clear ID `id`: the neutral's entry, no element of it kept for a version made later, and
-    /// the neutral at it in each version a command buffer has yet to commit (the module docs).
-    fn clear(&mut self, device: &Device, id: u64) -> Result<(), Error> {
-        self.unplace(device, id);
-        for entry in self.sets.values_mut() {
-            entry.shadows.remove(&id);
-        }
-        if let Some(table) = &self.table {
+    /// Forget the texture placed at slot `key`, and its count in the device's [`NanResidue`]:
+    /// its element, still held.
+    fn unplace(&mut self, device: &Device, key: SlotKey) -> Option<u32> {
+        let placed = self.textures.remove(&key)?;
+        device.shared().heap_nan_residue.remove(placed.residue);
+        Some(placed.element)
+    }
+
+    /// Clear slot `key`: the neutral's entry, its element free again, no element of it kept for a
+    /// version made later, and the neutral at it in each version a command buffer has yet to
+    /// commit (the module docs).
+    fn clear(&mut self, device: &Device, key: SlotKey) -> Result<(), Error> {
+        let element = self.unplace(device, key);
+        self.clear_at(device, key, element)
+    }
+
+    /// [`DeviceHeaps::clear`] of slot `key`, unplaced, which held `element`, if any.
+    fn clear_at(
+        &mut self,
+        device: &Device,
+        (scope, id): SlotKey,
+        element: Option<u32>,
+    ) -> Result<(), Error> {
+        if let Some(table) = self.table_of(scope) {
             table.put(id, 0, 0);
         }
-        let Ok(element) = u32::try_from(id) else {
+        let Some(element) = element else {
             return Ok(());
         };
+        self.elements.give(u64::from(element));
+        for entry in self.sets.values_mut() {
+            entry.shadows.remove(&element);
+        }
         for entry in self.sets.values_mut() {
             for array in &entry.images {
                 entry.written.remove(&(array.binding, element));
@@ -520,6 +673,8 @@ impl DeviceHeaps {
         held: &mut Vec<Texture>,
         notes: &mut Notes,
     ) -> Result<Arc<HeapSet>, Error> {
+        // The set is every scope's: it keeps no scope's table.
+        let device = &device.unscoped();
         let needs = set_needs(layout)?;
         let raw_layout = Arc::new(RawLayout::create(device, layout)?);
         let key = self.next_set;
@@ -580,12 +735,14 @@ impl DeviceHeaps {
         };
         entry.write(device, neutrals)?;
         let mut writes = Vec::new();
-        for (&id, placed) in &self.textures {
+        for (&key, placed) in &self.textures {
             if let Some(texture) = Texture::upgrade(&placed.texture) {
                 held.push(texture.clone());
-                let (placed, shadow) = texture_writes(device, &entry.images, id, &texture, notes)?;
+                let element = placed.element;
+                let (placed, shadow) =
+                    texture_writes(device, &entry.images, element, key.1, &texture, notes)?;
                 writes.extend(placed);
-                entry.shadow(id, &texture, shadow);
+                entry.shadow(element, key, &texture, shadow);
                 notes.placed(&texture, true);
             }
         }
@@ -645,11 +802,11 @@ struct SetEntry {
     /// Every element written, by `(binding, element)`, but those of textures gone: what a
     /// command buffer's own version holds as it is made.
     written: BTreeMap<(u32, u32), Written>,
-    /// By resource ID, the shadowed textures whose shadow image's view an array of the set
-    /// holds, with the key a command's uses name each by (`Texture::bound_use`): a command that
-    /// binds the set and neither names one nor makes it resident is announced
-    /// (`Degradation::UnnamedShadowedTexture`).
-    shadows: BTreeMap<u64, ResourceKey>,
+    /// By element, the shadowed textures whose shadow image's view an array of the set holds,
+    /// each with its slot and the key a command's uses name it by (`Texture::bound_use`): a
+    /// command of its scope that binds the set and neither names one nor makes it resident is
+    /// announced (`Degradation::UnnamedShadowedTexture`).
+    shadows: BTreeMap<u32, (SlotKey, ResourceKey)>,
 }
 
 /// An element a heap set holds ([`HeapWrite`]).
@@ -662,15 +819,16 @@ struct Written {
 }
 
 impl SetEntry {
-    /// Note texture `texture` at ID `id` among the shadowed textures the set holds a view of
-    /// where `shadow` (its arrays' writes hold its shadow image's view), else not.
-    fn shadow(&mut self, id: u64, texture: &Texture, shadow: bool) {
+    /// Note texture `texture` of slot `slot` at element `element` among the shadowed textures
+    /// the set holds a view of where `shadow` (its arrays' writes hold its shadow image's view),
+    /// else not.
+    fn shadow(&mut self, element: u32, slot: SlotKey, texture: &Texture, shadow: bool) {
         match shadow {
             true => {
                 let key = texture.bound_use(Access::NONE, Access::NONE).key;
-                self.shadows.insert(id, key)
+                self.shadows.insert(element, (slot, key))
             }
-            false => self.shadows.remove(&id),
+            false => self.shadows.remove(&element),
         };
     }
 
@@ -787,12 +945,13 @@ fn image_info(view: vk::ImageView) -> Info {
     )
 }
 
-/// The writes of texture `texture`, at ID `id`, into `arrays`: element `id` of each, which it
-/// holds as the array's class takes it (the module docs). An ID past an array's count is left
-/// out, noted. With whether an element is its shadow image's view.
+/// The writes of texture `texture`, at ID `id`, into `arrays`: element `element` of each, which
+/// it holds as the array's class takes it (the module docs). An element past an array's count is
+/// left out, noted. With whether an element is its shadow image's view.
 fn texture_writes(
     device: &Device,
     arrays: &[ImageArray],
+    element: u32,
     id: u64,
     texture: &Texture,
     notes: &mut Notes,
@@ -800,13 +959,10 @@ fn texture_writes(
     let mut writes = Vec::with_capacity(arrays.len());
     let mut shadow = false;
     for array in arrays {
-        let element = match u32::try_from(id) {
-            Ok(element) if element < array.count => element,
-            _ => {
-                notes.past = Some((id, array.count));
-                continue;
-            }
-        };
+        if element >= array.count {
+            notes.past_element = Some((id, element, array.count));
+            continue;
+        }
         let (info, shadowed) = texture_info(device, array, texture, notes)?;
         shadow |= shadowed;
         writes.push(HeapWrite {
@@ -868,6 +1024,8 @@ struct Notes {
     shadowed: Option<u64>,
     /// An ID past an array's count, and the count.
     past: Option<(u64, u32)>,
+    /// A texture's ID and element, its element past an array's count, and the count.
+    past_element: Option<(u64, u32, u32)>,
     /// The elements a command buffer's own version of a set was made with.
     copied: Option<usize>,
     /// A texture a set holds whose blocks a carrier holds for copies (`pvrtc.rs`).
@@ -922,6 +1080,18 @@ impl Notes {
                     format!("texture at resource ID {id}"),
                     format!(
                         "a pipeline's set-1 heap arrays hold {count} elements, which the ID is past"
+                    ),
+                )
+            });
+        }
+        if let Some((id, element, count)) = self.past_element {
+            device.degrade(Degradation::UnnamedTexturesPastCapacity, || {
+                (
+                    format!("texture at resource ID {id}"),
+                    format!(
+                        "a pipeline's set-1 heap arrays hold {count} elements, which the \
+                         texture's element {element} is past (more textures are placed than they \
+                         hold)"
                     ),
                 )
             });
@@ -1110,13 +1280,17 @@ pub(crate) fn heap_set(
 /// heap set (the module docs). A failure to write it leaves the ID's entry the neutral's,
 /// announced.
 pub(super) fn place(device: &Device, texture: &Texture) {
-    sync(device, Slots::Changed(texture.gpu_resource_id().0));
+    let (scope, ids) = texture.id_scope();
+    if scope != 0 {
+        lock(&device.shared().heaps).note_scope(scope, ids);
+    }
+    sync(device, Slots::Changed((scope, texture.gpu_resource_id().0)));
 }
 
 /// The texture slots a [`sync`] writes.
 enum Slots {
     /// One, where its holder changed since it was written.
-    Changed(u64),
+    Changed(SlotKey),
     /// Every live texture's.
     All,
     /// Those of the live textures whose images and texel views lie in the bytes of the buffer of
@@ -1194,6 +1368,11 @@ impl Drop for HeldSlots {
     }
 }
 
+/// The slots of texture scope `key` (0 for the device's own IDs), in ID order.
+fn scope_keys(key: u64) -> std::ops::RangeInclusive<SlotKey> {
+    (key, 0)..=(key, u64::MAX)
+}
+
 /// Announce that writing the heap elements of texture slot `id` failed with `error`: its entry
 /// is the neutral's.
 fn failed_write(device: &Device, id: u64, error: &Error) {
@@ -1214,6 +1393,16 @@ pub(super) fn tickets_out(device: &Device) -> bool {
 /// Write every live texture's elements again: a change of storage form swapped images in
 /// (`texture/storage_form.rs`) while no command buffer that may read the elements is pending.
 pub(super) fn renew(device: &Device) {
+    {
+        // The device's own slots changed generation already (`texture/storage_form.rs`); the
+        // scopes' change theirs here.
+        let heaps = lock(&device.shared().heaps);
+        for scope in heaps.scopes.values() {
+            if let Some(ids) = scope.ids.upgrade() {
+                lock(&ids).renew_textures();
+            }
+        }
+    }
     sync(device, Slots::All);
 }
 
@@ -1228,18 +1417,19 @@ pub(super) fn renew_over(device: &Device, key: ResourceKey) {
     sync(device, Slots::Over(key));
 }
 
-/// A program's texture at `id`, of hold serial `serial`, went: its entry is the neutral's where
-/// it held the slot, and `keeper` (what keeps its image) waits for the command buffers that may
-/// read it (the module docs).
-pub(super) fn gone(device: &Device, id: u64, serial: u64, keeper: Option<Keeper>) {
+/// A program's texture at `id` of texture scope `scope` (0 for the device's own IDs), of hold
+/// serial `serial`, went: its entry is the neutral's and its element free where it held the slot,
+/// and `keeper` (what keeps its image) waits for the command buffers that may read it (the module
+/// docs).
+pub(super) fn gone(device: &Device, scope: u64, id: u64, serial: u64, keeper: Option<Keeper>) {
     let (freed, cleared) = {
         let mut heaps = lock(&device.shared().heaps);
         let held = heaps
             .textures
-            .get(&id)
+            .get(&(scope, id))
             .is_some_and(|placed| placed.serial == serial);
         let cleared = match held {
-            true => heaps.clear(device, id),
+            true => heaps.clear(device, (scope, id)),
             false => Ok(()),
         };
         (
@@ -1390,7 +1580,8 @@ pub(super) struct TextureTable {
 }
 
 /// The texture table a command of `layout` binds at its texture handle tables, over the entries
-/// its heap arrays' count reaches: `None` for a layout without one.
+/// its heap arrays' count reaches: `None` for a layout without one. The table of `device`'s
+/// texture scope, the command buffer's handle's, else the device's own (the module docs).
 pub(super) fn texture_table(
     device: &Device,
     layout: &PipelineLayout,
@@ -1421,14 +1612,18 @@ pub(super) fn texture_table(
         .and_then(|set| set.bindings.iter().map(|b| b.count).min())
         .unwrap_or(TABLE_ENTRIES);
     let entries = capacity.min(TABLE_ENTRIES);
+    let scope = device.texture_scope();
     let mut heaps = lock(&device.shared().heaps);
     let past = heaps
         .textures
-        .keys()
+        .range(scope_keys(scope.map_or(0, |scope| scope.key)))
         .next_back()
-        .copied()
+        .map(|(&(_, id), _)| id)
         .filter(|&id| id >= u64::from(entries));
-    let info = heaps.table(device)?.entries(entries);
+    let info = match scope {
+        Some(scope) => heaps.scope_table(device, scope)?.entries(entries),
+        None => heaps.table(device)?.entries(entries),
+    };
     drop(heaps);
     if let Some(id) = past {
         Notes {
@@ -1485,12 +1680,13 @@ pub(super) fn bind(
         // shadow through the ID, which the command's copies leave as the last encoder that named
         // it copied it (Metal's own non-resident read is undefined). One its uses name has its
         // shadow copied in (`shadow::shadow_uses`, compute's and render's alike).
+        let scope = device.texture_scope().map_or(0, |scope| scope.key);
         notes.shadowed = uses.and_then(|uses| {
             entry
                 .shadows
-                .iter()
-                .find(|(_, key)| !uses.iter().any(|used| used.key == **key))
-                .map(|(&id, _)| id)
+                .values()
+                .find(|((of, _), key)| *of == scope && !uses.iter().any(|used| used.key == *key))
+                .map(|&((_, id), _)| id)
         });
         // The shared version, or the command buffer's own, made as it first binds the set.
         let own = heap.versions.iter().find(|v| v.key == set.key).cloned();

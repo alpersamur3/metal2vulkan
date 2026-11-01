@@ -93,7 +93,7 @@ use super::pvrtc::{
     cpu_order_of_rows, holds_blocks, image_block_extent, image_region, is_pvrtc, rows_of_cpu_order,
 };
 use super::resource::{Identity, ObjectId, ResourceKey};
-use super::resource_ids::{Holder, IdHold, IdPlacement, IdSpace, ResourceId};
+use super::resource_ids::{Holder, IdHold, IdPlacement, IdSpace, ResourceId, ResourceIds};
 use super::shadow::ShadowCopies;
 use super::shadow_copy_back::{self, with_word_view, WordView};
 use super::sharing::Sharing;
@@ -398,7 +398,7 @@ impl Drop for TextureShared {
                     }
                     Storage::Texels(texels) => (texels.buffer.device(), None),
                 };
-            heap_sets::gone(device, id, self.id.serial(), keeper);
+            heap_sets::gone(device, self.id.scope().0, id, self.id.serial(), keeper);
         }
         // No lock is held: the token goes with no runtime lock held.
         let last = self
@@ -3750,7 +3750,13 @@ impl Texture {
         parent: Option<Texture>,
         id_use: IdUse,
     ) -> Texture {
-        let ids = &device.shared().resource_ids;
+        // A view's ID is of its parent's space, whichever handle its storage is of (an opened
+        // shared texture's is the opener's); any other texture's of the handle's
+        // (`Device::with_own_texture_ids`).
+        let ids = match &parent {
+            Some(parent) => parent.0.id.scope().1,
+            None => device.texture_ids(),
+        };
         let id = match id_use {
             IdUse::Program(placement) => IdHold::take(ids, IdSpace::Texture, placement),
             IdUse::Runtime => IdHold::internal(ids, IdSpace::Texture),
@@ -4511,6 +4517,12 @@ impl Texture {
     /// view has its own.
     pub fn gpu_resource_id(&self) -> ResourceId {
         self.0.id.id()
+    }
+
+    /// The key of the texture scope its ID is of (0 for the device's own IDs), and the IDs it is
+    /// among (`resource_ids.rs`).
+    pub(super) fn id_scope(&self) -> (u64, &Arc<Mutex<ResourceIds>>) {
+        self.0.id.scope()
     }
 
     /// `isSparse`: the texture was made from a sparse heap (a view of such a texture is sparse

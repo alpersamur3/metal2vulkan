@@ -67,7 +67,7 @@ use super::mipmap_scratch::MipmapScratch;
 use super::owned_kernel::OwnedKernels;
 use super::render_state::{depth_bias_command, DepthBiasCommand, DepthRanges};
 use super::render_target::KeptRenderPasses;
-use super::resource_ids::{ResourceIds, SamplerIdReads};
+use super::resource_ids::{ResourceIds, SamplerIdReads, TextureScope};
 use super::sample_planes::PlanesObjects;
 use super::sampler::{SamplerCount, SamplerKey, SamplerShared};
 use super::scheduler::Scheduler;
@@ -95,14 +95,17 @@ use std::time::Instant;
 use submit::{Internal, OwnTimeline};
 
 /// A Metal device (`MTLDevice`) on a Vulkan device. Cheap to clone (a retain); `Send + Sync`.
+/// A handle may be one of a texture scope ([`Device::with_own_texture_ids`]): its textures take
+/// their resource IDs from the scope's space, and it is the device all the same.
 #[derive(Clone)]
-pub struct Device(Arc<DeviceShared>);
+pub struct Device(Arc<DeviceShared>, Option<Arc<TextureScope>>);
 
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Device")
             .field("name", &self.0.properties.name)
             .field("registry_id", &self.registry_id())
+            .field("texture_scope", &self.1.as_ref().map(|scope| scope.key))
             .finish()
     }
 }
@@ -821,9 +824,26 @@ impl Device {
         crate::memory::keep_room(&shared.memory, shared.vk(), &shared.counts);
     }
 
-    /// Whether `other` is this device (the same handle, not merely the same physical device).
+    /// Whether `other` is this device (the same handle, not merely the same physical device; a
+    /// handle of a texture scope is its device's).
     pub(super) fn same(&self, other: &Device) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The device's handle of texture scope `scope` (`resource_ids.rs`).
+    pub(super) fn scoped(&self, scope: Arc<TextureScope>) -> Device {
+        Device(Arc::clone(&self.0), Some(scope))
+    }
+
+    /// The handle's texture scope, `None` for the device's own texture IDs.
+    pub(super) fn texture_scope(&self) -> Option<&Arc<TextureScope>> {
+        self.1.as_ref()
+    }
+
+    /// The device's handle of no texture scope: for an object of every scope's, which keeps no
+    /// scope's texture table (`heap_sets.rs`).
+    pub(super) fn unscoped(&self) -> Device {
+        Device(Arc::clone(&self.0), None)
     }
 
     /// Whether the device was lost.
@@ -1651,7 +1671,7 @@ impl Device {
         if !moltenvk {
             (shared.scheduler).wait_on_gpu(Functions::clone(&shared.functions), shared.nudge);
         }
-        let device = Device(shared);
+        let device = Device(shared, None);
         // The pages its replays held last go on its handler threads (`recorder`).
         if let Some(recorder) = device.shared().recorder() {
             recorder.set_elsewhere(device.elsewhere());

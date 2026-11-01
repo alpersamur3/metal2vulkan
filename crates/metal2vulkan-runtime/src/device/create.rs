@@ -1344,7 +1344,7 @@ impl Made {
             .iter()
             .find(|(of, _)| *of == physical)
             .and_then(|(_, device)| device.upgrade())
-            .map(Device)
+            .map(|shared| Device(shared, None))
     }
 }
 

@@ -106,6 +106,18 @@
 //!   free ID leaves every free range holding it, and one handed out then is not handed out again
 //!   once its holder is gone. For a caller whose programs share one device where each had one of
 //!   its own on Metal, so that a program's reservation comes after the others' allocations.
+//! - **Texture scopes** ([`Device::with_own_texture_ids`](super::Device::with_own_texture_ids),
+//!   ours, a runtime extension with no Metal counterpart). A handle of the device whose textures
+//!   take their IDs from a texture space of their own ([`TextureScope`]), as a program's took them
+//!   from its own Metal device: for a caller whose programs share one device, so that one
+//!   program's placements and plain IDs never meet another's live textures (a late keep cannot
+//!   free an ID another program's texture holds). The scope's space is numbered, reserved and kept
+//!   as the device's, and its commands reach a texture ID through a texture table of the scope's
+//!   own (`heap_sets.rs`). Sampler states, pipeline states, visible-function tables and indirect
+//!   command buffers keep the device's spaces. The device makes its texture pool with its first
+//!   queue (G331 above); a scope's pool is never made, so the scope's first reservation is the one
+//!   Metal takes on a device with no queue yet, and no ID is handed out twice there: G331 is
+//!   Metal's defect, not copied into a space Metal does not have.
 //! - **Limits.** A placement ([`At`](IdPlacement::At)) of [`ID_LIMIT`] or more ended Metal's
 //!   process for every kind (probes 3 and 4), and of [`PIPELINE_ID_LIMIT`] or more for pipeline
 //!   states (a probe): it is refused `Invalid`. Metal itself was unreliable above about 9000 forced
@@ -275,9 +287,12 @@ pub(super) enum StateKind {
     Render,
 }
 
-/// One device's resource IDs.
+/// One device's resource IDs, or one texture scope's ([`TextureScope`], whose texture space alone
+/// is used).
 #[derive(Debug)]
 pub(super) struct ResourceIds {
+    /// The key of the texture scope whose IDs these are, 0 for the device's own.
+    scope: u64,
     textures: Space,
     samplers: Space,
     function_tables: Space,
@@ -325,6 +340,7 @@ impl Default for ResourceIds {
     /// Every space with nothing handed out, reserved or held.
     fn default() -> ResourceIds {
         ResourceIds {
+            scope: 0,
             textures: Space::new(IdSpace::Texture),
             samplers: Space::new(IdSpace::Sampler),
             function_tables: Space::new(IdSpace::FunctionTable),
@@ -343,6 +359,14 @@ impl Default for ResourceIds {
 }
 
 impl ResourceIds {
+    /// The IDs of texture scope `key`, with nothing handed out, reserved or held.
+    pub(super) fn of_scope(key: u64) -> ResourceIds {
+        ResourceIds {
+            scope: key,
+            ..ResourceIds::default()
+        }
+    }
+
     fn space(&mut self, space: IdSpace) -> &mut Space {
         match space {
             IdSpace::Texture => &mut self.textures,
@@ -798,17 +822,17 @@ impl Pool {
     }
 }
 
-/// The sampler states' set-1 elements ([`ElementHold`]): every element up to `highest` that is
-/// not free is held.
+/// Elements of set-1 arrays, the lowest free first: the sampler states' ([`ElementHold`]), and
+/// the placed textures' (`heap_sets.rs`). Every element up to `highest` that is not free is held.
 #[derive(Debug, Default)]
-struct Elements {
+pub(super) struct Elements {
     highest: u64,
     free: BTreeSet<u64>,
 }
 
 impl Elements {
     /// The lowest element above 0 not held, now held.
-    fn take(&mut self) -> u64 {
+    pub(super) fn take(&mut self) -> u64 {
         if let Some(n) = self.free.pop_first() {
             return n;
         }
@@ -817,7 +841,7 @@ impl Elements {
     }
 
     /// `n`, held, free again; the top shrinks past every free element.
-    fn give(&mut self, n: u64) {
+    pub(super) fn give(&mut self, n: u64) {
         self.free.insert(n);
         while self.highest > 0 && self.free.remove(&self.highest) {
             self.highest -= 1;
@@ -840,6 +864,8 @@ struct Slot {
 /// ([`Device::say_slot_taken`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SlotTaken {
+    /// The texture scope of the ID ([`TextureScope`]), 0 for the device's own.
+    pub(super) scope: u64,
     pub(super) id: u64,
     /// Whether plain allocation handed the new texture the ID, else it was placed at it.
     pub(super) plain: bool,
@@ -852,6 +878,8 @@ pub(super) struct SlotTaken {
 #[derive(Debug)]
 pub(super) struct IdHold {
     ids: Arc<Mutex<ResourceIds>>,
+    /// The key of the texture scope `ids` are of ([`TextureScope`]), 0 for the device's own.
+    scope: u64,
     space: IdSpace,
     id: u64,
     /// Whether plain allocation handed the ID out, so it is plain allocation's again once the
@@ -874,6 +902,7 @@ impl IdHold {
         }
         let mut all = lock(ids);
         let serial = all.next();
+        let scope = all.scope;
         let of = all.space(space);
         of.plain.start();
         let (id, plain) = match placement {
@@ -885,6 +914,7 @@ impl IdHold {
         }
         IdHold {
             ids: Arc::clone(ids),
+            scope,
             space,
             id,
             plain,
@@ -896,9 +926,13 @@ impl IdHold {
     /// handle, which no slot has and no plain allocation or reservation counts, so no ID a
     /// program reads or reserves ever names it.
     pub(super) fn internal(ids: &Arc<Mutex<ResourceIds>>, space: IdSpace) -> IdHold {
-        let serial = lock(ids).next();
+        let mut all = lock(ids);
+        let serial = all.next();
+        let scope = all.scope;
+        drop(all);
         IdHold {
             ids: Arc::clone(ids),
+            scope,
             space,
             id: 0,
             plain: false,
@@ -920,6 +954,7 @@ impl IdHold {
                 serial,
                 ..
             }) if *serial != self.serial && held.strong_count() > 0 => Some(SlotTaken {
+                scope: self.scope,
                 id: self.id,
                 plain: self.plain,
                 from: *serial,
@@ -944,6 +979,12 @@ impl IdHold {
     /// The ID.
     pub(super) fn id(&self) -> ResourceId {
         ResourceId(self.id)
+    }
+
+    /// The key of the texture scope the ID is of ([`TextureScope`]), 0 for the device's own, and
+    /// the IDs it is among.
+    pub(super) fn scope(&self) -> (u64, &Arc<Mutex<ResourceIds>>) {
+        (self.scope, &self.ids)
     }
 
     /// The hold's serial: what its slot names its holder by while it holds it
@@ -983,6 +1024,19 @@ impl Drop for IdHold {
         }
     }
 }
+
+/// A texture scope (the module docs, [`Device::with_own_texture_ids`]): its key, never 0 (the
+/// device's own IDs'), and its texture IDs. Each handle of the scope holds it; each texture of the
+/// scope holds its IDs ([`IdHold`]).
+#[derive(Debug)]
+pub(super) struct TextureScope {
+    pub(super) key: u64,
+    pub(super) ids: Arc<Mutex<ResourceIds>>,
+}
+
+/// The last texture scope key handed out: keys are the process's, so no two scopes of a device
+/// share one.
+static SCOPE_KEYS: AtomicU64 = AtomicU64::new(0);
 
 /// A sampler state's element of the set-1 sampler arrays, held until the state is gone: the
 /// lowest above 0 no live state holds, whatever its resource ID (the module docs). The tables
@@ -1043,7 +1097,7 @@ impl Device {
         }
         let space = |space| lock(&self.shared().resource_ids).reserve(space, ids);
         let taken = match kind {
-            ResourceIdKind::Texture => space(IdSpace::Texture),
+            ResourceIdKind::Texture => lock(self.texture_ids()).reserve(IdSpace::Texture, ids),
             ResourceIdKind::SamplerState => space(IdSpace::Sampler),
             ResourceIdKind::PipelineState => space(IdSpace::Pipeline),
             ResourceIdKind::IndirectCommandBuffer => {
@@ -1088,8 +1142,47 @@ impl Device {
         if !self.check_reservation(CALL, kind, ids)? {
             return Ok(());
         }
-        lock(&self.shared().resource_ids).keep(space, ids);
+        let of = match space {
+            IdSpace::Texture => self.texture_ids(),
+            _ => &self.shared().resource_ids,
+        };
+        lock(of).keep(space, ids);
         Ok(())
+    }
+
+    /// Ours, a runtime extension with no Metal counterpart: a handle of this device whose textures
+    /// take their resource IDs from a texture space of their own, a new texture scope (the module
+    /// docs), as if they were made on a Metal device of their own; all else is the device's (the
+    /// handle is the same device, [`Device::registry_id`] too, and its objects are the device's).
+    ///
+    /// A texture made through the handle, or through an object made through it (a heap, a
+    /// buffer's texture, an opened shared texture), and a view of such a texture, take their IDs
+    /// from the scope's space, numbered as the device numbers its own; [`reserve_resource_ids`]
+    /// and [`keep_resource_ids`] of textures through the handle reserve there, the first as Metal
+    /// takes a reservation on a device with no queue yet (a scope's pool is never made, so no ID
+    /// is handed out twice). A command of a command buffer of a queue made through the handle
+    /// reaches by ID the scope's live textures and no other's, as a command of the device's own
+    /// queues reaches the textures made with no scope. Sampler states, pipeline states,
+    /// visible-function tables and indirect command buffers take their IDs from the device's
+    /// spaces through every handle. The scope's texture table goes once no handle of it is left.
+    ///
+    /// For a caller whose programs share one device where each had one of its own on Metal: each
+    /// program's placements then meet none of another program's textures.
+    ///
+    /// [`reserve_resource_ids`]: Device::reserve_resource_ids
+    /// [`keep_resource_ids`]: Device::keep_resource_ids
+    pub fn with_own_texture_ids(&self) -> Device {
+        let key = SCOPE_KEYS.fetch_add(1, Ordering::Relaxed) + 1;
+        let ids = Arc::new(Mutex::new(ResourceIds::of_scope(key)));
+        self.scoped(Arc::new(TextureScope { key, ids }))
+    }
+
+    /// The texture IDs of this handle: its scope's ([`TextureScope`]), else the device's own.
+    pub(super) fn texture_ids(&self) -> &Arc<Mutex<ResourceIds>> {
+        match self.texture_scope() {
+            Some(scope) => &scope.ids,
+            None => &self.shared().resource_ids,
+        }
     }
 
     /// The limits of a reservation of `ids` of `kind` for `call`, checked
@@ -1290,6 +1383,7 @@ impl Device {
     /// (a general warning, `metal2vulkan-texture-slot-taken`). Ours: Metal says nothing.
     pub(super) fn say_slot_taken(&self, taken: SlotTaken) {
         let SlotTaken {
+            scope,
             id,
             plain,
             from,
@@ -1299,9 +1393,9 @@ impl Device {
         self.diagnose(
             "metal2vulkan-texture-slot-taken",
             format!(
-                "metal2vulkan: texture ID {id}: a {how} texture (hold {to}) took the slot of a \
-                 live texture (hold {from}): an argument buffer naming the ID reaches the new \
-                 one [metal2vulkan-texture-slot-taken]"
+                "metal2vulkan: texture ID {id} of scope {scope}: a {how} texture (hold {to}) took \
+                 the slot of a live texture (hold {from}): an argument buffer naming the ID \
+                 reaches the new one [metal2vulkan-texture-slot-taken]"
             ),
         );
     }

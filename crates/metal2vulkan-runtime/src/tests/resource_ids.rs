@@ -2,7 +2,9 @@
 //! space per kind of resource; placed IDs, reservations, and each ID's slot, whose generation
 //! changes with its holder.
 
-use crate::resource_ids::{Holder, IdHold, IdPlacement, IdSpace, ResourceId, ResourceIds};
+use crate::resource_ids::{
+    Elements, Holder, IdHold, IdPlacement, IdSpace, ResourceId, ResourceIds,
+};
 use std::sync::{Arc, Mutex, Weak};
 
 fn ids() -> Arc<Mutex<ResourceIds>> {
@@ -458,6 +460,64 @@ fn a_late_keep_takes_its_ids_out_of_overlapping_ranges() {
     assert!(held
         .iter()
         .all(|held| held.id().0 != 3 && held.id().0 != 20));
+}
+
+/// Ours: a texture scope's IDs (`Device::with_own_texture_ids`) are a space apart from the
+/// device's: its plain IDs start at 1 whatever the device handed out, its first keep is Metal's
+/// reservation though the device's pool was made and its space started, its slots are its own,
+/// and its holds name it.
+#[test]
+fn a_texture_scope_numbers_its_textures_apart_from_the_device() {
+    let device = ids();
+    device.lock().unwrap().make_texture_pool();
+    let taken: Vec<IdHold> = (0..3).map(|_| held(&device, IdPlacement::Any)).collect();
+    let scope = Arc::new(Mutex::new(ResourceIds::of_scope(7)));
+    assert!(scope
+        .lock()
+        .unwrap()
+        .keep(IdSpace::Texture, &[2, 3].map(ResourceId)));
+    let placed = held(&scope, IdPlacement::At(ResourceId(2)));
+    let plain: Vec<IdHold> = (0..3).map(|_| id(&scope, IdSpace::Texture)).collect();
+    let got: Vec<u64> = plain.iter().map(|held| held.id().0).collect();
+    assert_eq!(got, [1, 4, 5]);
+    assert_eq!((placed.scope().0, taken[1].scope().0), (7, 0));
+    assert!(slot(&device, 2).1 && slot(&scope, 2).1);
+    drop(placed);
+    assert!(slot(&device, 2).1 && !slot(&scope, 2).1);
+    // The device's later keep stays the device's, a late one.
+    assert!(!device
+        .lock()
+        .unwrap()
+        .keep(IdSpace::Texture, &[ResourceId(9)]));
+}
+
+/// Ours: a scope's pool is never made (only the device's queues make the device's), so its
+/// reservation hands out no ID twice where the device's would (G331, the module docs).
+#[test]
+fn a_texture_scope_hands_out_no_id_twice_after_its_reservation() {
+    let scope = Arc::new(Mutex::new(ResourceIds::of_scope(3)));
+    assert!(scope
+        .lock()
+        .unwrap()
+        .keep(IdSpace::Texture, &[ResourceId(20)]));
+    let held: Vec<IdHold> = (0..31).map(|_| id(&scope, IdSpace::Texture)).collect();
+    let got: Vec<u64> = held.iter().map(|held| held.id().0).collect();
+    assert_eq!(got, expand(&[(21, 31), (1, 19), (32, 32)]));
+}
+
+/// The heap arrays' elements of placed textures, as the sampler states': the lowest free above
+/// 0, the top shrinking past free ones.
+#[test]
+fn heap_elements_are_the_lowest_free_above_zero() {
+    let mut elements = Elements::default();
+    let got: Vec<u64> = (0..4).map(|_| elements.take()).collect();
+    assert_eq!(got, [1, 2, 3, 4]);
+    elements.give(2);
+    elements.give(4);
+    elements.give(3);
+    assert_eq!([elements.take(), elements.take()], [2, 3]);
+    elements.give(1);
+    assert_eq!([elements.take(), elements.take()], [1, 4]);
 }
 
 /// Visible-function tables' first pool is 32, as Metal's (2 to 4 of 1 to 5
