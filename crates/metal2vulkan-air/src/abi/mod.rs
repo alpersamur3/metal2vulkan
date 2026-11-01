@@ -208,6 +208,9 @@ pub struct CompileOptions {
     pub fast_math: Option<bool>,
     /// `air.compile.denorms_disable`.
     pub denorms_disable: bool,
+    /// `air.compile.native_double_disable` (an OpenGL ES shader's module states it; it says only
+    /// that the shader has no `double` to run natively).
+    pub native_double_disable: bool,
     /// `air.compile.framebuffer_fetch_enable` / `_disable`.
     pub framebuffer_fetch: Option<bool>,
 }

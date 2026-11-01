@@ -63,6 +63,13 @@ const NAMED: &[(&str, Named)] = &[
 /// `!{!"air.global_binding", <global>, <binding>}` binds a buffer to a program-scope pointer.
 const GLOBAL_BINDINGS: &str = "air.global_bindings";
 
+/// The Metal an OpenGL ES shader's module (`!air.language_version` `"OpenGL ES GLSL"`) reads as.
+const GLES_AS_METAL: Version = Version {
+    major: 2,
+    minor: 3,
+    patch: 0,
+};
+
 /// Decode every named list of `m`. Entries are decoded kernel, vertex, fragment, object, mesh,
 /// each in list order.
 pub(super) fn decode(m: &Module, meter: &mut Meter) -> Result<AirAbi, Error> {
@@ -117,15 +124,23 @@ pub(super) fn decode(m: &Module, meter: &mut Meter) -> Result<AirAbi, Error> {
             Named::Version => abi.air_version = Some(version(m, single(ops, &site)?, &site)?),
             Named::LanguageVersion => {
                 let mut n = Ops::node(m, single(ops, &site)?, site.clone())?;
-                if n.string(Some("air.language_version"))? != b"Metal" {
-                    return Err(site.err(AbiError::BadValue, Some("air.language_version")));
-                }
-                abi.language = Some(LanguageVersion(Version {
+                let gles = match n.string(Some("air.language_version"))? {
+                    b"Metal" => false,
+                    b"OpenGL ES GLSL" => true,
+                    _ => return Err(site.err(AbiError::BadValue, Some("air.language_version"))),
+                };
+                let stated = Version {
                     major: n.u32(None)?,
                     minor: n.u32(None)?,
                     patch: n.u32(None)?,
-                }));
+                };
                 n.finish()?;
+                // An OpenGL ES shader's module (AppleMetalGLRenderer's, from
+                // `newFunctionWithGLESIR`) states the GLSL ES version it was written in, not a
+                // Metal one. Its AIR is Metal's, and the language version decides only how
+                // `discard` lowers: GLSL ES promises only that a discarded fragment writes
+                // nothing, which Metal 2.3's semantics keep, so the module reads as Metal 2.3.
+                abi.language = Some(LanguageVersion(if gles { GLES_AS_METAL } else { stated }));
             }
             Named::CompileOptions => abi.compile = compile_options(m, ops, &site, cx.meter)?,
             Named::ModuleFlags => abi.limits = module_flags(m, ops, &site, cx.meter)?,
@@ -278,6 +293,11 @@ fn compile_options(
                 continue;
             }
             b"air.compile.denorms_disable" => return Err(site.err(AbiError::BadValue, key)),
+            b"air.compile.native_double_disable" if !c.native_double_disable => {
+                c.native_double_disable = true;
+                continue;
+            }
+            b"air.compile.native_double_disable" => return Err(site.err(AbiError::BadValue, key)),
             _ => return Err(site.err(AbiError::UnknownKey, key)),
         };
         if slot.replace(value).is_some() {

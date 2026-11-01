@@ -1927,12 +1927,54 @@ fn module_level_metadata_decodes() {
         CompileOptions {
             fast_math: Some(true),
             denorms_disable: true,
+            native_double_disable: false,
             framebuffer_fetch: Some(false),
         }
     );
     assert_eq!(abi.limits.max_textures, Some(128));
     assert_eq!(abi.limits.max_samplers, None);
     assert_eq!(abi.producer, Some(DiagName::new("producer")));
+}
+
+/// An OpenGL ES shader's module-level lists, as AppleMetalGLRenderer writes them (iOS 26): GLSL ES
+/// 1.0 reads as Metal 2.3, and `air.compile.native_double_disable` is kept once.
+#[test]
+fn gles_module_level_metadata_decodes() {
+    let abi = module_with(|b| {
+        let l = node(b, &[S("OpenGL ES GLSL"), I(1), I(0), I(0)]);
+        b.named_md("air.language_version", &[l]);
+        let o1 = node(b, &[S("air.compile.fast_math_enable")]);
+        let o2 = node(b, &[S("air.compile.denorms_disable")]);
+        let o3 = node(b, &[S("air.compile.native_double_disable")]);
+        b.named_md("air.compile_options", &[o1, o2, o3]);
+    })
+    .unwrap();
+    assert_eq!(
+        abi.language,
+        Some(LanguageVersion(Version {
+            major: 2,
+            minor: 3,
+            patch: 0
+        }))
+    );
+    assert_eq!(
+        abi.compile,
+        CompileOptions {
+            fast_math: Some(true),
+            denorms_disable: true,
+            native_double_disable: true,
+            framebuffer_fetch: None,
+        }
+    );
+    // Stated twice.
+    expect_abi(
+        module_with(|b| {
+            let a = node(b, &[S("air.compile.native_double_disable")]);
+            let c = node(b, &[S("air.compile.native_double_disable")]);
+            b.named_md("air.compile_options", &[a, c]);
+        }),
+        AbiError::BadValue,
+    );
 }
 
 #[test]
