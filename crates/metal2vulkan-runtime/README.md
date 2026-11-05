@@ -132,7 +132,7 @@ Vulkan-side choices Metal has no counterpart for:
 | `layers`, `layer_settings` | Instance layers, in order, and their settings. |
 | `instance_extensions`, `device_extensions` | Extensions beyond those the runtime enables (a swapchain, for example). |
 | `instance_api_version` | The instance's `apiVersion` (1.2 when unset); a version outside 1.2 to the loader's is refused, never clamped. |
-| `withheld_features`, `withheld_extensions`, `withhold_generated_commands`, `withhold_view_reinterpretation` | Parts of the recommended enables to leave off; the device then compiles for what is enabled. |
+| `withheld_features`, `withheld_extensions`, `withhold_generated_commands`, `withhold_view_reinterpretation` | Parts of the recommended enables to leave off; the device then compiles for what is enabled. `VK_EXT_device_generated_commands` is enabled only where compute pipelines bind through an execution set, and a device its driver refuses with it is made once more without it (`metal2vulkan-generated-commands-refused`). |
 | `messages` | A `MessageSink` for the validation layer's messages and the runtime's notices; without one, notices go to stderr. |
 | `shader_cache` | Where translated shaders are kept, and how much. |
 | `gpu_times_from_host` | Answer command buffers' GPU times from the host clock, sparing two timestamps per command buffer. |

@@ -17,9 +17,9 @@ fn the_registry_id_folds_the_uuid_and_is_never_zero() {
 }
 
 use crate::device::create::{
-    default_loaders, dma_buf_image_names, dma_buf_names, enable_set, host_image_copy,
-    instance_version, layer_settings, linear_color_attachment, open_loader, queue_plan,
-    setting_values, timeline_difference, QueuePlan,
+    default_loaders, dma_buf_image_names, dma_buf_names, enable_set, generated_commands,
+    host_image_copy, instance_version, layer_settings, linear_color_attachment, open_loader,
+    queue_plan, setting_values, timeline_difference, QueuePlan,
 };
 use crate::enables::host_image_copy_names;
 use crate::{DeviceOptions, Error, InstanceApiVersion, LayerSetting, LayerSettingValue};
@@ -169,6 +169,76 @@ fn withheld_features_leave_the_rest_of_the_recommendation() {
         metal2vulkan::device::Device::new(enabled, options.policy)
             .unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
     }
+}
+
+/// `VK_EXT_device_generated_commands` is enabled on a committed profile that states it with
+/// compute among both its stages and its pipeline-binding stages (RADV's and NVIDIA's), and on
+/// none once compute leaves either set (as on a device whose replay would refuse every execution,
+/// `GeneratedRefusal::NoComputePipelineBinding`), nor where the options withhold it.
+#[test]
+fn generated_commands_are_enabled_only_where_compute_pipelines_bind() {
+    let compute = metal2vulkan::vk::ShaderStageFlags::COMPUTE;
+    let withheld = DeviceOptions {
+        withhold_generated_commands: true,
+        ..DeviceOptions::default()
+    };
+    let mut enabled_on = Vec::new();
+    for (path, description) in descriptions() {
+        let options = DeviceOptions::default();
+        let on = generated_commands(
+            &description,
+            &options,
+            &mut enable_set(&description, &options),
+        );
+        let Some(facts) = description.generated_commands else {
+            assert!(!on, "{path:?}: enabled without the extension");
+            continue;
+        };
+        if !(facts.supported_stages.contains(compute)
+            && facts.pipeline_binding_stages.contains(compute))
+        {
+            assert!(!on, "{path:?}: enabled without a compute pipeline binding");
+            continue;
+        }
+        if !on {
+            // no `bufferDeviceAddress` or `VK_KHR_maintenance5`
+            continue;
+        }
+        enabled_on.push(path.clone());
+        let no_binding = {
+            let mut lacking = description.clone();
+            let facts = lacking.generated_commands.as_mut().unwrap();
+            facts.pipeline_binding_stages = facts.pipeline_binding_stages.difference(compute);
+            lacking
+        };
+        let no_stage = {
+            let mut lacking = description.clone();
+            let facts = lacking.generated_commands.as_mut().unwrap();
+            facts.supported_stages = facts.supported_stages.difference(compute);
+            lacking
+        };
+        for lacking in [no_binding, no_stage] {
+            let mut set = enable_set(&lacking, &options);
+            let before = set.clone();
+            assert!(
+                !generated_commands(&lacking, &options, &mut set),
+                "{path:?}: enabled without compute"
+            );
+            assert_eq!(set, before, "{path:?}: maintenance5 added for nothing");
+        }
+        assert!(
+            !generated_commands(
+                &description,
+                &withheld,
+                &mut enable_set(&description, &withheld)
+            ),
+            "{path:?}: enabled though withheld"
+        );
+    }
+    assert!(
+        enabled_on.len() >= 2,
+        "enabled on {enabled_on:?} only: the committed RADV and NVIDIA profiles state it with compute"
+    );
 }
 
 /// Withholding a feature another enabled one requires is refused by the description's check,
