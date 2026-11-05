@@ -113,7 +113,9 @@ pub struct DeviceOptions {
     /// enables it otherwise (with `VK_KHR_maintenance5`, which it requires), and runs an
     /// execution of commands a kernel writes on the GPU alone where every record it may hold is
     /// covered; without it every such execution takes the host step. The compile device states the
-    /// extension only where it is enabled.
+    /// extension only where it is enabled. The runtime enables it only where compute pipelines bind
+    /// through an execution set, and makes a device its driver refuses with it once more without
+    /// it, stating so (`metal2vulkan-generated-commands-refused`).
     pub withhold_generated_commands: bool,
     /// Make no Vulkan view of an image in another component layout, on any device, as a device
     /// whose `VK_KHR_portability_subset` withholds `imageViewFormatReinterpretation` makes none:
@@ -792,17 +794,24 @@ pub(crate) fn dma_buf_image_names(listed: &BTreeSet<CString>) -> Option<[&'stati
 
 /// Whether a device of `description` the runtime creates under `options` enables
 /// `VK_EXT_device_generated_commands`: where the description states it (the extension and its
-/// `deviceGeneratedCommands`), `options` do not withhold it, and `set` enables
-/// `bufferDeviceAddress`, which it requires. `set` then gains `VK_KHR_maintenance5` and its
-/// feature, which it requires too, unless they are withheld or the device lacks them, when it is
-/// not enabled.
+/// `deviceGeneratedCommands`) with compute among both its `supportedIndirectCommandsShaderStages`
+/// and its `supportedIndirectCommandsShaderStagesPipelineBinding`, `options` do not withhold it,
+/// and `set` enables `bufferDeviceAddress`, which it requires. `set` then gains
+/// `VK_KHR_maintenance5` and its feature, which it requires too, unless they are withheld or the
+/// device lacks them, when it is not enabled. A device that binds no compute pipeline through an
+/// execution set runs no execution on the GPU alone (the replay refuses it,
+/// `GeneratedRefusal::NoComputePipelineBinding`), so it is not asked to enable the extension.
 pub(crate) fn generated_commands(
     description: &DeviceDescription,
     options: &DeviceOptions,
     set: &mut EnableSet,
 ) -> bool {
     let maintenance5 = (VkExtension::KhrMaintenance5, VkFeature::Maintenance5);
-    let enabled = description.generated_commands.is_some()
+    let compute = metal2vulkan::vk::ShaderStageFlags::COMPUTE;
+    let binds_compute = description.generated_commands.is_some_and(|facts| {
+        facts.supported_stages.contains(compute) && facts.pipeline_binding_stages.contains(compute)
+    });
+    let enabled = binds_compute
         && !options.withhold_generated_commands
         && set.features.contains(&VkFeature::BufferDeviceAddress)
         && description.extensions.contains(&maintenance5.0)
@@ -1060,7 +1069,18 @@ pub(super) fn argument_buffers_kept(description: &DeviceDescription) -> Result<(
     check(Facts::of(description).argument_buffers())
 }
 
-/// A device on `physical`, made from `instance`, answering at `level`.
+/// The id name of the informational message a device states when its driver refused it with
+/// `VK_EXT_device_generated_commands` enabled and it was made again without the extension.
+pub(crate) const GENERATED_COMMANDS_REFUSED: &str = "metal2vulkan-generated-commands-refused";
+
+/// A device on `physical`, made from `instance`, answering at `level`. Where the driver refuses
+/// the device (`vkCreateDevice` fails) while it enables `VK_EXT_device_generated_commands`, the
+/// device is made once more with the extension withheld, as
+/// [`DeviceOptions::withhold_generated_commands`] withholds it, and states that once
+/// ([`GENERATED_COMMANDS_REFUSED`]): every execution of commands a kernel writes then takes the
+/// host step, as on a device without the extension, and every answer is the same. A driver can
+/// list the extension and its features and still fail such a device (AMD's on Windows answers
+/// `VK_ERROR_UNKNOWN`). A refusal of the second device is the error.
 fn create_on(
     instance: &Arc<InstanceShared>,
     physical: vk::PhysicalDevice,
@@ -1068,6 +1088,62 @@ fn create_on(
     cache: &CacheSetup,
     level: Chosen,
 ) -> Result<Device, Error> {
+    let refused = match create_attempt(instance, physical, options, cache, level) {
+        Err(Attempt::GeneratedCommandsRefused(refused)) => refused,
+        other => return other.map_err(Attempt::into_error),
+    };
+    let without = DeviceOptions {
+        withhold_generated_commands: true,
+        ..options.clone()
+    };
+    let device =
+        create_attempt(instance, physical, &without, cache, level).map_err(Attempt::into_error)?;
+    device.inform(
+        GENERATED_COMMANDS_REFUSED,
+        format!(
+            "metal2vulkan: the device, on {}: its driver lists `VK_EXT_device_generated_commands` \
+             but refused the device that enables it ({refused:?}); it is made without the \
+             extension, so every execution of commands a kernel writes takes the host step, and \
+             every answer is the same [{GENERATED_COMMANDS_REFUSED}]",
+            device.name()
+        ),
+    );
+    Ok(device)
+}
+
+/// Why [`create_attempt`] made no device.
+enum Attempt {
+    /// `vkCreateDevice` failed with this result while the device enabled
+    /// `VK_EXT_device_generated_commands`.
+    GeneratedCommandsRefused(vk::Result),
+    /// Anything else, the error the device is refused with.
+    Failed(Error),
+}
+
+impl Attempt {
+    /// The error a device is refused with.
+    fn into_error(self) -> Error {
+        match self {
+            Attempt::GeneratedCommandsRefused(result) => vulkan(result),
+            Attempt::Failed(error) => error,
+        }
+    }
+}
+
+impl From<Error> for Attempt {
+    fn from(error: Error) -> Attempt {
+        Attempt::Failed(error)
+    }
+}
+
+/// One try of [`create_on`] under `options`.
+fn create_attempt(
+    instance: &Arc<InstanceShared>,
+    physical: vk::PhysicalDevice,
+    options: &DeviceOptions,
+    cache: &CacheSetup,
+    level: Chosen,
+) -> Result<Device, Attempt> {
     // SAFETY: `physical` was enumerated from the instance, created at `api_version`.
     let description =
         unsafe { DeviceDescription::query(&instance.raw, physical, instance.api_version) }
@@ -1238,7 +1314,13 @@ fn create_on(
                 unsafe { instance.create_device(physical, asked.into_inner(), None) }
             })
         })
-        .map_err(vulkan)?;
+        .map_err(|result| {
+            if generated_commands {
+                Attempt::GeneratedCommandsRefused(result)
+            } else {
+                Attempt::Failed(vulkan(result))
+            }
+        })?;
     // SAFETY: the device was just created: its word is the loader's.
     let loader_word = unsafe { LoaderWord::of_device(raw.handle()) };
     let primary = families.get(queue_family as usize);
