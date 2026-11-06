@@ -8824,6 +8824,34 @@ impl RenderCommandEncoder {
             }
             // A draw whose pipeline is being made records the barrier first in its own
             // secondary (`render/pending.rs`).
+            // A draw that reads an input attachment after an earlier draw of the instance records
+            // after a barrier of the subpass's dependency on itself where the driver's
+            // rasterization-order reads miss earlier draws
+            // (`framebuffer_fetch::input_reads_barrier`).
+            let mut input_barrier = None;
+            if framebuffer_fetch::input_reads_barrier(
+                &device.properties().driver_defects,
+                self.layout.fetch_inputs,
+                !graphics.input_attachments.is_empty(),
+                self.current.recorded,
+            ) {
+                let view_mask = self.current.shape.view_mask;
+                device.shared().counts.draw_after_input_barrier();
+                match (pending.is_some(), &mut self.current.kept) {
+                    (true, _) => input_barrier = Some(view_mask),
+                    // An instance recorded inline after a split keeps it with its draws
+                    // (`render/inline_splits.rs`).
+                    (false, Some(kept)) => kept.barrier(view_mask),
+                    // SAFETY: as for the storage barrier below.
+                    (false, None) => unsafe {
+                        render_target::between_draws(
+                            device.shared().vk(),
+                            self.current.draws,
+                            view_mask,
+                        )
+                    },
+                }
+            }
             // A draw that reaches interlocked storage an earlier draw of the instance wrote, the
             // imageblock's, a color's or the depth's stand-in, records after the barrier
             // (`InterlockedStorage`).
@@ -9065,6 +9093,7 @@ impl RenderCommandEncoder {
                     draw: self.draw_calls,
                     variant: variant.key().clone(),
                     specialization: variant.constants(specialization),
+                    input_barrier,
                     storage_barrier,
                     indirect_barrier,
                     geometry_barrier,

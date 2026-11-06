@@ -50,6 +50,15 @@
 //! order them (`DriverFact::InterlockOrdersDraws`: ANV on the Iris Xe), where the colors' barrier
 //! goes, about 15,000 GPU cycles a draw there.
 //!
+//! Through input attachments Vulkan orders a draw's reads after the earlier draws' writes of the
+//! subpass by the rasterization order alone, which Turnip on the Adreno 830 (Mesa 26.2.6) does not
+//! keep where the image is UBWC-compressed: a draw's input attachment read misses, in whole blocks,
+//! what the draws before it in its render pass instance wrote there, and the block reads zero
+//! (`RuntimeDriverDefect::RasterOrderInputReadsStale`). There a draw that reads an input attachment
+//! after an earlier draw of its instance records after a barrier of the subpass's dependency on
+//! itself (`render_target::between_draws`, [`input_reads_barrier`]), which Turnip records as a
+//! clean of its color cache and an invalidation of its texture cache before the draw.
+//!
 //! An 8-bit sRGB attachment (with the compile form) is read and written through a storage view in
 //! the unsigned-integer format of its texel size ([`storage_view_format`]): Metal's tile keeps the
 //! attachment's 8-bit codes between draws, and the compile layer decodes and encodes them itself. A
@@ -98,18 +107,37 @@ use super::image_plan::{hiz_candidate, ImagePlan};
 use super::Device;
 use metal2vulkan::bind::PlanesCopy;
 use metal2vulkan::device::{DeviceProfile, DriverFact, FormatUsage, VkProperty};
-use metal2vulkan::error::Capability;
+use metal2vulkan::error::{Capability, RuntimeDriverDefect};
 use metal2vulkan::metal::format::WordAttachment;
 use metal2vulkan::metal::TextureType;
 use metal2vulkan::pipeline::StorageAttachmentUse;
 use metal2vulkan::vk::{Format, ImageCreateFlags, ImageUsageFlags, NumericFormat};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 /// Whether the compile layer reads `profile`'s fetched color attachments as input attachments
 /// in rasterization order (`lower::fragment::fetch`): where the device has
 /// `rasterizationOrderColorAttachmentAccess`.
 pub(crate) fn through_inputs(profile: &DeviceProfile) -> bool {
     profile.fragment().rasterization_order_color_access
+}
+
+/// Whether a draw records after a barrier of its subpass's dependency on itself
+/// (`render_target::between_draws`) for its input attachment reads (the module docs): in a pass
+/// whose draws read their colors as input attachments (`fetch_inputs`, `PassLayout::fetch_inputs`),
+/// a draw that reads one (`reads_inputs`) after an earlier draw or query recorded into its render
+/// pass instance (`after_draws`), on a device whose driver's rasterization-order reads miss earlier
+/// draws (`RuntimeDriverDefect::RasterOrderInputReadsStale` among `defects`). A render pass
+/// instance's first draw reads what its load left, which the pass's own dependencies order.
+pub(crate) fn input_reads_barrier(
+    defects: &BTreeSet<RuntimeDriverDefect>,
+    fetch_inputs: bool,
+    reads_inputs: bool,
+    after_draws: bool,
+) -> bool {
+    fetch_inputs
+        && reads_inputs
+        && after_draws
+        && defects.contains(&RuntimeDriverDefect::RasterOrderInputReadsStale)
 }
 
 /// Whether the compile layer reads `profile`'s fetched color attachments as storage images in the

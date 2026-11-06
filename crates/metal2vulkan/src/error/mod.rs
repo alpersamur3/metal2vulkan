@@ -901,6 +901,13 @@ pub enum RuntimeDriverDefect {
     /// that bakes samplers records in a `VkCommandBuffer` of its own there, as one whose pipeline
     /// is still being made does.
     ImmutableSamplersLostAfterCopies,
+    /// A draw's input attachment read of a color attachment in a subpass of rasterization-order
+    /// color access (`VK_EXT_rasterization_order_attachment_access`) misses, in whole blocks of
+    /// pixels, what earlier draws of the subpass wrote there: those blocks read zero (transparent
+    /// black) where the driver compresses the image. Nothing is refused: a draw that reads an
+    /// input attachment after an earlier draw of its render pass instance records after a barrier
+    /// of the subpass's dependency on itself there.
+    RasterOrderInputReadsStale,
 }
 
 /// One device capability a refusal can name.

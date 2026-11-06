@@ -80,6 +80,10 @@ pub(super) struct PendingDraw {
     pub(super) draw: usize,
     pub(super) variant: VariantKey,
     pub(super) specialization: Vec<(SpecKey, u64)>,
+    /// The view mask of the barrier before its input attachment reads it records first
+    /// (`render_target::between_draws`, `framebuffer_fetch::input_reads_barrier`), where it has
+    /// one.
+    pub(super) input_barrier: Option<u32>,
     /// The view mask of the storage barrier it records first
     /// (`render_target::between_storage_draws`), where it has one.
     pub(super) storage_barrier: Option<u32>,
@@ -158,6 +162,9 @@ impl PendingDraw {
         // instance, valid in the pass's subpass; the lent query is a continuation of the offset
         // the encoder's draws count in, with none active in this secondary before it.
         unsafe {
+            if let Some(view_mask) = self.input_barrier {
+                render_target::between_draws(raw, cb, view_mask);
+            }
             if let Some(view_mask) = self.storage_barrier {
                 render_target::between_storage_draws(raw, cb, view_mask);
             }

@@ -4,16 +4,16 @@
 use super::image_plan::{committed, facts};
 use super::texture_descriptor::APPLE;
 use crate::framebuffer_fetch::{
-    fetch_candidate, planes_candidate, planes_copies, planes_copies_gap, storage_candidate,
-    stores_samples, through_inputs, through_multisampled_storage, through_planes, through_storage,
-    UsageAnswers,
+    fetch_candidate, input_reads_barrier, planes_candidate, planes_copies, planes_copies_gap,
+    storage_candidate, stores_samples, through_inputs, through_multisampled_storage,
+    through_planes, through_storage, UsageAnswers,
 };
 use crate::image_plan::{plan_image, ImagePlan};
 use crate::texture_descriptor::{TextureDescriptor, TextureLayout};
 use metal2vulkan::bind::PlanesCopy;
 use metal2vulkan::device::FormatUsage;
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
-use metal2vulkan::vk::{Format, ImageCreateFlags, ImageUsageFlags};
+use metal2vulkan::vk::{DriverId, Format, ImageCreateFlags, ImageUsageFlags};
 
 /// A checked layout of a 2D texture of `pf`, `width` by 8, with `samples` (a multisample type
 /// above 1).
@@ -445,4 +445,35 @@ fn single_sample_depth_targets_are_offered_sampled_where_the_driver_keeps_hiz_so
         "intel-irisxe-rplp-anv".to_owned(),
         PixelFormat::Depth32Float
     )));
+}
+
+/// A draw that reads an input attachment after an earlier draw or query of its render pass
+/// instance records after a barrier of its subpass's dependency on itself on a device whose
+/// driver's rasterization-order reads miss earlier draws (`RasterOrderInputReadsStale`): the
+/// lavapipe profile, which fetches through input attachments, under Turnip's identity (the Adreno
+/// 830 at 26.2.6, and a later release). Not its instance's first draw, nor a draw that reads no
+/// input attachment, nor one of a pass whose fetch is not through them; and on lavapipe's own
+/// identity none.
+#[test]
+fn input_reads_after_earlier_draws_take_a_barrier_where_turnip_misses_them() {
+    let (_, lavapipe) = super::capabilities::committed_descriptions()
+        .into_iter()
+        .find(|(stem, _)| stem == "lavapipe")
+        .expect("lavapipe");
+    let mesa_26_2_6 = (26 << 22) | (2 << 12) | 6;
+    for release in [mesa_26_2_6, mesa_26_2_6 + 1] {
+        let mut turnip = lavapipe.clone();
+        turnip.driver_id = Some(DriverId::MESA_TURNIP);
+        (turnip.device_id, turnip.driver_version) = (0x4405_0001, release);
+        let defects = crate::driver_defects::of(&turnip);
+        assert!(
+            input_reads_barrier(&defects, true, true, true),
+            "{release:#x}"
+        );
+        assert!(!input_reads_barrier(&defects, true, true, false));
+        assert!(!input_reads_barrier(&defects, true, false, true));
+        assert!(!input_reads_barrier(&defects, false, true, true));
+    }
+    let defects = crate::driver_defects::of(&lavapipe);
+    assert!(!input_reads_barrier(&defects, true, true, true));
 }

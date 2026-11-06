@@ -285,6 +285,30 @@ pub(super) struct Affected {
 ///   does (`pending_dispatch.rs`); a host step's dispatch (an indirect dispatch's, an indirect
 ///   command buffer's execution) records in place. Graphics draws are unmeasured. Every lavapipe
 ///   release takes it: 26.2.4, measured clean, has no committed profile to be a measured identity.
+///
+/// `RasterOrderInputReadsStale`:
+/// - Mesa's Turnip (`MESA_TURNIP`): a subpass of rasterization-order color access, its pipelines
+///   made so, orders each draw's input attachment reads after the earlier draws' color writes by
+///   `GRAS_SC_CNTL`'s `SINGLE_PRIM_MODE` alone (`FLUSH_PER_OVERLAP_AND_OVERWRITE` in sysmem,
+///   `FLUSH_PER_OVERLAP` in GMEM; `tu_pipeline.cc`), with no cache maintenance between the draws,
+///   and on the Adreno 830 (`deviceID` 0x44050001, KGSL) a read of a UBWC-compressed color image
+///   then misses what the draws just before it wrote, in blocks of 16x16 pixels that read zero:
+///   iOS 26's Liquid Glass shapes, which blend over the backdrop they fetch, drew black blocks at
+///   their rounded corners wherever coverage was short of 1 (the Files tab bar, Settings' Apple
+///   Account card, Freeform's toolbar after the display slept and woke). Measured on 26.2.6
+///   (driverVersion `0x6802006`) under an iOS 26 guest on a Galaxy S25 Ultra: black with the
+///   driver's defaults, `TU_DEBUG=gmem` and `TU_DEBUG=sysmem`, and with
+///   `FD_DEV_FEATURES=has_coherent_ubwc_flag_caches=0`; clean with `TU_DEBUG=noubwc` (0 of 13
+///   captures of Settings) and `TU_DEBUG=flushall` (0 of 7). Freeform's toolbar held 268 to 656
+///   black pixels at its corners in 4 of 5 captures without a barrier, and at most 2 (a glyph's)
+///   in each of 10 captures of two runs with one before each draw that reads an input attachment,
+///   as in 5 captures with color render targets made mutable without a format list (which Turnip
+///   keeps uncompressed). Read in 26.2.6's source: known broken through 26.2.6. Nothing is
+///   refused: a draw that reads an input attachment after an earlier draw of its render pass
+///   instance records after that barrier there (`framebuffer_fetch::input_reads_barrier`), which
+///   Turnip records as `CCU_CLEAN_COLOR` and `CACHE_INVALIDATE` (`tu_flush_for_access`; with the
+///   a750 family's `ubwc_coherency_quirk`, `CACHE_CLEAN` too). Every Turnip GPU and release takes
+///   it until a probe finds one clean.
 pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::MultisampledDepthStencilColourCopies,
@@ -376,6 +400,11 @@ pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::ImmutableSamplersLostAfterCopies,
         driver: DriverId::MESA_LLVMPIPE,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::RasterOrderInputReadsStale,
+        driver: DriverId::MESA_TURNIP,
         clean: &[],
     },
 ];

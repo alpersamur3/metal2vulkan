@@ -25,6 +25,7 @@ const PUSHES: RuntimeDriverDefect = RuntimeDriverDefect::PushedBufferSizesUnset;
 const STALE_PUSHES: RuntimeDriverDefect =
     RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds;
 const BAKED_SAMPLERS: RuntimeDriverDefect = RuntimeDriverDefect::ImmutableSamplersLostAfterCopies;
+const RASTER_READS: RuntimeDriverDefect = RuntimeDriverDefect::RasterOrderInputReadsStale;
 
 /// Every committed profile's driver has its defects at every release and GPU but those a probe
 /// found clean: MoltenVK the multisampled depth/stencil colour copies, the inexact depths past
@@ -194,6 +195,38 @@ fn lavapipe_s_baked_samplers_are_every_release_s() {
     }
     let radv = among(AFFECTED, Some(DriverId::MESA_RADV), 0, mesa_26_0_8);
     assert!(!radv.contains(&BAKED_SAMPLERS));
+}
+
+/// Turnip's rasterization-order input attachment reads that miss earlier draws, measured on the
+/// Adreno 830 (`deviceID` 0x44050001) at 26.2.6, are every Turnip GPU's at every release: nothing
+/// is measured clean. A device that runs another driver has none, lavapipe's (which fetches
+/// through input attachments too) among them.
+#[test]
+fn turnip_s_raster_order_input_reads_are_every_release_s() {
+    let turnip = Some(DriverId::MESA_TURNIP);
+    let mesa_26_2_6 = (26 << 22) | (2 << 12) | 6;
+    for (device, release) in [
+        (0x4405_0001, mesa_26_2_6),
+        (0x4405_0001, mesa_26_2_6 + 1),
+        (0x4405_0001, MESA_26_2_4),
+        (0x4307_0000, mesa_26_2_6),
+    ] {
+        assert_eq!(
+            among(AFFECTED, turnip, device, release)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [RASTER_READS],
+            "{device:#x} {release:#x}"
+        );
+    }
+    for driver in [
+        DriverId::MESA_LLVMPIPE,
+        DriverId::MESA_RADV,
+        DriverId::NVIDIA_PROPRIETARY,
+    ] {
+        let defects = among(AFFECTED, Some(driver), 0x4405_0001, mesa_26_2_6);
+        assert!(!defects.contains(&RASTER_READS), "{driver:?}");
+    }
 }
 
 /// Hawk Point's Radeon 780M (`deviceID` 0x1900) is Phoenix's GPU (0x15bf): at RADV 26.2.4 it is a

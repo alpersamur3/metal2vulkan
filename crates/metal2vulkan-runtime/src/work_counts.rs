@@ -183,6 +183,7 @@ pub(crate) struct Counters {
     set_zero_writes_if_shapes_shared: AtomicU64,
     dispatches_pushing_set_zero: AtomicU64,
     baked_sampler_dispatches_apart: AtomicU64,
+    draws_after_input_barriers: AtomicU64,
     host_deallocators_delayed: AtomicU64,
     host_import_releases_posted: AtomicU64,
     host_import_releases_pending: AtomicU64,
@@ -1237,6 +1238,13 @@ impl Counters {
     /// `VkCommandBuffer` of its own (`RuntimeDriverDefect::ImmutableSamplersLostAfterCopies`).
     pub(crate) fn baked_sampler_dispatch_apart(&self) {
         self.baked_sampler_dispatches_apart
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw that reads an input attachment recorded after a barrier of its subpass's dependency
+    /// on itself (`RuntimeDriverDefect::RasterOrderInputReadsStale`).
+    pub(crate) fn draw_after_input_barrier(&self) {
+        self.draws_after_input_barriers
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2777,6 +2785,12 @@ pub struct WorkCounts {
     /// (`RuntimeDriverDefect::ImmutableSamplersLostAfterCopies`, every lavapipe release). Zero
     /// elsewhere.
     pub baked_sampler_dispatches_apart: u64,
+    /// Draws that read an input attachment after an earlier draw or query of their render pass
+    /// instance, recorded after a barrier of their subpass's dependency on itself
+    /// (`framebuffer_fetch::input_reads_barrier`): on a device whose driver's rasterization-order
+    /// input attachment reads miss earlier draws (`RuntimeDriverDefect::RasterOrderInputReadsStale`,
+    /// every Turnip release). Zero elsewhere.
+    pub draws_after_input_barriers: u64,
     /// No-copy buffers and heaps released with a deallocator whose deallocator waited past the
     /// release (`host-deallocator-delayed`), counted at each wait: given no keep-alive, for the
     /// import of their pages, which something else held (a command buffer submitted before a
@@ -3539,6 +3553,8 @@ impl Device {
             dispatches_pushing_set_zero: (counters.dispatches_pushing_set_zero)
                 .load(Ordering::Relaxed),
             baked_sampler_dispatches_apart: (counters.baked_sampler_dispatches_apart)
+                .load(Ordering::Relaxed),
+            draws_after_input_barriers: (counters.draws_after_input_barriers)
                 .load(Ordering::Relaxed),
             host_deallocators_delayed: counters.host_deallocators_delayed.load(Ordering::Relaxed),
             host_import_releases_posted: (counters.host_import_releases_posted)
