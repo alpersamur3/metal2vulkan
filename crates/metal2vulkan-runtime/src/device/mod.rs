@@ -857,9 +857,20 @@ impl Device {
         self.0.lost.load(Ordering::Acquire)
     }
 
-    /// Record that the device was lost.
+    /// Record that the device was lost. The first time, a line through the instance's sink (on
+    /// stderr without one) names where the runtime saw it and the last sparse binds and chunks of
+    /// gathered pages before it (`sparse_log.rs`): a lost device's driver says why to the
+    /// instance's messengers alone, if at all, and the runtime's later calls only that it was lost.
+    #[track_caller]
     pub(super) fn mark_lost(&self) {
-        self.0.lost.store(true, Ordering::Release);
+        if !self.0.lost.swap(true, Ordering::AcqRel) {
+            let line = crate::sparse_log::lost_line(std::panic::Location::caller());
+            crate::driver_facts::inform_through(
+                self.0.instance.sink(),
+                "metal2vulkan-device-lost",
+                line,
+            );
+        }
     }
 
     /// Wait for the work submitted to each of the device's queues to end, each queue under its

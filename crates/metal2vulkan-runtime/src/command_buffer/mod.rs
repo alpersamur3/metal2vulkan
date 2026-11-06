@@ -3698,6 +3698,7 @@ fn step_error(device: &Device, error: Error, refusal: &mut Option<Error>) -> Com
 }
 
 /// The command-buffer error of a failed submission, recording a lost device.
+#[track_caller]
 fn submission_error(device: &Device, error: vk::Result) -> CommandBufferError {
     match device.failed(error) {
         Error::DeviceLost => CommandBufferError::DeviceLost,

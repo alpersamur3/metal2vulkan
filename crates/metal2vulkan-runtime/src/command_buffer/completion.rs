@@ -853,7 +853,9 @@ pub(crate) fn seen<E>(
     })
 }
 
-/// The command-buffer error of a failed wait, recording a lost device.
+/// The command-buffer error of a failed wait, recording a lost device (its caller's place:
+/// `Device::mark_lost`).
+#[track_caller]
 fn failure(device: &Device, error: vk::Result) -> CommandBufferError {
     match error {
         vk::Result::ERROR_DEVICE_LOST => {

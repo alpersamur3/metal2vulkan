@@ -25,7 +25,7 @@ use crate::exit_guard::{self, Call};
 use crate::release;
 use crate::resource::ResourceKey;
 use crate::work_counts::Begun;
-use ash::vk;
+use ash::vk::{self, Handle};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -334,6 +334,7 @@ impl Device {
             raw.queue_bind_sparse(queue, &[info], vk::Fence::null())
         });
         exit_guard::called(Call::QueueBindSparse);
+        crate::sparse_log::bound(false, buffer.as_raw(), binds, value, bound.is_err());
         bound.map_err(|error| self.failed(error))?;
         objects.signalled = value;
         *lock(&shared.bound_at) = Some((objects.timeline, value));
@@ -382,6 +383,7 @@ impl Device {
             raw.queue_bind_sparse(queue, &[info], vk::Fence::null())
         });
         exit_guard::called(Call::QueueBindSparse);
+        crate::sparse_log::bound(true, image.as_raw(), binds, value, bound.is_err());
         bound.map_err(|error| self.failed(error))?;
         objects.signalled = value;
         *lock(&shared.bound_at) = Some((objects.timeline, value));
@@ -433,7 +435,9 @@ impl Device {
         Some((timeline, value))
     }
 
-    /// The error of a failed submission or wait, recording a lost device.
+    /// The error of a failed submission or wait, recording a lost device (its caller's place:
+    /// `Device::mark_lost`).
+    #[track_caller]
     pub(crate) fn failed(&self, error: vk::Result) -> Error {
         if error == vk::Result::ERROR_DEVICE_LOST {
             self.mark_lost();

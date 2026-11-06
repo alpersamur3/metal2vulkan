@@ -192,6 +192,7 @@ mod sharing;
 mod sorted_chunks;
 mod spares;
 mod sparse;
+mod sparse_log;
 mod stencil_copy;
 mod storage_placeholder;
 mod tessellation;

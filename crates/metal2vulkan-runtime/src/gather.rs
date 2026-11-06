@@ -222,6 +222,7 @@ impl Drop for HostChunk {
         // SAFETY: no buffer is bound to the chunk any more (every holder's buffer was destroyed
         // before it let go of it), and no command reads it.
         if unsafe { release::object(self.functions.get(), self.memory) } {
+            crate::sparse_log::chunk(true, self.memory, self.first, self.size);
             CHUNKS_LIVE.fetch_sub(1, Ordering::Relaxed);
             CHUNK_BYTES_LIVE.fetch_sub(self.size, Ordering::Relaxed);
         }
@@ -727,6 +728,7 @@ impl Device {
             ImportFailure::NoMemoryType => not_importable(),
             ImportFailure::Vulkan(error) => import_refused(error),
         })?;
+        crate::sparse_log::chunk(false, memory, first, size);
         CHUNKS_LIVE.fetch_add(1, Ordering::Relaxed);
         CHUNK_BYTES_LIVE.fetch_add(size, Ordering::Relaxed);
         CHUNKS_IMPORTED.fetch_add(1, Ordering::Relaxed);
