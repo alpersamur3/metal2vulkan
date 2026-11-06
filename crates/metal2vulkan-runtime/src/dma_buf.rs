@@ -336,7 +336,7 @@ fn answers(chunks: &[DmaBufChunk], request: &DmaBufRequest, page: u64) -> bool {
 
 /// The bytes of the dma-buf `fd`; `None` where it is no dma-buf (its file is not on the kernel's
 /// dma-buf file system).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn dma_buf_length(fd: BorrowedFd<'_>) -> Option<u64> {
     use std::os::fd::AsRawFd;
     /// `DMA_BUF_MAGIC` of Linux's `include/uapi/linux/magic.h`.
@@ -359,7 +359,7 @@ fn dma_buf_length(fd: BorrowedFd<'_>) -> Option<u64> {
 }
 
 /// No file is a dma-buf on this system.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn dma_buf_length(_fd: BorrowedFd<'_>) -> Option<u64> {
     None
 }

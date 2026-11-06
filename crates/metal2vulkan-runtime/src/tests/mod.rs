@@ -77,7 +77,7 @@ mod host_aliases;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod host_import_counts;
 mod host_memory;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+#[cfg(all(any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
 mod host_residency;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod host_step_neutrals;
@@ -123,7 +123,7 @@ mod pipeline;
 mod pipeline_wait_order;
 #[cfg(unix)]
 mod pixel_format_info;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+#[cfg(all(any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
 mod pointer_residency;
 mod private_properties;
 mod queue;

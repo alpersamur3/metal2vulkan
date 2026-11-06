@@ -493,7 +493,7 @@ impl Sweeper {
 
     /// Release every releasable import idle now (`force`: whatever its window), on this thread:
     /// how many.
-    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
     pub(super) fn sweep(&self, force: bool) -> usize {
         sweep(&self.shared, force)
     }
@@ -554,7 +554,7 @@ fn sweep(shared: &Shared, force: bool) -> usize {
 }
 
 /// The crate's device tests' hooks (`tests/host_residency.rs`).
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
 impl Device {
     /// Release now every import of a no-copy buffer's dma-bufs that the device releases while
     /// idle, whatever its idle window: those no command buffer holds, whose Metal address was

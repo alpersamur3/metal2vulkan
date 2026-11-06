@@ -218,12 +218,12 @@ fn the_host_page_is_unknown_elsewhere() {
 }
 
 /// Lines of `/proc/<pid>/maps` (address order) for the writability check.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn maps(lines: &[&str]) -> Vec<String> {
     lines.iter().map(|line| line.to_string()).collect()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn only_pages_mapped_writable_without_a_gap_are_importable() {
     use crate::host_memory::writable;
@@ -257,7 +257,7 @@ fn only_pages_mapped_writable_without_a_gap_are_importable() {
 
 /// The mapping queries go through one file the process keeps open (`host_memory::kept_maps`),
 /// opened once, whose answers follow the mappings as they are at each query (the test below).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn the_mapping_queries_keep_one_file_open() {
     use crate::host_memory::kept_maps;
@@ -268,7 +268,7 @@ fn the_mapping_queries_keep_one_file_open() {
 
 /// The check reads this process's own mappings: a fresh page is importable until it is made
 /// read-only, and a page no longer mapped is not, through the kept file's queries as they are now.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn this_process_s_read_only_and_unmapped_pages_are_refused() {
     use crate::error::Error;
@@ -315,7 +315,7 @@ fn this_process_s_read_only_and_unmapped_pages_are_refused() {
 /// answers read the address space of a child forked for each state ([`window_answers`]), which
 /// no other thread changes: in this process, another test's mapping may take the unmapped page
 /// between the two readings.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn the_kernel_s_answer_for_a_window_is_the_maps_lines_answer() {
     let page = host_page().unwrap();
@@ -384,7 +384,7 @@ fn the_kernel_s_answer_for_a_window_is_the_maps_lines_answer() {
 /// process leaves only async-signal-safe calls safe; another thread may have held `malloc`'s lock)
 /// and ends with `_exit`, which runs no exit handler; this process reads the lines' answers from
 /// the copy.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn window_answers<const N: usize>(windows: &[(u64, u64); N]) -> [(bool, Option<bool>); N] {
     use crate::host_memory::writable;
     use std::io::Read;
@@ -434,7 +434,7 @@ fn window_answers<const N: usize>(windows: &[(u64, u64); N]) -> [(bool, Option<b
 /// The forked child's side of [`window_answers`], which allocates nothing: one byte per window
 /// for the kernel's answer (1 where it answers, plus 2 where that is writable), then the maps
 /// text, written to `sink`. The exit code: 0, or what failed (2 the open, 3 a write, 4 a read).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn send_window_answers<const N: usize>(sink: i32, windows: &[(u64, u64); N]) -> i32 {
     use crate::host_memory::queried_writable;
     use std::os::fd::FromRawFd;

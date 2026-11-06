@@ -4,7 +4,6 @@ members = [
     "crates/metal2vulkan-air",
     "crates/metal2vulkan-devtools",
     "crates/metal2vulkan-runtime",
-    "crates/metal2vulkan-validation",
 ]
 # A bare `cargo build`, `cargo test` or `cargo run` at the root acts on the translator alone, as it
 # did when the translator's package was this manifest; `--workspace` or `-p` selects the others.

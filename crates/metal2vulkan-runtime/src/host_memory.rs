@@ -455,7 +455,7 @@ pub(super) fn import_refused(error: vk::Result) -> Error {
 /// the reading, which cost about 4.5 ms per import in a process of 34,000 mappings. Each mapping
 /// asked is counted in `counts` (`WorkCounts::host_mappings_queried`). When the file cannot be
 /// opened, every import is refused as not implemented here.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn refuse_unwritable(window: &ImportWindow, counts: &Counters) -> Result<(), Error> {
     let mut asked = 0;
     let answer = mappings_writable(window.start, window.start + window.size, &mut asked);
@@ -473,7 +473,7 @@ pub(super) fn refuse_unwritable(window: &ImportWindow, counts: &Counters) -> Res
 /// kernel answers now: for the mappings over it ([`queried_writable`]), or from the lines of
 /// `/proc/self/maps` where the kernel predates the query ([`writable`]); `None` when that file
 /// cannot be opened. Each mapping asked is added to `asked`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn mappings_writable(start: u64, end: u64, asked: &mut u64) -> Option<bool> {
     use std::io::BufRead;
     let maps = kept_maps()?;
@@ -493,7 +493,7 @@ fn mappings_writable(start: u64, end: u64, asked: &mut u64) -> Option<bool> {
 /// answers as one opened for the call, without the opening, which cost each import about as much
 /// as its queries (an import over 57 mappings, the consumer's guest pages). A process forked
 /// since holds the file of its parent's mappings, so one of another id opens its own.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
     static KEPT: Mutex<Option<(u32, std::sync::Arc<std::fs::File>)>> = Mutex::new(None);
     let process = std::process::id();
@@ -508,7 +508,7 @@ pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
 
 /// `struct procmap_query` of Linux's `include/uapi/linux/fs.h` (Linux 6.11): the argument of
 /// [`PROCMAP_QUERY`].
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[repr(C)]
 #[derive(Default)]
 struct ProcmapQuery {
@@ -529,17 +529,17 @@ struct ProcmapQuery {
     build_id_addr: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const _: () = assert!(std::mem::size_of::<ProcmapQuery>() == 104);
 
 /// `PROCMAP_QUERY`, `_IOWR('f', 17, struct procmap_query)` in the generic ioctl encoding (an
 /// architecture of another encoding answers `ENOTTY`, and its imports take the lines).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const PROCMAP_QUERY: u64 =
     (3 << 30) | ((std::mem::size_of::<ProcmapQuery>() as u64) << 16) | ((b'f' as u64) << 8) | 17;
 
 /// `PROCMAP_QUERY_VMA_WRITABLE`: the mapping's `VM_WRITE`, the `w` of its line in the maps.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
 
 /// Whether the process maps `[start, end)` without a gap, each mapping with write permission, as
@@ -547,7 +547,7 @@ const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
 /// mapping the window touches, each for the mapping covering the first address not yet covered,
 /// and each added to `asked`. `None` where the kernel does not answer the query (before Linux
 /// 6.11, `ENOTTY`) or fails it otherwise; a missing mapping (`ENOENT`) is an answer, not writable.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn queried_writable(
     maps: &std::fs::File,
     start: u64,
@@ -590,7 +590,7 @@ pub(super) fn queried_writable(
 
 /// Refuse the window's pages unless the process can write them: no check off Linux (MoltenVK
 /// hands the range to Metal, which reads read-only pages).
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> Result<(), Error> {
     Ok(())
 }
@@ -599,7 +599,7 @@ pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> R
 /// `[start, end)` without a gap, each with write permission, adding to `asked` each mapping it
 /// judged (one ending past the address it reached). Reading stops at the first line past `end`; a
 /// line that does not parse is skipped.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn writable(
     maps: impl IntoIterator<Item = String>,
     start: u64,
@@ -627,7 +627,7 @@ pub(super) fn writable(
 }
 
 /// One line of `/proc/<pid>/maps`: the mapping's start, its end, and whether it is writable.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn mapping(line: &str) -> Option<(u64, u64, bool)> {
     let mut fields = line.split_ascii_whitespace();
     let (from, to) = fields.next()?.split_once('-')?;

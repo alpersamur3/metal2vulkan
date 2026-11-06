@@ -789,7 +789,7 @@ fn no_wait_for_a_cpu_device_s_work_follows_a_destructor_between_the_hook_s_runs(
 
 /// A child's exit, as its parent saw it: its status, how long it took from the child's call of
 /// `exit` to its end, and what it wrote on standard error.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 struct ChildExit {
     status: libc::c_int,
     took: Duration,
@@ -797,7 +797,7 @@ struct ChildExit {
 }
 
 /// The clock every process reads alike (`CLOCK_MONOTONIC`), in nanoseconds.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 fn monotonic_ns() -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
@@ -810,7 +810,7 @@ fn monotonic_ns() -> u64 {
 
 /// Fork a child that runs `child` (its exit handlers, its devices, what is in progress as it
 /// exits), then calls the C library's `exit` with `status`; its standard error goes to a pipe.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 fn child_exit(child: fn(), status: libc::c_int) -> ChildExit {
     use std::io::Read;
     use std::os::fd::FromRawFd;
@@ -876,7 +876,7 @@ fn child_exit(child: fn(), status: libc::c_int) -> ChildExit {
 /// thread) ends the process at once with that status, says so on standard error in one line, and
 /// runs no handler registered before the hook: Metal's process ends within 2 ms of its `exit`.
 /// Before, the hook waited 2 s, returned, and the handler ran.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 #[test]
 fn a_busy_exit_ends_at_once_with_its_status() {
     /// An exit handler the program registered before the runtime's (a terminal's restore): it
@@ -1162,7 +1162,7 @@ fn the_threads_that_take_command_buffers_to_their_handlers_run_at_the_user_inter
 /// such as ananicy-cpp put in `SCHED_IDLE` may not leave it), `SCHED_IDLE` always. Where the kernel
 /// refuses the floor (built without the clamps), every thread reads none, and the kernel refuses
 /// one the test asks for itself.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn the_threads_that_take_command_buffers_to_their_handlers_run_with_the_utilization_floor() {
     use crate::command_buffer::completion::Completion;
@@ -2327,7 +2327,7 @@ fn a_section_after_an_entry_point_s_first_call_since_a_load_registers_the_hook_a
 
 /// The process's count of loaded shared objects never falls, and rises when one is loaded (where
 /// a library not loaded yet can be found here).
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 #[test]
 fn the_count_of_loaded_objects_rises_with_a_load() {
     use std::ffi::CString;

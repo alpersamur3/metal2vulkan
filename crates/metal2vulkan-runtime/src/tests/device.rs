@@ -564,7 +564,7 @@ fn the_default_loaders_reach_past_the_dynamic_linker_s_paths_on_macos() {
             ]
         );
         assert_eq!(default_loaders(None).len(), 4);
-    } else if cfg!(target_os = "linux") {
+    } else if cfg!(any(target_os = "linux", target_os = "android")) {
         assert_eq!(found, ["libvulkan.so.1"]);
     }
 }

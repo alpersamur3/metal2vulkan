@@ -168,14 +168,14 @@ use std::time::{Duration, Instant};
 /// submission, one poll (at most 100 ms), one counter read, one save's read, or one object's
 /// release (a device's: its threads' stops, `vkDeviceWaitIdle`, its destruction); it outlasts this
 /// only when a driver or a message sink blocks.
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu")))]
 pub(crate) const BOUND: Duration = Duration::from_secs(2);
 
 /// The longest the hook waits, where it learns no exit status (macOS), while a driver's making of
 /// a `VkPipeline` is in progress in a section ([`driver_making`]), for the sections in progress: a
 /// making takes 20 to 50 s on NVIDIA (`pipeline/piece_holds.rs`), and Metal's process waited for
 /// all of it at the state's creation, before its exit.
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu")))]
 pub(crate) const MAKING_BOUND: Duration = Duration::from_secs(60);
 
 /// The longest a blocked wait goes without looking at the guard.
@@ -930,7 +930,7 @@ fn run_at_user_interactive() {
 /// Ask the scheduler to treat this thread as fully busy whenever it runs, and no thread it starts:
 /// a thread of the runtime's own that takes command buffers to their handlers
 /// ([`spawn_user_interactive`]), as macOS runs them at the user-interactive class.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn run_at_user_interactive() {
     // `SCHED_FLAG_RESET_ON_FORK`, `SCHED_FLAG_KEEP_PARAMS` and `SCHED_FLAG_UTIL_CLAMP_MIN`
     // (`<linux/sched.h>`).
@@ -976,7 +976,7 @@ fn run_at_user_interactive() {
 
 /// `struct sched_attr` of `sched_setattr(2)` and `sched_getattr(2)` (`<linux/sched/types.h>`), its
 /// 56-byte version, the first with the utilization clamps.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SchedAttr {
@@ -992,7 +992,7 @@ pub(crate) struct SchedAttr {
     pub(crate) sched_util_max: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl SchedAttr {
     /// Its size, which `size` states.
     const SIZE: u32 = std::mem::size_of::<SchedAttr>() as u32;
@@ -1034,7 +1034,7 @@ impl SchedAttr {
 }
 
 /// Nothing: no such hint here ([`run_at_user_interactive`] on macOS and Linux).
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 fn run_at_user_interactive() {}
 
 /// Whether this thread runs at the user-initiated quality of service or above: its class is
@@ -1308,7 +1308,7 @@ fn register_again() {
 
 /// Register [`exit_handler`] with the C library's exit handlers: through `on_exit(3)`, which
 /// shares `atexit`'s order and passes the exit's status.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 fn install() {
     INSTALLED.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `exit_handler` takes the status and an argument it does not read, and never
@@ -1318,7 +1318,7 @@ fn install() {
 }
 
 /// Register [`exit_handler`] with the C library's exit handlers.
-#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
+#[cfg(all(unix, not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))))]
 fn install() {
     INSTALLED.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `exit_handler` is a function with no arguments that never unwinds. Registration
@@ -1334,7 +1334,7 @@ fn install() {}
 // The GNU C library's `on_exit(3)` (`<stdlib.h>`), which `libc` does not declare: `function` is
 // called with `exit`'s status and `argument`, among the handlers `atexit` registers, in the
 // reverse order of their registration.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 unsafe extern "C" {
     fn on_exit(
         function: extern "C" fn(std::ffi::c_int, *mut std::ffi::c_void),
@@ -1345,7 +1345,7 @@ unsafe extern "C" {
 /// The exit handler, where it learns the exit's status: the hook waits for nothing, and where the
 /// driver is running what the runtime gave it, the process ends at once with that status
 /// ([`end_at_once`]).
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 extern "C" fn exit_handler(status: std::ffi::c_int, _: *mut std::ffi::c_void) {
     let ended = hook(
         &GUARD,
@@ -1363,7 +1363,7 @@ extern "C" fn exit_handler(status: std::ffi::c_int, _: *mut std::ffi::c_void) {
 
 /// The exit handler, where it learns no status (`atexit`): the hook waits at most [`BOUND`], or
 /// [`MAKING_BOUND`] while a making is in progress, and returns.
-#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
+#[cfg(all(unix, not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))))]
 extern "C" fn exit_handler() {
     hook(
         &GUARD,
@@ -1381,9 +1381,9 @@ extern "C" fn exit_handler() {
 /// the child inherits.
 #[cfg(all(test, unix))]
 pub(crate) fn run_on_exit(status: std::ffi::c_int) {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
     exit_handler(status, std::ptr::null_mut());
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu")))]
     {
         let _ = status;
         exit_handler();
@@ -1391,7 +1391,7 @@ pub(crate) fn run_on_exit(status: std::ffi::c_int) {
 }
 
 /// What [`end_at_once`] writes on standard error, one line in a degrade notice's form.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 pub(crate) const AT_ONCE_NOTICE: &str = "metal2vulkan: the process's exit: the Vulkan driver is \
     still running the runtime's work (a call, a pipeline's making, or a CPU device's commands); \
     the process ends at once with its status, and the exit handlers registered before the \
@@ -1402,7 +1402,7 @@ pub(crate) const AT_ONCE_NOTICE: &str = "metal2vulkan: the process's exit: the V
 /// work. One line on standard error ([`AT_ONCE_NOTICE`]), the C library's output streams flushed
 /// (as `exit` flushes them after its handlers), then `_exit`: no later exit handler or destructor
 /// runs, beside the driver's call or after it.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
 fn end_at_once(status: std::ffi::c_int) -> ! {
     // SAFETY: writes the notice's bytes, live for the call, to standard error; a failed write
     // is ignored, as the exit goes on.

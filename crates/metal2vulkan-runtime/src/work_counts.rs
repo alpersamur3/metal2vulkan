@@ -1323,7 +1323,7 @@ impl Counters {
     /// The kernel was asked about `mappings` of the process's mappings, for their write
     /// permission, before an import of host pages (`host_memory.rs`'s `refuse_unwritable`, which
     /// asks only on Linux).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn host_mappings_queried(&self, mappings: u64) {
         if mappings > 0 {
             self.host_mappings_queried
