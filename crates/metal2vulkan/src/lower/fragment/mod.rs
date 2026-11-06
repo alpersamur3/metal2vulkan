@@ -343,8 +343,8 @@ pub fn finish(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<(), Error> {
     let shadow = cx.families.fragment.stencil.is_some();
     let storage = !cx.families.fragment.fetch.is_empty() || shadow;
     let interlock =
-        if rog::declared(cx.entry) || cx.families.fragment.imageblock.is_some() || storage {
-            Some(rog::mode(cx)?)
+        if rog::needs_interlock(cx) || cx.families.fragment.imageblock.is_some() || storage {
+            rog::mode(cx)?
         } else {
             None
         };

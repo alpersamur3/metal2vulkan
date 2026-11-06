@@ -27,6 +27,13 @@
 //! output alone does not interlock the function, so a function whose groups hold nothing else
 //! compiles on every device, the ones without an interlock included.
 //!
+//! **Color inputs**. On a device without the pixel interlock but with rasterization-order color
+//! attachment access (Turnip), a group's color input and color output are ordered by that access:
+//! an input attachment's read sees every earlier overlapping fragment's write. Those alone do not
+//! interlock the function there ([`needs_interlock`]). A group on any other memory still asks for
+//! it, and such a device has none: the function runs unordered and says so ([`mode`]), which only
+//! overlapping fragments of a draw can tell from Metal; iOS' own compositor needs these functions.
+//!
 //! **Mode** ([`mode`]). `PixelInterlockOrderedEXT` where the profile has
 //! `fragmentShaderPixelInterlock`: it orders every invocation covering the pixel, which covers
 //! Metal's pixel- and sample-rate ordering. `SampleInterlockOrderedEXT` orders only invocations
@@ -79,20 +86,36 @@ fn role_layouts(role: &ParamRole) -> [Option<StructRef>; 2] {
 /// `e.structs` holds every layout of the module, so a layout only another function names does not
 /// count. A group's color output the function does not read needs none ([module docs](self)).
 pub(super) fn declared(e: &Entry) -> bool {
-    let params = e.ep.params.iter().any(|b| role_group(&b.role).is_some());
+    declared_on(e, true)
+}
+
+/// Whether the function's groups need the interlock on this device: [`declared`], without the
+/// color inputs and outputs on a device whose rasterization-order access orders them
+/// ([module docs](self)).
+pub(super) fn needs_interlock(cx: &SelectCx<'_>) -> bool {
+    let f = cx.profile.fields().fragment;
+    declared_on(cx.entry, f.pixel_interlock || !f.rasterization_order_color_access)
+}
+
+/// [`declared`], counting a group on a color input or output only when `colors`.
+fn declared_on(e: &Entry, colors: bool) -> bool {
+    let params = e.ep.params.iter().any(|b| {
+        (colors || !matches!(b.role, ParamRole::ColorInput { .. })) && role_group(&b.role).is_some()
+    });
     let read = |attachment| {
         e.ep.params
             .iter()
             .any(|b| matches!(b.role, ParamRole::ColorInput { index, .. } if index == attachment))
     };
-    let outputs = e.ep.outputs.iter().any(|o| match o.role {
-        OutputRole::RenderTarget {
-            attachment,
-            raster_order_group: Some(_),
-            ..
-        } => read(attachment),
-        _ => false,
-    });
+    let outputs = colors
+        && e.ep.outputs.iter().any(|o| match o.role {
+            OutputRole::RenderTarget {
+                attachment,
+                raster_order_group: Some(_),
+                ..
+            } => read(attachment),
+            _ => false,
+        });
     if params || outputs {
         return true;
     }
@@ -143,9 +166,23 @@ fn sample_rate(objects: &[IoObject]) -> bool {
     })
 }
 
-/// The interlock mode of a function in a raster order group, or its refusal. Called once the
-/// stage interface is planned (`fragment::finish`).
-pub(super) fn mode(cx: &SelectCx<'_>) -> Result<ExecMode, Error> {
+/// What the first group of entry `e` that needs the interlock is on, for the line [`mode`] prints.
+fn group_memory(e: &Entry) -> &'static str {
+    let named = e.ep.params.iter().find_map(|b| match &b.role {
+        ParamRole::Buffer(a) if a.raster_order_group.is_some() => Some("a buffer"),
+        ParamRole::ArgumentBuffer(a) if a.raster_order_group.is_some() => {
+            Some("an argument buffer")
+        }
+        ParamRole::Threadgroup(a) if a.raster_order_group.is_some() => Some("threadgroup memory"),
+        ParamRole::Texture(t) if t.raster_order_group.is_some() => Some("a texture"),
+        _ => None,
+    });
+    named.unwrap_or("a member of a layout")
+}
+
+/// The interlock mode of a function in a raster order group, `None` to run unordered, or its
+/// refusal. Called once the stage interface is planned (`fragment::finish`).
+pub(super) fn mode(cx: &SelectCx<'_>) -> Result<Option<ExecMode>, Error> {
     if cx.stage != Stage::Fragment {
         // Metal orders raster order groups between fragments only.
         return Err(Unsupported::not_implemented(Feature::RasterOrderGroups).into());
@@ -153,10 +190,23 @@ pub(super) fn mode(cx: &SelectCx<'_>) -> Result<ExecMode, Error> {
     let f = cx.profile.fields().fragment;
     let per_sample = sample_rate(&cx.families.stage_io.objects);
     if f.pixel_interlock {
-        return Ok(ExecMode::PixelInterlockOrdered);
+        return Ok(Some(ExecMode::PixelInterlockOrdered));
     }
     if f.sample_interlock && per_sample {
-        return Ok(ExecMode::SampleInterlockOrdered);
+        return Ok(Some(ExecMode::SampleInterlockOrdered));
+    }
+    // A group alone, on a device that orders attachments but has no interlock ([module docs](self));
+    // an imageblock, the storage form and a stencil shadow cannot do without one.
+    let fragment = &cx.families.fragment;
+    let group_alone =
+        fragment.imageblock.is_none() && fragment.fetch.is_empty() && fragment.stencil.is_none();
+    if group_alone && f.rasterization_order_color_access {
+        eprintln!(
+            "metal2vulkan: the fragment function of a render pipeline state: its raster order \
+             group on {} runs unordered: the device has no pixel interlock",
+            group_memory(cx.entry)
+        );
+        return Ok(None);
     }
     let pixel = vec![Capability::Feature(VkFeature::FragmentShaderPixelInterlock)];
     let alternatives = if per_sample {
