@@ -563,6 +563,22 @@ struct Raw {
 /// bound to (`dma_buf.rs`), freed after it is destroyed.
 pub(super) enum RawHold {
     Import { _pages: ImageImport },
+    /// The sparse binding of an image of gathered pages (`gather.rs`): the internal timeline and
+    /// the value it signals, waited for before the image is destroyed.
+    Bound((vk::Semaphore, u64)),
+}
+
+impl RawHold {
+    /// Waits for the sparse binding it holds, before its image is destroyed.
+    fn settle(&self, device: &Device) {
+        match self {
+            #[cfg(unix)]
+            RawHold::Bound(binding) => crate::gather::settle_binding(device, *binding),
+            _ => {
+                let _ = device;
+            }
+        }
+    }
 }
 
 /// The dedicated import of the pages a texture's image over dma-buf pages is bound to
@@ -582,6 +598,15 @@ impl Raw {
         }
     }
 
+    /// `raw`, a sparse image whose binding to gathered pages is `binding` (`gather.rs`).
+    #[cfg(unix)]
+    fn bound(raw: vk::Image, binding: (vk::Semaphore, u64)) -> Raw {
+        Raw {
+            image: AtomicU64::new(raw.as_raw()),
+            import: Mutex::new(Some(RawHold::Bound(binding))),
+        }
+    }
+
     /// `raw`, bound to `import`, its dedicated import.
     #[cfg(unix)]
     fn imported(raw: vk::Image, import: ImageImport) -> Raw {
@@ -595,7 +620,7 @@ impl Raw {
     fn dedicated(&self) -> bool {
         match &*lock(&self.import) {
             Some(RawHold::Import { .. }) => true,
-            None => false,
+            Some(RawHold::Bound(_)) | None => false,
         }
     }
 
@@ -646,6 +671,10 @@ impl Drop for ImageObjects {
             // one's after the views above).
             match &self.raw_goes {
                 RawGoes::Destroyed => {
+                    // A sparse image of gathered pages waits for its binding (`gather.rs`).
+                    if let Some(hold) = &self.import {
+                        hold.settle(&self.device);
+                    }
                     release::object(raw, self.raw);
                 }
                 RawGoes::WithStandIn(stand_in) => {
@@ -775,6 +804,19 @@ impl ImageObjects {
             views: Vec::new(),
             raw_goes: RawGoes::Destroyed,
             import: None,
+        }
+    }
+
+    /// `raw`, a new sparse image of `device`'s whose binding to gathered pages is `binding`
+    /// (`gather.rs`), with no views yet.
+    #[cfg(unix)]
+    fn bound(device: &Device, raw: vk::Image, binding: (vk::Semaphore, u64)) -> ImageObjects {
+        ImageObjects {
+            device: device.clone(),
+            raw,
+            views: Vec::new(),
+            raw_goes: RawGoes::Destroyed,
+            import: Some(RawHold::Bound(binding)),
         }
     }
 
@@ -1156,6 +1198,10 @@ impl Drop for Image {
             Some(detached) => detached.own,
             None => Some(self.raw.get()),
         };
+        // A sparse image of gathered pages waits for its binding (`gather.rs`).
+        if let Some(hold) = &*lock(&self.raw.import) {
+            hold.settle(&self.device);
+        }
         // The kept resolve objects go before the views they were made of.
         self.resolves.clear();
         unsafe {
@@ -2538,6 +2584,10 @@ impl Device {
         let Some(imports) = placement.dma_buf_pages() else {
             return Ok(remade);
         };
+        // Gathered pages take sparse images, made as the rebind settles (`rebound_heap_images`).
+        if imports.is_gathered() {
+            return Ok(remade);
+        }
         let type_index = placement.type_index();
         self.dma_buf_heap_images_again(heap, imports, type_index, pointer, &mut remade)?;
         Ok(remade)

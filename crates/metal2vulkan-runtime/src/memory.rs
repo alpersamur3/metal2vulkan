@@ -1396,6 +1396,55 @@ impl Memory {
         Err(failure)
     }
 
+    /// Import `size` bytes of a host region's pages at `pointer` (a chunk of it, `gather.rs`) as
+    /// memory of the best type of `class` among `allowed` (the types both the pointer and the
+    /// sparse buffers bound in it take): the memory and its type, the caller's to free
+    /// (`gather.rs`'s `HostChunk`), in no block, its host address the pointer. Allocated with the
+    /// device-address flag where the device enables `bufferDeviceAddress`. Refused when no type
+    /// of `class` is among `allowed`, else with the failure of the last type tried.
+    ///
+    /// # Safety
+    ///
+    /// The `size` bytes at `pointer` are host memory of this process, mapped and writable, that
+    /// stays mapped until the memory is freed.
+    #[cfg(unix)]
+    pub(super) unsafe fn import_host_chunk(
+        &self,
+        device: &ash::Device,
+        pointer: NonNull<u8>,
+        size: u64,
+        (allowed, class): (u32, MemoryClass),
+    ) -> Result<(vk::DeviceMemory, u32), ImportFailure> {
+        let mut failure = ImportFailure::NoMemoryType;
+        for type_index in candidates(&self.types, allowed, class, self.unified) {
+            let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+                .host_pointer(pointer.as_ptr().cast());
+            let mut flags = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let mut info = vk::MemoryAllocateInfo::default()
+                .allocation_size(size)
+                .memory_type_index(type_index)
+                .push_next(&mut import);
+            if self.device_address {
+                info = info.push_next(&mut flags);
+            }
+            // SAFETY: `info` and its chain live for the call; the type index is the device's and
+            // allows the pointer; the caller's contract keeps the memory mapped.
+            match unsafe { device.allocate_memory(&info, None) } {
+                Ok(memory) => {
+                    if let Some(log) = &self.log {
+                        let what = "imported a chunk of a host region";
+                        log.say(what, memory, type_index, size, None);
+                    }
+                    return Ok((memory, type_index));
+                }
+                Err(error) => failure = ImportFailure::Vulkan(error),
+            }
+        }
+        Err(failure)
+    }
+
     /// The property flags of memory type `index`, where the device has it.
     pub(super) fn type_flags(&self, index: u32) -> Option<vk::MemoryPropertyFlags> {
         self.types

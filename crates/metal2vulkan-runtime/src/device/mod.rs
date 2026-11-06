@@ -631,6 +631,12 @@ impl Drop for DeviceShared {
         }
         // Nor a kept barrier command buffer: the queues are idle.
         self.scheduler.release_kept(self.vk());
+        // The chunks of host regions no gathered buffer holds any more (`gather.rs`): every other
+        // holder held the device.
+        #[cfg(unix)]
+        if let Ok(importer) = &self.host_import {
+            importer.chunks.clear();
+        }
         // No command buffer is left to give back a spare, or to hold one.
         self.spares.release(self);
         if let Some(internal) = lock(&self.internal).take() {

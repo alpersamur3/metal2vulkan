@@ -186,6 +186,9 @@ pub(super) struct DmaBufPages {
     /// imported, as the descriptors to import it again did not fit (`host_residency.rs`):
     /// counted in `WorkCounts::host_imports_kept_for_fds` while the pages live.
     kept_for_fds: bool,
+    /// The chunks of host regions the pages were gathered from instead (`gather.rs`): no import
+    /// of the placement's own, and no source; let go of after the buffer bound to them.
+    gathered: Option<crate::gather::GatheredChunks>,
 }
 
 impl Drop for DmaBufPages {
@@ -200,6 +203,11 @@ impl Drop for DmaBufPages {
         };
         let shared = self.device.shared();
         let raw_device = shared.vk();
+        if let Some(gathered) = self.gathered.take() {
+            // Its chunks linger a while for a later buffer over them (`gather.rs`).
+            drop(gathered);
+            return;
+        }
         if let Some(log) = crate::memory_log::MemoryLog::new(shared.instance.sink()) {
             use ash::vk::Handle;
             let memories: Vec<String> = (self.memories.iter())
@@ -247,7 +255,48 @@ impl DmaBufPages {
             length: request.length,
             bound: None,
             kept_for_fds: false,
+            gathered: None,
         }
+    }
+
+    /// The pages of `length` bytes from `start`, gathered from `chunks` of host regions into a
+    /// sparse buffer whose binding `bound` signals (`gather.rs`): no import of their own and no
+    /// source, so a texture over them is a shadow.
+    pub(super) fn gathered(
+        device: &Device,
+        start: NonNull<u8>,
+        length: u64,
+        chunks: crate::gather::GatheredChunks,
+        bound: (vk::Semaphore, u64),
+    ) -> DmaBufPages {
+        DmaBufPages {
+            device: device.clone(),
+            memories: Vec::new(),
+            of_image: false,
+            source: None,
+            start: start.as_ptr() as u64,
+            length,
+            bound: Some(bound),
+            kept_for_fds: false,
+            gathered: Some(chunks),
+        }
+    }
+
+    /// Whether the pages were gathered from chunks of host regions (`gather.rs`), not imported
+    /// as dma-bufs: no image of a dma-buf is made over them.
+    pub(super) fn is_gathered(&self) -> bool {
+        self.gathered.is_some()
+    }
+
+    /// The opaque binds of an image of `size` bytes at `at` of gathered pages, at a granule of
+    /// `granule` (`GatheredChunks::image_binds`); `None` for pages not gathered.
+    pub(super) fn gathered_image_binds(
+        &self,
+        at: u64,
+        size: u64,
+        granule: u64,
+    ) -> Option<Vec<vk::SparseMemoryBind>> {
+        self.gathered.as_ref()?.image_binds(at, size, granule)
     }
 
     /// Hold `memory`, imported from one of the source's dma-bufs, until the pages go; counted

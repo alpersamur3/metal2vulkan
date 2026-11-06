@@ -98,6 +98,8 @@
 use super::device::lock;
 #[cfg(unix)]
 use super::dma_buf::DmaBufSource;
+#[cfg(unix)]
+use super::gather::{Chunks, GatherSource};
 use super::error::{vulkan, Error};
 use super::exit_guard;
 use super::loader_word::LoaderWord;
@@ -119,10 +121,25 @@ pub struct HostMemory {
     source: Option<Source>,
 }
 
-/// What a [`HostMemory`] may carry besides its pointer: a [`DmaBufSource`] where the system has
-/// file descriptors, nothing elsewhere.
+/// What a [`HostMemory`] may carry besides its pointer, where the system has file descriptors: a
+/// [`DmaBufSource`] for a device that refuses the pointer, or a [`GatherSource`] for memory whose
+/// pointer is no mapping the device imports (`gather.rs`).
 #[cfg(unix)]
-pub(super) type Source = DmaBufSource;
+pub(super) enum Source {
+    /// Dma-bufs of the pages (`dma_buf.rs`).
+    DmaBuf(DmaBufSource),
+    /// Where the pages lie in host regions the device imports in chunks (`gather.rs`).
+    Gather(GatherSource),
+}
+
+#[cfg(unix)]
+impl Source {
+    /// Whether it gathers the pages (`gather.rs`): the pointer is never imported first, nor its
+    /// pages' writability asked.
+    pub(super) fn gathers(&self) -> bool {
+        matches!(self, Source::Gather(_))
+    }
+}
 
 /// What a [`HostMemory`] may carry besides its pointer: nothing on this system.
 #[cfg(not(unix))]
@@ -140,7 +157,7 @@ impl std::fmt::Debug for HostMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostMemory")
             .field("pointer", &self.pointer)
-            .field("dma_buf", &self.source.is_some())
+            .field("source", &self.source.is_some())
             .finish()
     }
 }
@@ -219,7 +236,33 @@ impl HostMemory {
     pub unsafe fn with_dma_buf(pointer: NonNull<u8>, source: DmaBufSource) -> HostMemory {
         HostMemory {
             pointer,
-            source: Some(source),
+            source: Some(Source::DmaBuf(source)),
+        }
+    }
+
+    /// The host memory at `pointer` whose pages lie scattered in host regions the device imports
+    /// in chunks (a runtime extension, [`GatherSource`], `gather.rs`): the runtime never imports
+    /// the pointer itself, nor reads the process's mappings over it, but asks the source where
+    /// the pages lie and binds a sparse buffer over its chunks of those regions, or imports the
+    /// pointer where the source answers it mapped (`GatherAnswer::Pointer`). `contents` answers
+    /// the pointer: the caller makes the bytes there the same pages before the CPU reaches them.
+    /// A texture over such memory, or placed in such a heap, is a shadow of the bytes. Refused as
+    /// [`HostMemory::new`]'s memory is (`Unsupported`, `HostMemory`) where the device binds no
+    /// sparse buffer of host allocations at the pieces' granule and the source does not answer
+    /// the pointer, a chunk is refused, or the source fails; pieces that break the source's
+    /// contract are misuse (`Invalid`, `Problem::DmaBuf`).
+    ///
+    /// # Safety
+    ///
+    /// [`HostMemory::new`]'s contract for the bytes at `pointer`, as the source answers where
+    /// they lie: the pages the source names for a window stay those bytes while the import lives,
+    /// in regions that stay mapped, shared and writable for the device's life; and where it
+    /// answers the pointer, the bytes are mapped there as [`HostMemory::new`] requires.
+    #[cfg(unix)]
+    pub unsafe fn with_gather(pointer: NonNull<u8>, source: GatherSource) -> HostMemory {
+        HostMemory {
+            pointer,
+            source: Some(Source::Gather(source)),
         }
     }
 
@@ -656,6 +699,13 @@ pub(super) struct Importer {
     /// the first time a pointer is refused and a source called; `None` where the device makes no
     /// such buffer.
     pub(super) sparse_granule: std::sync::OnceLock<Option<u64>>,
+    /// The granule a gather source's pieces are cut at (`gather.rs`): the alignment of a sparse
+    /// buffer of host allocations. Asked once; `None` where the device binds no sparse memory.
+    #[cfg(unix)]
+    pub(super) gather_granule: std::sync::OnceLock<Option<u64>>,
+    /// The chunks of host regions imported for gathered buffers (`gather.rs`).
+    #[cfg(unix)]
+    pub(super) chunks: std::sync::Arc<Chunks>,
 }
 
 impl Importer {
@@ -727,6 +777,10 @@ impl Importer {
             dma_buf,
             dma_buf_images,
             sparse_granule: std::sync::OnceLock::new(),
+            #[cfg(unix)]
+            gather_granule: std::sync::OnceLock::new(),
+            #[cfg(unix)]
+            chunks: std::sync::Arc::new(Chunks::default()),
         })
     }
 

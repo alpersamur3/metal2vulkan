@@ -470,7 +470,10 @@ impl Device {
         // Only a buffer that imports its pages pins them, and so has their writability asked: one
         // that lies in a live import pins none, that import's making asked for the same window,
         // and the pages stay writable while imported (`HostMemory::new`).
-        refuse_unwritable(&window, &shared.counts)?;
+        // Gathered pages pin none of the pointer's: their chunks are the device's (`gather.rs`).
+        if !host.gathers() {
+            refuse_unwritable(&window, &shared.counts)?;
+        }
         // SAFETY: the window lies in the pages of the caller's bytes, which stay mapped
         // (`HostMemory::new`), and the source's pieces hold them (`HostMemory::with_dma_buf`). No
         // lock of the runtime's is held.
@@ -493,7 +496,7 @@ impl Device {
                 Err(source) => unsafe {
                     let keep = !of_heap;
                     let window = &window;
-                    self.import_from_source(
+                    self.import_from_any(
                         call, importer, pointer, length, window, source, class, keep,
                     )
                 }?,
@@ -614,8 +617,11 @@ impl Device {
         let (pages, remade) = match shares {
             Some(import) => (self.pages_in_import(import), Remade::default()),
             None => {
-                // Only pages imported here are pinned, and so have their writability asked.
-                refuse_unwritable(&window, &shared.counts)?;
+                // Only pages imported here are pinned, and so have their writability asked; a
+                // gather pins none of the pointer's (`gather.rs`).
+                if !host.gathers() {
+                    refuse_unwritable(&window, &shared.counts)?;
+                }
                 // Whether an import alive now holds every page of them: counted once the import
                 // is made (`WorkCounts::host_rebind_imports_covered`).
                 let unit = importer.page.max(importer.alignment);
@@ -636,7 +642,7 @@ impl Device {
                         // (`HostMemory::with_dma_buf`).
                         let (host, placement, _) = unsafe {
                             let window = &window;
-                            self.import_from_source(
+                            self.import_from_any(
                                 call, importer, pointer, length, window, source, class, false,
                             )
                         }?;
@@ -862,7 +868,7 @@ impl Device {
     ///
     /// The window's `size` bytes are host memory of this process that stays mapped until the
     /// placement is freed.
-    unsafe fn import_pointer(
+    pub(super) unsafe fn import_pointer(
         &self,
         importer: &Importer,
         pointer: NonNull<u8>,
@@ -919,13 +925,47 @@ impl Device {
         ))
     }
 
-    /// No dma-buf is imported on this system: there is no source to call.
+    /// The import of `window`'s pages through the caller's `source`, the pointer refused or not
+    /// tried: a dma-buf source's chunks (`dma_buf.rs`), or a gather source's pieces of host
+    /// regions (`gather.rs`), which keeps no import to make again.
+    ///
+    /// # Safety
+    ///
+    /// As [`Device::import_from_source`]'s, or [`Device::import_gathered`]'s for a gather source.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn import_from_any(
+        &self,
+        call: &'static str,
+        importer: &Importer,
+        pointer: NonNull<u8>,
+        length: u64,
+        window: &ImportWindow,
+        source: Source,
+        class: MemoryClass,
+        keep: bool,
+    ) -> Result<(HostBuffer, Placement, Option<Again>), Error> {
+        match source {
+            // SAFETY: the caller's.
+            Source::DmaBuf(source) => unsafe {
+                self.import_from_source(call, importer, pointer, length, window, source, class, keep)
+            },
+            // SAFETY: the caller's.
+            Source::Gather(source) => unsafe {
+                self.import_gathered(call, importer, pointer, length, window, source, class)
+            }
+            .map(|(buffer, placement)| (buffer, placement, None)),
+        }
+    }
+
+    /// No source exists on this system: there is nothing to call.
     ///
     /// # Safety
     ///
     /// None: it does nothing.
     #[cfg(not(unix))]
-    unsafe fn import_from_source(
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn import_from_any(
         &self,
         _call: &'static str,
         _importer: &Importer,
@@ -1106,11 +1146,14 @@ fn host_window(
     length: u64,
     source: Option<Source>,
 ) -> Result<HostWindow, Error> {
-    let source = source.filter(|_| importer.imports_dma_bufs());
+    let source = source.filter(|source| usable_source(importer, source));
     let at = pointer.as_ptr() as u64;
     let window = import_window(at, length, importer.page, 1)
         .map_err(|_| nil(call, Problem::BufferLength { length }))?;
-    let by_pointer = import_window(at, length, importer.page, importer.alignment).is_ok();
+    // Gathered pages are never imported by their pointer first (`gather.rs`): the pointer is no
+    // mapping of them until the source answers it is.
+    let by_pointer = import_window(at, length, importer.page, importer.alignment).is_ok()
+        && !source.as_ref().is_some_and(gathers);
     if !by_pointer && source.is_none() {
         return Err(not_importable());
     }
@@ -1119,6 +1162,42 @@ fn host_window(
         by_pointer,
         source,
     })
+}
+
+/// Whether the device can use `source`: a dma-buf source where it imports dma-bufs, a gather
+/// source always (`gather.rs`).
+#[cfg(unix)]
+fn usable_source(importer: &Importer, source: &Source) -> bool {
+    match source {
+        Source::DmaBuf(_) => importer.imports_dma_bufs(),
+        Source::Gather(_) => true,
+    }
+}
+
+/// No source exists on this system.
+#[cfg(not(unix))]
+fn usable_source(_importer: &Importer, source: &Source) -> bool {
+    match *source {}
+}
+
+/// Whether `source` gathers the pages (`gather.rs`), whose pointer is not imported first nor its
+/// pages' writability asked.
+#[cfg(unix)]
+fn gathers(source: &Source) -> bool {
+    source.gathers()
+}
+
+/// No source exists on this system.
+#[cfg(not(unix))]
+fn gathers(source: &Source) -> bool {
+    match *source {}
+}
+
+impl HostWindow {
+    /// Whether its source gathers the pages (`gather.rs`).
+    fn gathers(&self) -> bool {
+        self.source.as_ref().is_some_and(gathers)
+    }
 }
 
 /// A no-copy buffer's unbound `VkBuffer` (`Device::host_buffer`): `size` bytes, its bytes from

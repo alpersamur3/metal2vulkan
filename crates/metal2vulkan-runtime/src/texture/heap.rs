@@ -1833,6 +1833,38 @@ impl Device {
         // pages as the texture is made (`heap_texture_at`), where it fits the answer; else the
         // shadow below, counted and announced.
         let dma_buf = bytes.over_dma_buf();
+        // Over pages gathered from chunks of host regions (`gather.rs`) no image is bound to them:
+        // the shadow below.
+        #[cfg(unix)]
+        let gathered = (bytes.host_pages().as_deref())
+            .and_then(HostPages::dma_buf)
+            .is_some_and(|(imports, _, _)| imports.is_gathered());
+        #[cfg(not(unix))]
+        let gathered = false;
+        if gathered {
+            // A sparse linear image bound to the chunks the heap's bytes lie in, where the device
+            // makes one that lies in the texture's answer; else a shadow of the heap's bytes.
+            if !apart && linear_lack(&linear, &facts).is_none() {
+                if let Some(requirements) = self.sparse_image_requirements(&linear)? {
+                    if requirements.memory_type_bits & (1 << type_index) != 0
+                        && requirements.alignment <= align
+                        && requirements.size <= size
+                    {
+                        let image = HeapImage {
+                            plan: linear,
+                            tiling: vk::ImageTiling::LINEAR,
+                            requirements,
+                            route: AliasRoute::Direct,
+                        };
+                        return Ok(HeapPlan { image, ..p });
+                    }
+                }
+            }
+            #[cfg(unix)]
+            crate::gather::heap_shadow_made();
+            let image = self.memory_shadow(linear, &p)?;
+            return Ok(HeapPlan { image, ..p });
+        }
         if !apart && dma_buf {
             let image = self.dma_buf_heap_plan(linear, &p, &facts)?;
             return Ok(HeapPlan { image, ..p });
@@ -2107,10 +2139,108 @@ impl Device {
         Ok((dedicated.requires_dedicated_allocation == vk::FALSE).then_some(requirements))
     }
 
+    /// The memory requirements of a linear image of `plan` made with `SPARSE_BINDING` for host
+    /// allocations, as one in a heap over gathered pages is (`gather.rs`); `None` where the
+    /// device makes none, or past its limits for one.
+    fn sparse_image_requirements(
+        &self,
+        plan: &ImagePlan,
+    ) -> Result<Option<vk::MemoryRequirements>, Error> {
+        if !self.shared().sparse.binds() {
+            return Ok(None);
+        }
+        let view_formats = plan.ash_view_formats();
+        let mut list = vk::ImageFormatListCreateInfo::default();
+        let mut external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        let info = plan.create_info(self.shared().sharing(), &view_formats, &mut list);
+        let flags = info.flags | vk::ImageCreateFlags::SPARSE_BINDING;
+        let info = info
+            .flags(flags)
+            .tiling(vk::ImageTiling::LINEAR)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external);
+        let Ok(limits) = self.host_image_limits(&info, &view_formats)? else {
+            return Ok(None);
+        };
+        if check_linear_limits(plan, &limits).is_err() {
+            return Ok(None);
+        }
+        let raw_device = self.shared().vk();
+        // SAFETY: the device is live and binds sparse memory, and `info` (with its chain) is
+        // valid and within the device's limits for such an image.
+        let Ok(raw) = (unsafe { crate::creation::image(raw_device, &info) }) else {
+            return Ok(None);
+        };
+        // SAFETY: `raw` is a live image of this device, destroyed right after the query, unbound.
+        let requirements = unsafe {
+            let requirements = raw_device.get_image_memory_requirements(raw);
+            release::object(raw_device, raw);
+            requirements
+        };
+        Ok(Some(requirements))
+    }
+
+    /// A sparse linear `VkImage` of `plan`, made for host allocations, bound to the chunks the
+    /// `size` bytes at `at` of `pages` (gathered, `gather.rs`) lie in, with the layout it starts in
+    /// and its binding, which the image waits for before it is destroyed; `None`, nothing made,
+    /// where its requirements do not fit there (its alignment misses `at` or a stretch, or it
+    /// takes more bytes).
+    #[cfg(unix)]
+    fn heap_sparse_image(
+        &self,
+        plan: &ImagePlan,
+        pages: &HostPages,
+        at: u64,
+        size: u64,
+    ) -> Result<Option<(vk::Image, vk::ImageLayout, (vk::Semaphore, u64))>, Error> {
+        let Some((imports, _, _)) = pages.dma_buf() else {
+            return Ok(None);
+        };
+        let raw_device = self.shared().vk();
+        let view_formats = plan.ash_view_formats();
+        let mut list = vk::ImageFormatListCreateInfo::default();
+        let mut external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        let info = plan.create_info(self.shared().sharing(), &view_formats, &mut list);
+        let flags = info.flags | vk::ImageCreateFlags::SPARSE_BINDING;
+        let info = info
+            .flags(flags)
+            .tiling(vk::ImageTiling::LINEAR)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external);
+        // SAFETY: the device is live and binds sparse memory, and `info` (with its chain) valid
+        // and within its limits for such an image (`sparse_image_requirements`).
+        let raw = unsafe { crate::creation::image(raw_device, &info) }?;
+        // SAFETY: `raw` is a live image of this device.
+        let requirements = unsafe { raw_device.get_image_memory_requirements(raw) };
+        let binds = (at.is_multiple_of(requirements.alignment.max(1)) && requirements.size <= size)
+            .then(|| imports.gathered_image_binds(at, requirements.size, requirements.alignment))
+            .flatten();
+        let Some(binds) = binds else {
+            // SAFETY: the image is live and unbound, and no command uses it.
+            unsafe { release::object(raw_device, raw) };
+            return Ok(None);
+        };
+        match self.bind_sparse_image(raw, &binds) {
+            Ok(binding) => {
+                crate::gather::heap_sparse_image_made();
+                Ok(Some((raw, vk::ImageLayout::UNDEFINED, binding)))
+            }
+            Err(error) => {
+                // SAFETY: the image is live and its binding failed, so nothing is pending; no
+                // command uses it.
+                unsafe { release::object(raw_device, raw) };
+                Err(error)
+            }
+        }
+    }
+
     /// An image of `image`'s plan and tiling bound at `at` of the heap's memory, whose
     /// requirements (the plan's) hold at most `size` bytes there, holding what its bytes held;
     /// `owner` its owner. The device's next submission moves it to the `GENERAL` layout (one over
-    /// host pages, the next that names it).
+    /// host pages, the next that names it). Over gathered pages (no memory of the heap's own,
+    /// `gather.rs`), a sparse linear image bound to their chunks.
     fn bind_heap_image(
         &self,
         binding: &HeapBinding,
@@ -2119,20 +2249,41 @@ impl Device {
         size: u64,
         owner: Owner,
     ) -> Result<Image, Error> {
-        let made = self.heap_raw_image(
-            &image.plan,
-            image.tiling,
-            binding.host,
-            binding.memory,
-            at,
-            size,
-        )?;
-        let (raw, initial) = made.ok_or_else(|| {
-            internal("a heap texture's image does not lie where its plan placed it")
-        })?;
+        #[cfg(unix)]
+        let sparse = match (binding.memory == vk::DeviceMemory::null(), &binding.pages) {
+            (true, Some(pages)) => Some(self.heap_sparse_image(&image.plan, pages, at, size)?),
+            _ => None,
+        };
+        #[cfg(not(unix))]
+        let sparse: Option<Option<(vk::Image, vk::ImageLayout, std::convert::Infallible)>> = None;
+        let (raw, initial, made_raw) = match sparse {
+            #[cfg(unix)]
+            Some(made) => {
+                let (raw, initial, bound) = made.ok_or_else(|| {
+                    internal("a heap texture's sparse image does not lie where its plan placed it")
+                })?;
+                (raw, initial, Raw::bound(raw, bound))
+            }
+            #[cfg(not(unix))]
+            Some(_) => unreachable!("no gathered pages on this system"),
+            None => {
+                let made = self.heap_raw_image(
+                    &image.plan,
+                    image.tiling,
+                    binding.host,
+                    binding.memory,
+                    at,
+                    size,
+                )?;
+                let (raw, initial) = made.ok_or_else(|| {
+                    internal("a heap texture's image does not lie where its plan placed it")
+                })?;
+                (raw, initial, Raw::new(raw))
+            }
+        };
         let made = Image {
             device: self.clone(),
-            raw: Raw::new(raw),
+            raw: made_raw,
             owner,
             plan: image.plan,
             options: binding.options,
@@ -2286,7 +2437,11 @@ impl Device {
             if swaps.iter().any(|swap| swap.is_of(image)) {
                 continue;
             }
-            if dma_buf {
+            #[cfg(unix)]
+            let gathered = (pages.dma_buf()).is_some_and(|(imports, _, _)| imports.is_gathered());
+            #[cfg(not(unix))]
+            let gathered = false;
+            if dma_buf && !gathered {
                 let Some(objects) = remade.take(image) else {
                     return Err(Error::NotImplemented(RuntimeGap::RebindTextures));
                 };
@@ -2304,6 +2459,19 @@ impl Device {
             // `DRM_FORMAT_MOD_LINEAR` image, which its linear image need not keep.
             if image.raw.dedicated() {
                 return Err(Error::NotImplemented(RuntimeGap::RebindTextures));
+            }
+            // Over gathered pages (no memory of the heap's own, `gather.rs`): a sparse linear
+            // image bound to their chunks.
+            #[cfg(unix)]
+            if memory == vk::DeviceMemory::null() {
+                let made = self.heap_sparse_image(image.plan(), pages, base + place.offset, place.size)?;
+                let Some((raw, initial, bound)) = made else {
+                    return Err(Error::NotImplemented(RuntimeGap::RebindTextures));
+                };
+                let first = FirstMove::new(raw, image.plan().format, initial, pages_hold(pages));
+                let objects = ImageObjects::bound(self, raw, bound);
+                swaps.push(ImageSwap::new(Arc::clone(image), objects, first, pages));
+                continue;
             }
             let made = self.heap_raw_image(
                 image.plan(),

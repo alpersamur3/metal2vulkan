@@ -98,6 +98,8 @@ mod fence;
 mod fetch_reach;
 mod fill_value;
 mod fragment_imageblock;
+#[cfg(unix)]
+mod gather;
 mod framebuffer_fetch;
 mod freed_memory;
 mod fresh_unwritten;
@@ -239,6 +241,10 @@ pub use device::{
 };
 #[cfg(unix)]
 pub use dma_buf::{DmaBufChunk, DmaBufRequest, DmaBufSource};
+#[cfg(unix)]
+pub use gather::{
+    gather_counts, GatherAnswer, GatherCounts, GatherPiece, GatherRequest, GatherSource, CHUNK as GATHER_CHUNK,
+};
 pub use dynamic_library::DynamicLibrary;
 pub use error::DynamicLibraryError;
 pub use error::ExtensionFeature;

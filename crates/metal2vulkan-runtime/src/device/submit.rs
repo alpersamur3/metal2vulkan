@@ -340,6 +340,54 @@ impl Device {
         Ok((objects.timeline, value))
     }
 
+    /// Bind `image`, made with `SPARSE_BINDING`, to `binds` (opaque binds of its memory), as
+    /// [`Device::bind_sparse_buffer`] binds a buffer: on the device's first queue, signalling the
+    /// internal timeline, which every later submission waits for; the image waits for it before
+    /// it is destroyed (`gather.rs`'s `settle_binding`).
+    pub(crate) fn bind_sparse_image(
+        &self,
+        image: vk::Image,
+        binds: &[vk::SparseMemoryBind],
+    ) -> Result<(vk::Semaphore, u64), Error> {
+        if self.is_lost() {
+            return Err(Error::DeviceLost);
+        }
+        let shared = self.shared();
+        let raw = shared.vk();
+        let mut internal = lock(&shared.internal);
+        if internal.is_none() {
+            *internal = Some(Internal::new(self)?);
+        }
+        let Some(objects) = internal.as_mut() else {
+            unreachable!("made above");
+        };
+        let image_binds = [vk::SparseImageOpaqueMemoryBindInfo::default()
+            .image(image)
+            .binds(binds)];
+        let value = objects.signalled + 1;
+        let signal_semaphores = [objects.timeline];
+        let signal_values = [value];
+        let mut timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&signal_values);
+        let info = vk::BindSparseInfo::default()
+            .image_opaque_binds(&image_binds)
+            .signal_semaphores(&signal_semaphores)
+            .push_next(&mut timeline);
+        // SAFETY: the image is live, made with `SPARSE_BINDING`, unused; every bind lies in it
+        // and in its memory at its alignment, of a type it takes (`texture/heap.rs`); the queue's
+        // family binds sparse memory, and the queue is used under its lock; the signal is above
+        // the timeline's value (the internal lock is held).
+        shared.counts.queue_submitted(0);
+        let bound = shared.use_queue(0, By::Runtime, |queue| unsafe {
+            raw.queue_bind_sparse(queue, &[info], vk::Fence::null())
+        });
+        exit_guard::called(Call::QueueBindSparse);
+        bound.map_err(|error| self.failed(error))?;
+        objects.signalled = value;
+        *lock(&shared.bound_at) = Some((objects.timeline, value));
+        Ok((objects.timeline, value))
+    }
+
     /// The device's own timelines outside the batches, each at the value through which the host
     /// saw its submissions complete ([`OwnTimeline`]): the internal one, then the staging
     /// queue's.
