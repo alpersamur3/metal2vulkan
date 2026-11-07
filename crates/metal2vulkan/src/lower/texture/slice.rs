@@ -43,6 +43,12 @@
 //! class, at level 0, the write dropped through the null element, a narrower element as a slot's is
 //! (the texel does not depend on the member's format, so no binder check is needed). An integer
 //! element's class is the group's from another operation (no slot has a format input to give it).
+//!
+//! A static slot bound in an extended-range format (`LoweringInputs::extended_range`) holds
+//! Metal's raw codes in its raw format's image: a slice of four-lane `float` or `half` elements
+//! stores each texel's raw code as a `write` of that texel does
+//! ([`extended_range::encode`](crate::lower::arith::extended_range::encode)); any other element is
+//! `Unsupported{Format, NotImplemented}`.
 
 use crate::air::intrinsics::{Elem, TexRole, Texture};
 use crate::air::ir::{Value, ValueId};
@@ -86,6 +92,10 @@ pub struct Slice {
     /// The slot's storage class (`super::storage_class`): a converting one (`RotateArgb`,
     /// `HalfTowardZero`) rounds each texel to Metal's code of each channel.
     pub class: StorageImageClass,
+    /// The slot's variant binds a texture of this extended-range format: each texel is encoded to
+    /// its raw code as a write encodes it
+    /// ([`extended_range::encode`](crate::lower::arith::extended_range::encode)).
+    pub extended: Option<crate::metal::format::ExtendedRange>,
     /// A `float` slice through a heap handle on a device not measured to store it in a
     /// half-float texture as Metal does: the class each texel takes where the handle's texel
     /// class is a half-float format's (`super::Write::heap_half`).
@@ -106,6 +116,11 @@ impl Slice {
             + if self.contained { 64 } else { 0 }
             + if self.guard { 48 } else { 0 }
             + super::emit::class_write_words(self.class)
+            + if self.extended.is_some() {
+                crate::lower::arith::extended_range::ENCODE_WORDS
+            } else {
+                0
+            }
             + self.heap_half.map_or(0, |c| {
                 super::HEAP_CLASS_WORDS + super::emit::class_write_words(c) + 32
             })
@@ -246,6 +261,17 @@ pub(super) fn select(
         ),
         _ => return Err(imageblocks()),
     };
+    // A slot bound in an extended-range format (`LoweringInputs::extended_range`) holds Metal's
+    // raw codes: a slice of whole `float` or `half` texels (the only parameter Metal binds such a
+    // texture to) is encoded as a write of the texel encodes it, as QuartzCore's backdrop capture
+    // writes its imageblock into a `RGB10A8_2P_XR10` target; a narrower element is not measured.
+    let extended = super::extended_range(cx, image)?;
+    if let Some(form) = extended {
+        if conv.is_none() || lanes != 4 {
+            return Err(Unsupported::not_implemented(Feature::Format).into());
+        }
+        cx.families.arith.converts(form);
+    }
     let bytes = lane_bytes * u32::from(lanes);
     // A tile function's slice of words its pass does not keep is unmeasured
     // (`access::tile::KeptCells`).
@@ -329,7 +355,8 @@ pub(super) fn select(
     if conv == TexelConv::F32 {
         super::half_storage_facts(cx, image, class, (heap_half, heap_bits))?;
     }
-    let half_nans = match conv == TexelConv::F16 {
+    // An extended-range texel's `half` lanes are encoded exactly, NaN included, as a write's are.
+    let half_nans = match conv == TexelConv::F16 && extended.is_none() {
         true => super::half_nans(cx, image, (false, heap_bits))?,
         false => super::HalfNans::Held,
     };
@@ -346,6 +373,7 @@ pub(super) fn select(
         guard,
         contained: imageblock::contained(cx),
         class,
+        extended,
         heap_half,
         heap_small_floats,
         half_nans,

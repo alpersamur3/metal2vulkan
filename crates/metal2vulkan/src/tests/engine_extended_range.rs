@@ -1157,3 +1157,162 @@ fn ycbcr_write_slots_store_each_texel_s_bits_and_mark() {
         }
     }
 }
+
+/// A kernel whose threads each read slot 0's texel at their `gid` (`half` texels, or `float`)
+/// into their own cell of an explicit imageblock of one `T4` per cell, and whose first thread then
+/// writes the whole imageblock (an implicit slice) to `texture2d<T, access::write>` slot 1 at the
+/// threadgroup's origin: dispatched in 8 x 8 threadgroups with an 8 x 8 imageblock, every texel
+/// lands where a plain write of it would.
+fn slice_kernel(half: bool) -> String {
+    let (texel, vec4, size, cell_ty, suffix) = if half {
+        ("half", "<4 x half>", 8, "half4", "v4f16")
+    } else {
+        ("float", "<4 x float>", 16, "float4", "v4f32")
+    };
+    format!(
+        r#"%"struct.metal::_imageblock_base" = type {{ ptr addrspace(4) }}
+
+define void @k(ptr addrspace(1) %t, ptr addrspace(1) %w, %"struct.metal::_imageblock_base" %img, <2 x i16> %lid, <2 x i32> %gid) {{
+entry:
+  %rs = call ptr addrspace(2) @air.get_read_sampler()
+  %r = call {{ {vec4}, i8 }} @air.read_texture_2d.{suffix}(ptr addrspace(1) %t, ptr addrspace(2) %rs, <2 x i32> %gid, <2 x i32> zeroinitializer, i32 0, i32 1)
+  %v = extractvalue {{ {vec4}, i8 }} %r, 0
+  %cell = call ptr addrspace(4) @air.imageblock_data(<2 x i16> %lid, i32 0, i16 0)
+  store {vec4} %v, ptr addrspace(4) %cell, align {size}
+  call void @air.wg.barrier(i32 8, i32 1)
+  %z = icmp eq <2 x i16> %lid, zeroinitializer
+  %first = call i1 @air.all.v2i1(<2 x i1> %z)
+  br i1 %first, label %write, label %done
+
+write:
+  %o = trunc <2 x i32> %gid to <2 x i16>
+  call void @air.write_imageblock_slice_to_texture_2d.i16.{suffix}(ptr addrspace(1) %w, ptr addrspace(4) %cell, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %o, i16 0, i1 false, i32 2)
+  br label %done
+
+done:
+  ret void
+}}
+
+declare ptr addrspace(2) @air.get_read_sampler()
+declare {{ {vec4}, i8 }} @air.read_texture_2d.{suffix}(ptr addrspace(1), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.wg.barrier(i32, i32)
+declare i1 @air.all.v2i1(<2 x i1>)
+declare void @air.write_imageblock_slice_to_texture_2d.i16.{suffix}(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
+
+!air.kernel = !{{!0}}
+!0 = !{{ptr @k, !1, !2}}
+!1 = !{{}}
+!2 = !{{!3, !4, !5, !6, !7}}
+!3 = !{{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<{texel}, read>", !"air.arg_name", !"t"}}
+!4 = !{{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<{texel}, write>", !"air.arg_name", !"w"}}
+!5 = !{{i32 2, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 {size}, !"air.struct_type_info", !8, !"air.arg_type_align_size", i32 {size}, !"air.arg_type_name", !"imageblock<Cell, layout_explicit>", !"air.arg_name", !"img"}}
+!6 = !{{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"lid"}}
+!7 = !{{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}}
+!8 = !{{i32 0, i32 {size}, i32 0, !"{cell_ty}", !"color"}}
+"#
+    )
+}
+
+/// The side of the slice kernel's threadgroups and imageblock (`slice_kernel`).
+const BLOCK: u32 = 8;
+
+/// Resources of a dispatch of the slice kernel: `BLOCK` x `BLOCK` threadgroups, each with an
+/// imageblock of as many cells.
+fn slice_resources(plan: &Plan) -> Resources {
+    let mut spec = BTreeMap::new();
+    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(BLOCK));
+    spec.insert(SpecKey::LocalSize(Axis::Y), u64::from(BLOCK));
+    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
+    spec.insert(SpecKey::FlatLocalSize, u64::from(BLOCK * BLOCK));
+    spec.insert(SpecKey::ImageblockWidth, u64::from(BLOCK));
+    spec.insert(SpecKey::ImageblockHeight, u64::from(BLOCK));
+    let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
+    for f in &plan.push.fields {
+        match (f.field, f.loc) {
+            (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
+            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
+            other => panic!("unexpected push field {other:?}"),
+        }
+    }
+    Resources {
+        buffers: Vec::new(),
+        push,
+        spec,
+    }
+}
+
+/// QuartzCore's backdrop capture (`backdrop_capture_compute_tile_lph`, on a watch whose layers
+/// are `RGB10A8_2P_XR10`) writes its imageblock to an extended-range texture with
+/// `write(img.slice(...), coord)`: every code of each format, read into the imageblock with a
+/// `half` and a `float` result and written back as a slice, is Metal's raw texel, as a plain
+/// write of it stores (`reads_and_writes_of_every_code_are_metals`).
+#[test]
+fn slices_of_every_code_store_metals_raw_texels() {
+    for half in [false, true] {
+        let what = format!("slice {}", if half { "half" } else { "float" });
+        let Some(bc) = assemble(&what, &slice_kernel(half)) else {
+            return;
+        };
+        for (stem, p) in profiles() {
+            for form in FORMS {
+                let what = format!("{what} {form:?} on {stem}");
+                let i = inputs(form, Source::Read);
+                let (plan, m) =
+                    typed_module_with(&bc, "k", &p, &i).unwrap_or_else(|e| panic!("{what}: {e}"));
+                validate(&bc, &i, &p, &what);
+                let res = slice_resources(&plan);
+                let images = [image(0, |n| raw_texel(form, n)), image(1, |_| [0; 4])];
+                let mut outs = Vec::new();
+                for order in [Order::Forward, Order::Reverse] {
+                    let cfg = Config {
+                        workgroups: [SIDE / BLOCK, SIDE / BLOCK, 1],
+                        order,
+                        ..Config::default()
+                    };
+                    let (_, imgs) = run_with_images(&m, &cfg, res.clone(), images.to_vec())
+                        .unwrap_or_else(|e| panic!("{what}: interpreter: {e:?}"));
+                    outs.push(imgs);
+                }
+                assert_eq!(outs[0], outs[1], "{what}: the scheduling orders disagree");
+                let target = texels_of(&outs[0], 1);
+                let layout = image(1, |_| [0; 4]);
+                let lanes = raw_lanes(form);
+                for n in 0..SIDE * SIDE {
+                    let at = layout
+                        .index(0, 0, 0, [n % SIDE, n / SIDE, 0])
+                        .expect("texel");
+                    assert_eq!(
+                        target[at][..lanes],
+                        written(form, n)[..lanes],
+                        "{what}: texel {n} written"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A slice of fewer than four lanes into a slot bound in an extended-range format is not
+/// measured: refused for its format, never lowered as a plain format's.
+#[test]
+fn a_narrow_slice_into_an_extended_range_slot_is_refused() {
+    let body = slice_kernel(true).replace(
+        "write_imageblock_slice_to_texture_2d.i16.v4f16",
+        "write_imageblock_slice_to_texture_2d.i16.v2f16",
+    );
+    let Some(bc) = assemble("narrow slice", &body) else {
+        return;
+    };
+    for (stem, p) in profiles() {
+        for form in FORMS {
+            match typed_module_with(&bc, "k", &p, &inputs(form, Source::Read)) {
+                Err(crate::error::Error::Unsupported(u)) => {
+                    assert_eq!(u.feature, Feature::Format, "{stem} {form:?}: {u:?}")
+                }
+                Err(other) => panic!("{stem} {form:?}: {other}"),
+                Ok(_) => panic!("{stem} {form:?}: a narrow extended-range slice is lowered"),
+            }
+        }
+    }
+}

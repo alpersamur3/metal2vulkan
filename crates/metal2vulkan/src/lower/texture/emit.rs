@@ -3954,6 +3954,12 @@ fn slice<'c>(cx: &mut EmitCx<'c>, fb: &mut FunctionBuilder<'_>, s: &Slice) -> BR
         (true, ImageRef::Heap { group, handle }) => Some(heap_twin(cx, fb, group, handle)?),
         _ => None,
     };
+    // A slot bound in an extended-range format: its form and, for an `_sRGB` one, the table its
+    // color channels encode through, found once, outside the loop.
+    let extended = match s.extended {
+        Some(xr) => Some((xr, extended_table(cx, xr)?)),
+        None => None,
+    };
     let body: LoopFn<'_, EmitCx<'c>> = Box::new(move |fb, cx, lc| {
         let k = fb.load(counter, MemAccess::default())?;
         let done = fb.binary(BinOp::UGreaterThanEqual, k, n)?;
@@ -3976,8 +3982,14 @@ fn slice<'c>(cx: &mut EmitCx<'c>, fb: &mut FunctionBuilder<'_>, s: &Slice) -> BR
             conv: s.texel.conv,
             lanes: 4,
         };
-        let test = NanTest::for_modes(&cx.plan.families.arith.modes);
-        let texel = to_image(fb, &decl, form, held, cx.decl.families.arith.srgb, test)?;
+        // An extended-range texel's raw code, encoded as Metal writes it (`write`'s).
+        let texel = match extended {
+            Some((xr, table)) => crate::lower::arith::extended_range::encode(fb, xr, held, table)?,
+            None => {
+                let test = NanTest::for_modes(&cx.plan.families.arith.modes);
+                to_image(fb, &decl, form, held, cx.decl.families.arith.srgb, test)?
+            }
+        };
         let twin = match twin {
             Some((is_bits, img)) => Some(TwinWrite {
                 is_bits,

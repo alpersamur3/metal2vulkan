@@ -2308,22 +2308,16 @@ pub fn select(
     }
     let target = crate::lower::access::handle::texture_target(cx, tex, m)?;
     // A slot bound in an extended-range format is read, written, and sampled (the sampler
-    // family's selection); its imageblock slices are not built yet.
+    // family's selection), and a slice written to one static slot encodes each texel as a write
+    // does (`slice::select`); a switch among such slots is not built yet.
     if slice {
-        let slots: Vec<u32> = match &target {
-            HandleTarget::One(Candidate::Texture(index)) => vec![*index],
-            HandleTarget::Switch { cands, .. } => cands
-                .iter()
-                .filter_map(|c| match c {
-                    Candidate::Texture(index) => Some(*index),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        for index in slots {
-            if extended_range(cx, ImageRef::Slot(index))?.is_some() {
-                return Err(Unsupported::not_implemented(Feature::Format).into());
+        if let HandleTarget::Switch { cands, .. } = &target {
+            for c in cands {
+                if let Candidate::Texture(index) = c {
+                    if extended_range(cx, ImageRef::Slot(*index))?.is_some() {
+                        return Err(Unsupported::not_implemented(Feature::Format).into());
+                    }
+                }
             }
         }
     }
