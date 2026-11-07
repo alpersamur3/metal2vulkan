@@ -110,15 +110,20 @@ pub struct GatherPiece {
     pub region_length: u64,
 }
 
-/// The bytes the runtime imports a region in, from its first byte: 16 MiB, or
+/// The bytes the runtime imports a region in, from its first byte: 256 KiB, or
 /// `METAL2VULKAN_GATHER_CHUNK_KIB` kibibytes (a power of two, 64 to 1048576), or
 /// `METAL2VULKAN_GATHER_CHUNK_MIB` mebibytes (a power of two, 1 to 1024). Turnip binds a piece in
 /// time that grows with the memory object's size (measured on the Adreno 830: 39-74 µs a piece in
 /// a 256 MiB import, 495-598 µs in a 2 GiB one), so the chunks are small; each costs an import.
 /// A driver that imports host memory by pinning its pages (KGSL) pins a chunk whole while any
 /// gathered buffer holds it, so the chunk also bounds how much more than the buffers' own pages is
-/// pinned where those lie scattered.
-pub const CHUNK: u64 = 16 << 20;
+/// pinned where those lie scattered. Measured with iOS 26 on a Galaxy S25 Ultra (reims, the same
+/// rounds of six apps from a cold boot per size): the chunks pinned on average 2,857 MiB for
+/// 138 MiB of live gathered buffers at 16 MiB (where Android's lmkd killed the app), 1,641 for 146
+/// at 2 MiB, 922 for 169 at 512 KiB and 703 for 180 at 256 KiB; an import took 4.6 ms at 16 MiB
+/// and 0.15 ms at 256 KiB, a bind 57 and 29 µs, the imports and binds of a buffer 3.8 and 2.2 ms
+/// in all.
+pub const CHUNK: u64 = 256 << 10;
 
 /// The bytes of chunks no buffer holds that the device keeps imported for a later one
 /// ([`Chunks`]): 256 MiB, or `METAL2VULKAN_GATHER_LINGER_MIB` mebibytes.
