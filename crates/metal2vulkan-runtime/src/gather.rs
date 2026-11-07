@@ -111,9 +111,13 @@ pub struct GatherPiece {
 }
 
 /// The bytes the runtime imports a region in, from its first byte: 16 MiB, or
+/// `METAL2VULKAN_GATHER_CHUNK_KIB` kibibytes (a power of two, 64 to 1048576), or
 /// `METAL2VULKAN_GATHER_CHUNK_MIB` mebibytes (a power of two, 1 to 1024). Turnip binds a piece in
 /// time that grows with the memory object's size (measured on the Adreno 830: 39-74 µs a piece in
 /// a 256 MiB import, 495-598 µs in a 2 GiB one), so the chunks are small; each costs an import.
+/// A driver that imports host memory by pinning its pages (KGSL) pins a chunk whole while any
+/// gathered buffer holds it, so the chunk also bounds how much more than the buffers' own pages is
+/// pinned where those lie scattered.
 pub const CHUNK: u64 = 16 << 20;
 
 /// The bytes of chunks no buffer holds that the device keeps imported for a later one
@@ -124,11 +128,17 @@ const LINGER: u64 = 256 << 20;
 fn chunk_size() -> u64 {
     static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        std::env::var("METAL2VULKAN_GATHER_CHUNK_MIB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|mib| (1..=1024).contains(mib) && mib.is_power_of_two())
-            .map_or(CHUNK, |mib| mib << 20)
+        let read = |name: &str, most: u64, shift: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| (1..=most).contains(n) && n.is_power_of_two())
+                .map(|n| n << shift)
+        };
+        read("METAL2VULKAN_GATHER_CHUNK_KIB", 1 << 20, 10)
+            .filter(|bytes| *bytes >= 64 << 10)
+            .or_else(|| read("METAL2VULKAN_GATHER_CHUNK_MIB", 1024, 20))
+            .unwrap_or(CHUNK)
     })
 }
 
@@ -153,6 +163,8 @@ pub struct GatherCounts {
     pub chunk_bytes_live: u64,
     /// Chunks imported so far, ever.
     pub chunks_imported: u64,
+    /// The time the chunks' imports took on the calling threads, in microseconds, ever.
+    pub import_micros: u64,
     /// Gathered buffers made so far.
     pub buffers: u64,
     /// The binds of their pieces so far (after joining neighbours).
@@ -174,6 +186,7 @@ pub struct GatherCounts {
 static CHUNKS_LIVE: AtomicU64 = AtomicU64::new(0);
 static CHUNK_BYTES_LIVE: AtomicU64 = AtomicU64::new(0);
 static CHUNKS_IMPORTED: AtomicU64 = AtomicU64::new(0);
+static IMPORT_MICROS: AtomicU64 = AtomicU64::new(0);
 static BUFFERS: AtomicU64 = AtomicU64::new(0);
 static BINDS: AtomicU64 = AtomicU64::new(0);
 static BUFFERS_LIVE: AtomicU64 = AtomicU64::new(0);
@@ -194,6 +207,7 @@ pub fn gather_counts() -> GatherCounts {
         chunks_live: get(&CHUNKS_LIVE),
         chunk_bytes_live: get(&CHUNK_BYTES_LIVE),
         chunks_imported: get(&CHUNKS_IMPORTED),
+        import_micros: get(&IMPORT_MICROS),
         buffers: get(&BUFFERS),
         binds: get(&BINDS),
         buffers_live: get(&BUFFERS_LIVE),
@@ -715,6 +729,7 @@ impl Device {
         }
         let shared = self.shared();
         let raw_device = shared.vk();
+        let began = std::time::Instant::now();
         let pointer = NonNull::new(first as *mut u8).ok_or_else(not_importable)?;
         // SAFETY: the region's pages are host memory the source vouches for, at the import
         // alignment (a chunk starts at a multiple of the host page from the region's first byte).
@@ -729,6 +744,7 @@ impl Device {
             ImportFailure::Vulkan(error) => import_refused(error),
         })?;
         crate::sparse_log::chunk(false, memory, first, size);
+        IMPORT_MICROS.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         CHUNKS_LIVE.fetch_add(1, Ordering::Relaxed);
         CHUNK_BYTES_LIVE.fetch_add(size, Ordering::Relaxed);
         CHUNKS_IMPORTED.fetch_add(1, Ordering::Relaxed);
