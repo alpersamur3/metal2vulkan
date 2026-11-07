@@ -295,50 +295,14 @@ impl Device {
     /// `vkQueueBindSparse` on the device's first `VkQueue` that signals the internal timeline,
     /// and return without waiting for it: every submission made after it, on every `VkQueue`,
     /// waits for it until the host saw it complete ([`Device::binding_wait`]). The timeline and
-    /// the value it signals, which the buffer's release waits for.
+    /// the value it signals, which the buffer's release waits for. The ranges go in groups of at
+    /// most [`RANGES_PER_BIND`] ([`Device::bind_sparse`]).
     pub(crate) fn bind_sparse_buffer(
         &self,
         buffer: vk::Buffer,
         binds: &[vk::SparseMemoryBind],
     ) -> Result<(vk::Semaphore, u64), Error> {
-        if self.is_lost() {
-            return Err(Error::DeviceLost);
-        }
-        let shared = self.shared();
-        let raw = shared.vk();
-        let mut internal = lock(&shared.internal);
-        if internal.is_none() {
-            *internal = Some(Internal::new(self)?);
-        }
-        let Some(objects) = internal.as_mut() else {
-            unreachable!("made above");
-        };
-        let buffer_binds = [vk::SparseBufferMemoryBindInfo::default()
-            .buffer(buffer)
-            .binds(binds)];
-        let value = objects.signalled + 1;
-        let signal_semaphores = [objects.timeline];
-        let signal_values = [value];
-        let mut timeline =
-            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&signal_values);
-        let info = vk::BindSparseInfo::default()
-            .buffer_binds(&buffer_binds)
-            .signal_semaphores(&signal_semaphores)
-            .push_next(&mut timeline);
-        // SAFETY: the buffer is live, made with `SPARSE_BINDING`, unused; every bind lies in it
-        // and in its memory at its alignment, of a type it takes (`dma_buf.rs`); the queue's
-        // family binds sparse memory, and the queue is used under its lock; the signal is above
-        // the timeline's value (the internal lock is held).
-        shared.counts.queue_submitted(0);
-        let bound = shared.use_queue(0, By::Runtime, |queue| unsafe {
-            raw.queue_bind_sparse(queue, &[info], vk::Fence::null())
-        });
-        exit_guard::called(Call::QueueBindSparse);
-        crate::sparse_log::bound(false, buffer.as_raw(), binds, value, bound.is_err());
-        bound.map_err(|error| self.failed(error))?;
-        objects.signalled = value;
-        *lock(&shared.bound_at) = Some((objects.timeline, value));
-        Ok((objects.timeline, value))
+        self.bind_sparse(SparseTarget::Buffer(buffer), binds)
     }
 
     /// Bind `image`, made with `SPARSE_BINDING`, to `binds` (opaque binds of its memory), as
@@ -350,6 +314,19 @@ impl Device {
         image: vk::Image,
         binds: &[vk::SparseMemoryBind],
     ) -> Result<(vk::Semaphore, u64), Error> {
+        self.bind_sparse(SparseTarget::Image(image), binds)
+    }
+
+    /// [`Device::bind_sparse_buffer`] and [`Device::bind_sparse_image`]: one `vkQueueBindSparse`
+    /// of a bind info per group of at most [`RANGES_PER_BIND`] of `binds`, each signalling the
+    /// internal timeline's next value. Mesa merges no two bind infos with a signal between them
+    /// (`vk_queue_submits_merge`), so each group reaches the driver as a submission of its own:
+    /// one kernel call of its ranges on Turnip over KGSL. The timeline and the last value.
+    fn bind_sparse(
+        &self,
+        target: SparseTarget,
+        binds: &[vk::SparseMemoryBind],
+    ) -> Result<(vk::Semaphore, u64), Error> {
         if self.is_lost() {
             return Err(Error::DeviceLost);
         }
@@ -362,32 +339,68 @@ impl Device {
         let Some(objects) = internal.as_mut() else {
             unreachable!("made above");
         };
-        let image_binds = [vk::SparseImageOpaqueMemoryBindInfo::default()
-            .image(image)
-            .binds(binds)];
-        let value = objects.signalled + 1;
+        let groups: Vec<&[vk::SparseMemoryBind]> = if binds.is_empty() {
+            vec![binds]
+        } else {
+            binds.chunks(RANGES_PER_BIND).collect()
+        };
+        let first = objects.signalled + 1;
+        let last = first + groups.len() as u64 - 1;
+        let values: Vec<[u64; 1]> = (first..=last).map(|value| [value]).collect();
+        let (buffer_binds, image_binds): (Vec<_>, Vec<_>) = match target {
+            SparseTarget::Buffer(buffer) => (
+                (groups.iter())
+                    .map(|group| {
+                        [vk::SparseBufferMemoryBindInfo::default()
+                            .buffer(buffer)
+                            .binds(group)]
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+            SparseTarget::Image(image) => (
+                Vec::new(),
+                (groups.iter())
+                    .map(|group| {
+                        [vk::SparseImageOpaqueMemoryBindInfo::default()
+                            .image(image)
+                            .binds(group)]
+                    })
+                    .collect(),
+            ),
+        };
         let signal_semaphores = [objects.timeline];
-        let signal_values = [value];
-        let mut timeline =
-            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&signal_values);
-        let info = vk::BindSparseInfo::default()
-            .image_opaque_binds(&image_binds)
-            .signal_semaphores(&signal_semaphores)
-            .push_next(&mut timeline);
-        // SAFETY: the image is live, made with `SPARSE_BINDING`, unused; every bind lies in it
-        // and in its memory at its alignment, of a type it takes (`texture/heap.rs`); the queue's
-        // family binds sparse memory, and the queue is used under its lock; the signal is above
-        // the timeline's value (the internal lock is held).
+        let mut timelines: Vec<vk::TimelineSemaphoreSubmitInfo<'_>> = (values.iter())
+            .map(|value| vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(value))
+            .collect();
+        let infos: Vec<vk::BindSparseInfo<'_>> = (timelines.iter_mut().enumerate())
+            .map(|(at, timeline)| {
+                let info = vk::BindSparseInfo::default().signal_semaphores(&signal_semaphores);
+                let info = match target {
+                    SparseTarget::Buffer(_) => info.buffer_binds(&buffer_binds[at]),
+                    SparseTarget::Image(_) => info.image_opaque_binds(&image_binds[at]),
+                };
+                info.push_next(timeline)
+            })
+            .collect();
+        // SAFETY: the resource is live, made with `SPARSE_BINDING`, unused; every bind lies in it
+        // and in its memory at its alignment, of a type it takes (`dma_buf.rs`, `gather.rs`,
+        // `texture/heap.rs`); the queue's family binds sparse memory, and the queue is used under
+        // its lock; the signals rise above the timeline's value (the internal lock is held).
         shared.counts.queue_submitted(0);
         let bound = shared.use_queue(0, By::Runtime, |queue| unsafe {
-            raw.queue_bind_sparse(queue, &[info], vk::Fence::null())
+            raw.queue_bind_sparse(queue, &infos, vk::Fence::null())
         });
         exit_guard::called(Call::QueueBindSparse);
-        crate::sparse_log::bound(true, image.as_raw(), binds, value, bound.is_err());
+        let (image, resource) = match target {
+            SparseTarget::Buffer(buffer) => (false, buffer.as_raw()),
+            SparseTarget::Image(image) => (true, image.as_raw()),
+        };
+        crate::sparse_log::bound(image, resource, binds, last, bound.is_err());
         bound.map_err(|error| self.failed(error))?;
-        objects.signalled = value;
-        *lock(&shared.bound_at) = Some((objects.timeline, value));
-        Ok((objects.timeline, value))
+        objects.signalled = last;
+        *lock(&shared.bound_at) = Some((objects.timeline, last));
+        Ok((objects.timeline, last))
     }
 
     /// The device's own timelines outside the batches, each at the value through which the host
@@ -444,6 +457,25 @@ impl Device {
         }
         vulkan(error)
     }
+}
+
+/// The most ranges one bind info of the runtime's sparse binds names ([`Device::bind_sparse`]).
+/// Turnip over KGSL makes a bind info's ranges of one resource one `IOCTL_KGSL_GPU_AUX_COMMAND`,
+/// whose ranges KGSL copies into a kernel array of 32 bytes a range that it allocates without
+/// retrying (graphics-kernel `kgsl_vbo.c`, `kgsl_sharedmem_create_bind_op`: `kvcalloc` with
+/// `__GFP_NORETRY`): under memory pressure a large one fails with `ENOMEM`, and Turnip loses the
+/// device ("bind submit failed: Out of memory": a heap texture's sparse image of 578 ranges on a
+/// Galaxy S25 Ultra as other apps were being killed for memory). 64 ranges keep the array at
+/// 2 KiB, a slab object within one page.
+pub(crate) const RANGES_PER_BIND: usize = 64;
+
+/// What a sparse bind binds ([`Device::bind_sparse`]).
+#[derive(Clone, Copy)]
+enum SparseTarget {
+    /// A buffer's ranges.
+    Buffer(vk::Buffer),
+    /// An image's opaque ranges.
+    Image(vk::Image),
 }
 
 /// Whether the host saw a binding that signals `value` complete, its timeline read at `read`
