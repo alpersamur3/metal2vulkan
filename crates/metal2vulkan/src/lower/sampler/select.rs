@@ -372,6 +372,18 @@ pub fn select_sampling(
         }
         _ => None,
     };
+    // An extended-range arm whose level comes from its own derivatives (a fragment's implicit
+    // level under a mip filter: `extended::LevelAt::Derived`) is a tangled instruction the switch
+    // cannot hold: within the same bound, every arm is evaluated before the switch, as an LOD
+    // query's are (`Prelude::Arms`), each at its own implicit level.
+    let mut hoist = hoist;
+    if hoist.is_some()
+        && combinations <= super::LOD_QUERY_CANDIDATES
+        && extended_arm_derives(cx, &textures, &samplers)
+    {
+        hoist = None;
+        queries = true;
+    }
     let mut arms = Vec::with_capacity(combinations);
     for tc in &textures {
         let index = match *tc {
@@ -432,6 +444,47 @@ pub fn select_sampling(
         null: NullArm::Zero(cx.lowered_repr(Value::Inst(at), inst.ty)?),
         prelude,
     })))
+}
+
+/// Whether a fragment's implicit-level sample over the candidates `textures` and `samplers` has
+/// an arm on an extended-range slot that derives its level ([`select_extended`]'s
+/// `LevelAt::Derived`, under a mip filter): through a constexpr sampler with a mip filter, or
+/// through a runtime sampler slot, either not bicubic (a bicubic sample reads the base level). A
+/// candidate whose state is refused counts as none: the arms' selection refuses it, as before.
+fn extended_arm_derives(cx: &SelectCx<'_>, textures: &[Candidate], samplers: &[Candidate]) -> bool {
+    for tc in textures {
+        let Candidate::Texture(index) = *tc else {
+            continue;
+        };
+        if !matches!(
+            crate::lower::texture::extended_range(cx, ImageRef::Slot(index)),
+            Ok(Some(_))
+        ) {
+            continue;
+        }
+        for &sc in samplers {
+            if sc == Candidate::Absent {
+                continue;
+            }
+            let derives = match sampler_of(cx, sc) {
+                Ok(SamplerArg::Static(r @ SamplerRef::Constexpr(words), _)) => {
+                    matches!(super::bicubic::state(r), Ok(None))
+                        && super::state_of(words).is_ok_and(|s| s.mip_filter != MipFilter::None)
+                }
+                Ok(SamplerArg::Static(SamplerRef::Slot(n), _)) => {
+                    // A slot the variant binds a bicubic sampler at reads the base level.
+                    !cx.inputs
+                        .cubic_samplers
+                        .contains_key(&sampler_slot(cx.stage, n))
+                }
+                _ => false,
+            };
+            if derives {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Select sampling call `inst` (sample, gather, or LOD query) decoded as `t` on element `handle`
@@ -1020,8 +1073,9 @@ fn nearest_texel(r: SamplerRef) -> Result<bool, Error> {
 
 /// Select sampling call `call` of texture slot `index` through static sampler `sampler`: an
 /// extended-range sample where the slot's variant binds such a format ([`select_extended`]), else
-/// [`select_one`]'s sampling. `arm` is set for an arm of a switch-at-use, whether it reads the
-/// gradients its switch hoisted ([`select_one`]).
+/// [`select_one`]'s sampling, an LOD query of such a slot's too (it reads no texel, and the image
+/// has the texture's levels and size). `arm` is set for an arm of a switch-at-use, whether it
+/// reads the gradients its switch hoisted ([`select_one`]).
 fn select_slot(
     cx: &mut SelectCx<'_>,
     call: Call<'_>,
@@ -1046,8 +1100,10 @@ fn select_slot(
         _ => sampler,
     };
     match crate::lower::texture::extended_range(cx, ImageRef::Slot(index))? {
-        Some(form) => select_extended(cx, call, (index, form), sampler, m),
-        None => select_one(cx, call, ImageRef::Slot(index), sampler, arm, m)
+        Some(form) if !matches!(call.t.op, TexOp::CalculateLod { .. }) => {
+            select_extended(cx, call, (index, form), sampler, m)
+        }
+        _ => select_one(cx, call, ImageRef::Slot(index), sampler, arm, m)
             .map(|x| TextureStrategy::Sampling(Box::new(x))),
     }
 }
@@ -1058,9 +1114,10 @@ fn select_slot(
 /// texture's sample or gradient sample without comparison (and a `BGR10_XR` or `BGRA10_XR`
 /// form's, or `_sRGB` twin's, 3D texture's under no mip filter or a nearest one), with a `float` or `half` result, a
 /// constant texel offset or none, no `min_lod_clamp`, and no observed residency, through a
-/// constexpr sampler with one filter for minification and magnification (nearest or linear), no
-/// anisotropy, and no mip filter, a nearest one, or a linear one of a form whose levels' blend is
-/// built (`ExtendedRange::blends_levels`), or through a runtime sampler slot, whose bound sampler
+/// constexpr sampler with one filter for minification and magnification (nearest or linear), any
+/// anisotropy (sampled as the plain filter), and no mip filter, a nearest one, or a linear one of
+/// a form whose levels' blend is built (`ExtendedRange::blends_levels`), or through a runtime
+/// sampler slot, whose bound sampler
 /// the binder holds to the same (`ResourcePlanner::pair`). Its level is Metal's rule's
 /// (`extended::Level`): an explicit level or a kernel's bias exactly, a fragment function's
 /// implicit level and explicit gradients by Vulkan's level of detail, recorded
@@ -1074,10 +1131,10 @@ fn select_slot(
 /// (`extended`), under the bicubic filter's checks (`NotImplemented(SamplerBicubicFilter)`:
 /// `bicubic::check`), and refused there for a bfloat or padded form, a gather, a 2D array, and a
 /// swizzled texture (not measured). Every other sampling of the slot is `NotImplemented(Format)`:
-/// a two-plane form's gather, or a padded form's `half` one, an LOD query, a comparison, a 1D or
-/// cube texture, another form's 3D texture, an anisotropic or mixed filter, a linear mip filter of
-/// another form or of a 3D texture, a constexpr sampler's level bias of its own or empty clamp,
-/// and a dynamic offset.
+/// a two-plane form's gather, or a padded form's `half` one, a comparison, a 1D or cube texture,
+/// another form's 3D texture, a mixed filter, a linear mip filter of another form or of a 3D
+/// texture, a constexpr sampler's level bias of its own or empty clamp, and a dynamic offset. An
+/// LOD query of the slot is [`select_slot`]'s plain one.
 fn select_extended(
     cx: &mut SelectCx<'_>,
     call: Call<'_>,
@@ -1248,9 +1305,9 @@ fn select_extended(
                 // Metal's linear filter of a bfloat texture reads the nearest texel,
                 // and a gather follows no filter.
                 let linear = linear && !form.bfloat() && gather.is_none();
-                if s.max_anisotropy > 1 {
-                    return Err(refused());
-                }
+                // Anisotropy only sharpens the level a slanted surface's sample reads: a sampler
+                // of `max_anisotropy` above 1 samples as its plain filter (Metal's anisotropic
+                // filter of these forms is not measured).
                 if gather.is_none() && s.mip_filter != MipFilter::None {
                     let Some(stated) = super::extended::Stated::of(&s, form) else {
                         return Err(refused());
