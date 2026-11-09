@@ -88,7 +88,7 @@ use super::Buffer;
 use crate::device::functions::Vk;
 use ash::vk;
 use metal2vulkan::error::{Feature, Unsupported};
-use metal2vulkan::metal::format::{aspects, is_depth_stencil};
+use metal2vulkan::metal::format::{aspects, is_depth_stencil, ExtendedRange};
 use metal2vulkan::metal::{PixelFormat, TextureType};
 use metal2vulkan::vk::{Format, ImageAspectFlags};
 use std::ops::Range;
@@ -1792,9 +1792,18 @@ impl BlitCommandEncoder {
             Err(MipmapRefusal::Unsupported(unsupported)) => Err(Error::Unsupported(unsupported)),
         };
         // Metal's filter, computed (`mipmap_filter.rs`), where the device runs it; no blit, so
-        // no check. An extended-range format, which no blit filters, is refused without it.
-        let own_format = texture.record().pixel_format == texture.image_plan()?.pixel_format;
-        if own_format && self.filter_mipmaps(texture, &facts, read(), write())? {
+        // no check. An extended-range format, which no blit filters, is refused without it. An
+        // extended-range texture over an image planned in another extended-range format of the
+        // same raw texels (`BGRA10_XR` over its `_sRGB` twin's, or the reverse) holds the codes
+        // its own format reads, which the filter decodes by that format: the filter takes it.
+        let own = texture.record().pixel_format;
+        let planned = texture.image_plan()?.pixel_format;
+        let own_format = own == planned;
+        let raw_twins = match (ExtendedRange::of(own), ExtendedRange::of(planned)) {
+            (Some(a), Some(b)) => a.raw_format() == b.raw_format(),
+            _ => false,
+        };
+        if (own_format || raw_twins) && self.filter_mipmaps(texture, &facts, read(), write())? {
             return Ok(());
         }
         if not_implemented(texture.record().pixel_format) {

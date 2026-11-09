@@ -70,7 +70,8 @@ const UPDATE_BYTES: usize = 65536;
 impl BlitCommandEncoder {
     /// Record `texture`'s mipmaps as Metal's filter where this device runs it (the module docs):
     /// `false`, recording nothing, where it does not. The caller checked Metal's rules and that
-    /// the texture presents its image's own format.
+    /// the texture presents its image's own format, or an extended-range format of the image's
+    /// raw texels (its `_sRGB` twin, or the reverse).
     pub(super) fn filter_mipmaps(
         &mut self,
         texture: &Texture,
