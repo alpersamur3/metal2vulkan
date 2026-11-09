@@ -885,6 +885,18 @@ pub fn sample_id(cx: &mut SelectCx<'_>) -> usize {
     )
 }
 
+/// Plan the fragment's `ViewIndex` input for the storage form of an amplified
+/// pipeline, which reads and writes each view's layer: the index of its object.
+pub fn view_index(cx: &mut SelectCx<'_>) -> usize {
+    plan::builtin(
+        &mut cx.families.stage_io,
+        crate::spv::BuiltIn::ViewIndex,
+        IoDir::Input,
+        Shape::U32,
+        crate::pipeline::stage_io::StageBuiltin::ViewIndex,
+    )
+}
+
 /// Plan the fragment's `FrontFacing` input for a family that reads the fragment's face (the
 /// shader-side stencil): the index of its object, shared with a `[[front_facing]]` input.
 pub fn front_facing(cx: &mut SelectCx<'_>) -> usize {

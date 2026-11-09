@@ -5345,7 +5345,8 @@ impl RenderCommandEncoder {
         let samples = self.layout.samples;
         for s in &storage {
             match s.view {
-                StorageAttachmentView::Attachment => {}
+                // The attachment's own image (a views image: its 2D array of layers).
+                StorageAttachmentView::Attachment | StorageAttachmentView::AttachmentLayers => {}
                 StorageAttachmentView::SamplePlanes { layers }
                     if layers == samples && samples > 1 => {}
                 StorageAttachmentView::SamplePlanes { .. } => {

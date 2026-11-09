@@ -1443,6 +1443,13 @@ fn image_descriptor(
                 StorageAttachmentView::Attachment => {
                     image(render_target::storage_view_in(&color.target, in_format)?)
                 }
+                // An amplified pipeline's views image: the 2D array of the layers the draw's instance
+                // renders.
+                StorageAttachmentView::AttachmentLayers => {
+                    let views = tables.pass.map(|(_, views)| views).unwrap_or_default();
+                    let target = render_target::viewed(&color.target, views);
+                    image(render_target::storage_layers_view_in(&target, in_format)?)
+                }
                 StorageAttachmentView::SamplePlanes { layers } => {
                     let planes = color
                         .planes

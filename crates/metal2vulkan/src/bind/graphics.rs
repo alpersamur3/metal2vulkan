@@ -14,7 +14,9 @@
 //!   cells, so a pass of more than one layer or an amplified draw is not implemented. An attachment
 //!   the fragment function reads in the interlocked storage form
 //!   (`GraphicsState::storage_attachments`) is `WriteSource::TileAttachment` in the attachment's
-//!   own format, likewise one 2D view, so such a pass or draw is not implemented either. A fragment
+//!   own format, likewise one 2D view, so such a pass or draw is not implemented either, but for an
+//!   amplified pipeline's views images (`StorageAttachmentView::AttachmentLayers`, a 2D array of
+//!   the layers the draw's instance renders) drawn as multiview views. A fragment
 //!   function's threadgroup arguments (`RuntimeFact::TileThreadgroupMemory`) are the pass's tile
 //!   memory, `WriteSource::TileMemory` as a tile function's (`plan::compute`): the shape's
 //!   `tile_threadgroup` places each argument, and its `render_area` and `imageblock_size` (the
@@ -1107,7 +1109,16 @@ fn plan(p: &RenderPipeline, device: &Device, shape: &BindShape) -> Result<Bindin
     }
     // An attachment read in the interlocked storage form is one 2D view: what a layered pass, or an
     // amplified draw, reads and writes of each layer or view is not modelled.
+    // But not an amplified pipeline's views images (`AttachmentLayers`) drawn as multiview
+    // views, whose function reads and writes each view's layer at its `ViewIndex`.
+    let layered_storage = !p.graphics.storage_attachments.is_empty()
+        && p.graphics
+            .storage_attachments
+            .iter()
+            .all(|a| a.view == crate::pipeline::StorageAttachmentView::AttachmentLayers)
+        && amplification_draws.is_none();
     if !p.graphics.storage_attachments.is_empty()
+        && !layered_storage
         && (shape.render_target_array_length > 1 || shape.vertex_amplification.count > 1)
     {
         return Err(not_implemented(Feature::FramebufferFetch));
@@ -1217,8 +1228,8 @@ fn plan(p: &RenderPipeline, device: &Device, shape: &BindShape) -> Result<Bindin
     // pass's or an amplified draw's, whose storage form is one 2D view (above).
     if !interlocked_colors.is_empty()
         && (p.graphics.rasterization_samples.as_raw() > 1
-            || shape.render_target_array_length > 1
-            || shape.vertex_amplification.count > 1)
+            || (!layered_storage
+                && (shape.render_target_array_length > 1 || shape.vertex_amplification.count > 1)))
     {
         return Err(not_implemented(Feature::FramebufferFetch));
     }

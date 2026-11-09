@@ -152,8 +152,7 @@ fn a_clean_state_takes_the_storage_form() {
     }
 }
 
-/// What the form does not model is `NotImplemented`: an amplified pipeline, a one- or two-channel
-/// sRGB format, and,
+/// What the form does not model is `NotImplemented`: a one- or two-channel sRGB format, and,
 /// for a written attachment only, blending (but one and zero, added), a signed normalized format under a write mask that
 /// keeps some of its channels, alpha to coverage, a returned sample mask at one sample, and a depth
 /// or stencil attachment without early fragment tests, but where each draw's plan checks its tests.
@@ -162,9 +161,16 @@ fn unmodelled_states_are_not_implemented() {
     let p = profile("moltenvk-m3", &[]);
     let ni = Err(Unsupported::not_implemented(Feature::FramebufferFetch));
     let r32 = state(PixelFormat::R32Float, |_| {});
+    // An amplified pipeline's is a 2D array of the views' layers, on a device with multiview.
     let mut amplified = r32.clone();
     amplified.amplified = true;
-    assert_eq!(form(&amplified, false, READS, &p), ni);
+    let views = form(&amplified, false, READS, &p).expect("the views form");
+    assert!(views.views);
+    assert!(
+        !form(&r32, false, READS, &p)
+            .expect("the storage form")
+            .views
+    );
     for pf in [PixelFormat::R8UnormSRGB, PixelFormat::RG8UnormSRGB] {
         let srgb = state(pf, |_| {});
         assert_eq!(form(&srgb, false, READS, &p), ni, "{pf:?}");
@@ -213,9 +219,10 @@ fn unmodelled_states_are_not_implemented() {
 
 /// An 8-bit four-channel sRGB attachment takes the storage form through a view in `R32_UINT`,
 /// declared `R32ui` (without a format where the device grants that) with `uint` texels, which the
-/// function reads and writes as floats it decodes and encodes itself; a blend into one, a replacing
-/// blend too, is not measured, so a written attachment under it is `NotImplemented`, a read-only
-/// one is not.
+/// function reads and writes as floats it decodes and encodes itself. A written attachment's blend
+/// that Metal's 8-bit unorm model covers is computed by the function over the decoded texel (not
+/// measured against Metal's sRGB blend); a replacing blend is not measured, so a written attachment
+/// under it is `NotImplemented`, a read-only one is not.
 #[test]
 fn a_four_channel_srgb_attachment_takes_a_uint_view() {
     let ni = Err(Unsupported::not_implemented(Feature::FramebufferFetch));
@@ -259,7 +266,14 @@ fn a_four_channel_srgb_attachment_takes_a_uint_view() {
                         c.destination_rgb_blend_factor = crate::metal::BlendFactor::One;
                     }
                 });
-                assert_eq!(form(&blended, false, WRITES, &p), ni, "{stem} {pf:?}");
+                let written = form(&blended, false, WRITES, &p);
+                match replaces {
+                    true => assert_eq!(written, ni, "{stem} {pf:?}"),
+                    false => assert!(
+                        written.is_ok_and(|v| v.blend.is_some() && v.uint_view.is_some()),
+                        "{stem} {pf:?}"
+                    ),
+                }
                 assert!(form(&blended, false, READS, &p).is_ok(), "{stem} {pf:?}");
             }
         }

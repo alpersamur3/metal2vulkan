@@ -1329,7 +1329,7 @@ codec_enum! {
     Reconvergence { Guaranteed, ImplementationDefined }
     LinkedUseGap { EndlessLoop, StackMemory, GatedOffMeshBuiltin, UnmeasuredColorWrite }
     ImageblockMechanism { StorageImageInterlock }
-    StorageAttachmentView { Attachment, SamplePlanes { layers } }
+    StorageAttachmentView { Attachment, SamplePlanes { layers }, AttachmentLayers }
     StandInView { Image, SamplePlanes { layers } }
     PrecisionNote {
         F16FmaDoubleRounding, F16IntConvDoubleRounding, GradFromBias,

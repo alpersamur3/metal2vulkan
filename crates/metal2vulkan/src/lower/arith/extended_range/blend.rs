@@ -2153,6 +2153,27 @@ pub fn blend_unorm8(
     clamped_blend(fb, b, arith, (s, d), color)
 }
 
+/// Metal's blend `b` (the 8-bit unorm model of an sRGB format's unorm twin,
+/// [`Blend::unorm8`]) of a four-lane output `s` over `d`, an 8-bit sRGB texel decoded to linear as a
+/// fetch reads it (a `vec4` of `f32`), in `arith`: the output clamped to `[0, 1]` as Metal clamps it
+/// for a normalized format, `d` rounded to `half` in `half` arithmetic. The linear result, which the
+/// caller encodes by Metal's sRGB write. Not measured against Metal's sRGB blend.
+pub fn blend_srgb(
+    fb: &mut FunctionBuilder<'_>,
+    b: &Blend,
+    arith: BlendArith,
+    (s, d): (Value, Value),
+    color: Option<Value>,
+) -> BResult<Value> {
+    let f = floats();
+    let s = clamped(fb, s, (0.0, 1.0))?;
+    let d = match arith {
+        BlendArith::Half => half_of(fb, f, d)?,
+        BlendArith::Float => d,
+    };
+    clamped_blend(fb, b, arith, (s, d), color)
+}
+
 /// Blend `b` of the clamped output `s` over the destination `d`, both `vec4`s of `f32` in
 /// `arith`, the blend color `color` clamped to `[0, 1]` (a NaN 0) and rounded to `arith`, and
 /// its one minus that of the read: [`blend_unorm8`]'s and [`blend_packed16`]'s arithmetic.

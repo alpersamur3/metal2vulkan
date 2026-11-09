@@ -1872,6 +1872,25 @@ pub(super) fn storage_view_in(
     attachment_view_in(target, format, metal2vulkan::vk::ImageUsageFlags::STORAGE)
 }
 
+/// The 2D-array storage view of `target`'s level and layers in `format`,
+/// whatever their count: an amplified pipeline's views image (`StorageAttachmentView::AttachmentLayers`).
+pub(super) fn storage_layers_view_in(
+    target: &Target,
+    format: metal2vulkan::vk::Format,
+) -> Result<vk::ImageView, Error> {
+    target.texture.image_view(&VkView {
+        view_type: metal2vulkan::vk::ImageViewType::TYPE_2D_ARRAY,
+        format,
+        components: metal2vulkan::vk::ComponentMapping::IDENTITY,
+        aspect: super::texture::image_aspects(format),
+        base_level: target.level,
+        level_count: 1,
+        base_layer: target.layer,
+        layer_count: target.layers.max(1),
+        usage: metal2vulkan::vk::ImageUsageFlags::STORAGE,
+    })
+}
+
 /// The view of the level and layers an attachment renders: 2D, or a 2D array in a layered pass;
 /// every aspect of its format, which a depth/stencil attachment's view must have.
 fn attachment_view(

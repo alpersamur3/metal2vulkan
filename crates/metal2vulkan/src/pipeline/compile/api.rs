@@ -1168,7 +1168,13 @@ fn graphics_requirements(
     let multisampled_storage = graphics
         .storage_attachments
         .iter()
-        .any(|a| a.view == StorageAttachmentView::Attachment)
+        // A multisampled views image too.
+        .any(|a| {
+            matches!(
+                a.view,
+                StorageAttachmentView::Attachment | StorageAttachmentView::AttachmentLayers
+            )
+        })
         && graphics.rasterization_samples.as_raw() > 1;
     if multisampled_shadow || multisampled_storage || multisampled_stand_in {
         requirements

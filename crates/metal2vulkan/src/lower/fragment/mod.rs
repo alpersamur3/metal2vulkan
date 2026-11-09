@@ -210,6 +210,9 @@ pub struct FragmentPlan {
     /// writes each storage-form color: Metal runs such a function once per covered sample and
     /// reads its own sample.
     pub fetch_sample: Option<usize>,
+    /// The stage interface's `ViewIndex` object, the layer of a views
+    /// storage image (`fetch::StorageView::views`).
+    pub fetch_view: Option<usize>,
     /// The field of the returned value holding the function's `[[sample_mask]]` output, which
     /// gates each storage-form write of a per-sample function on the invocation's own sample bit,
     /// and of a function at one sample on bit 0.

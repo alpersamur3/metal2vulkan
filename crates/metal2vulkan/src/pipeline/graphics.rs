@@ -858,6 +858,12 @@ pub enum StorageAttachmentView {
     /// fills from the multisampled attachment before the draws and writes back (or resolves)
     /// after them.
     SamplePlanes { layers: u32 },
+    /// A 2D-array view (`VK_IMAGE_VIEW_TYPE_2D_ARRAY`) of the attachment's own image, of the
+    /// layers the draw's render pass instance renders (its multiview views from its first; one
+    /// layer for a draw of one), of the pass's samples (a multisampled 2D array where the pass is
+    /// multisampled): an amplified pipeline's, whose function
+    /// reads and writes view `v` of pixel `(x, y)` at texel `(x, y, v)` (at its own sample).
+    AttachmentLayers,
 }
 
 impl StorageAttachmentUse {

@@ -319,6 +319,17 @@ pub(crate) fn unorm8_format(pf: crate::metal::PixelFormat) -> bool {
     matches!(pf, P::R8Unorm | P::RG8Unorm | P::RGBA8Unorm | P::BGRA8Unorm)
 }
 
+/// The 8-bit unorm twin of an 8-bit four-channel sRGB format, whose blend model the storage
+/// form's sRGB blend takes over the decoded destination (`srgb_texel`).
+pub(crate) fn srgb8_twin(pf: crate::metal::PixelFormat) -> Option<crate::metal::PixelFormat> {
+    use crate::metal::PixelFormat as P;
+    match pf {
+        P::RGBA8UnormSRGB => Some(P::RGBA8Unorm),
+        P::BGRA8UnormSRGB => Some(P::BGRA8Unorm),
+        _ => None,
+    }
+}
+
 /// Whether `pf` is a packed 16-bit unorm format (`metal::format::WordAttachment::Packed16`), whose
 /// blend Metal computes in `half` over its decoded codes ([`extended_range::Blend::packed16`]).
 pub(crate) fn packed16_format(pf: crate::metal::PixelFormat) -> bool {
@@ -344,6 +355,7 @@ fn direct_blend(
         extended_range::blend::BlendArith,
     ),
 ) -> Result<extended_range::Blend, Error> {
+    let pf = srgb8_twin(pf).unwrap_or(pf);
     if packed16_format(pf) {
         return extended_range::Blend::packed16(eq, written, math);
     }
@@ -648,6 +660,12 @@ pub struct StorageView {
     pub numeric: SampledType,
     /// How the image holds the attachment's samples.
     pub samples: StorageSamples,
+    /// The pipeline may draw amplified as multiview views
+    /// (`FramebufferFetchInputs::amplified`): the image is a 2D array of the layers the draw's
+    /// render pass instance renders, view `v` of pixel `(x, y)` at texel `(x, y, v)`
+    /// (`StorageAttachmentView::AttachmentLayers`), a multisampled 2D array where the pass is
+    /// multisampled.
+    pub views: bool,
     /// The format's channels a write of the function keeps from the texel it overwrites: those
     /// outside the descriptor's write mask, which the storage write takes from the texel it reads
     /// first. Empty where the function does not write the attachment, or the mask covers every
@@ -962,8 +980,23 @@ pub(crate) fn storage_form(
         && attachment.equation.is_some_and(|eq| {
             extended_range::Blend::packed16(&eq, written_of_four, use_.math).is_ok()
         });
+    // And the blend of an 8-bit four-channel sRGB attachment, which the shader computes over the
+    // destination its read decodes, by the 8-bit unorm model of the format's unorm twin, and
+    // encodes by Metal's sRGB write (`srgb_texel`): not measured against Metal's sRGB blend, a
+    // near-equivalent the function notes.
+    let srgb_blend = uint_view.is_some()
+        && attachment.blending_enabled
+        && !attachment.replaces
+        && attachment.equation.is_some_and(|eq| {
+            let twin = srgb8_twin(pf).unwrap_or(pf);
+            extended_range::Blend::unorm8(&eq, twin, written_of_four, (use_.math, half)).is_ok()
+        });
     let blend = attachment.equation.filter(|_| {
-        (extended.is_some_and(|e| !e.padded()) || half_blend || unorm8_blend || word_blend)
+        (extended.is_some_and(|e| !e.padded())
+            || half_blend
+            || unorm8_blend
+            || word_blend
+            || srgb_blend)
             && stores
     });
     if let Some(eq) = blend {
@@ -990,7 +1023,17 @@ pub(crate) fn storage_form(
         && word.is_none();
     // An unblended write of every channel stores Metal's write of the output. A padded 10-bit
     // attachment's tile value and blends are not measured: no storage form.
-    let not_modelled = inputs.amplified
+    // An amplified pipeline's image is a 2D array of the views' layers, read and written at the
+    // invocation's `ViewIndex`, under the device's multiview, of no extended-range attachment
+    // (its `half` shadow is one 2D image).
+    let views = inputs.amplified;
+    let multiview = p.fields().enabled.features.contains(&VkFeature::Multiview);
+    // A multisampled pass's views image is a multisampled 2D array where the device has
+    // multisampled storage images; its sample planes are not built under amplification.
+    let not_modelled = (views
+        && (!multiview
+            || extended.is_some()
+            || (multisampled && !p.fields().images.storage_multisample)))
         || extended.is_some_and(ExtendedRange::padded)
         || (emulation != FormatEmulation::Direct && extended.is_none() && !alpha_in_red)
         || (extended.is_some()
@@ -1001,7 +1044,7 @@ pub(crate) fn storage_form(
         // An `RGB9E5Float` word's mantissas share its exponent: no field is kept apart.
         || (word == Some(WordAttachment::Rgb9e5) && stores && merged)
         // Metal's blend into an sRGB attachment, a replacing one too, is not measured.
-        || (uint_view.is_some() && stores && attachment.blending_enabled)
+        || (uint_view.is_some() && stores && attachment.blending_enabled && !srgb_blend)
         || (writes
             && attachment
                 .write_mask
@@ -1091,6 +1134,7 @@ pub(crate) fn storage_form(
             declared,
             numeric,
             samples,
+            views,
             kept,
             kept_at_draw: kept_draw,
             extended,
@@ -1506,7 +1550,8 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                     let half = extended_range::blend::BlendArith::Half;
                     direct_blend(&eq, view.pixel_format, written, (math, half))
                 });
-                let unorm8 = unorm8_format(view.pixel_format);
+                let srgb8 = srgb8_twin(view.pixel_format).is_some();
+                let unorm8 = unorm8_format(view.pixel_format) || srgb8;
                 match (planned, blended_output(cx.entry, color)) {
                     // An 8-bit unorm or packed 16-bit blend of fewer lanes is not measured.
                     (Some(Ok(_)), Some((_, lanes)))
@@ -1532,7 +1577,7 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                         // output's arithmetic folds into it: the blend is
                         // Metal's wherever the module states its math.
                         sixteen_exact = stated
-                            && (unorm8
+                            && ((unorm8 && !srgb8)
                                 || constant
                                 || (b.fitted() && !folds_into_blend(cx, color, math)?));
                         match sixteen_exact || fetched.contains(&color) {
@@ -1633,6 +1678,10 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                         .interface
                         .alpha_in_red_colors
                         .insert(color);
+                }
+                // A views image is read and written at the view's layer.
+                if view.views && cx.families.fragment.fetch_view.is_none() {
+                    cx.families.fragment.fetch_view = Some(stage_io::view_index(cx));
                 }
                 cx.facts.insert(RuntimeFact::InterlockedFramebufferFetch {
                     color,
@@ -2103,7 +2152,7 @@ pub(super) fn declare(mb: &mut ModuleBuilder, color: u32, sc: &StorageColor) -> 
         sampled_type,
         dim: Dim::D2,
         depth: false,
-        arrayed: sc.view.samples == StorageSamples::Planes,
+        arrayed: sc.view.samples == StorageSamples::Planes || sc.view.views,
         multisampled: sc.view.samples == StorageSamples::Multisampled,
         usage: ImageUsage::Storage,
         format: sc.view.declared,
@@ -2209,6 +2258,30 @@ fn image_and_texel(
     let p = fb.module().global_value(g)?;
     let image = fb.load(p, MemAccess::default())?;
     let pixel = pixel(cx, fb)?;
+    // A views image's texel is the pixel in the view's layer.
+    if cx
+        .plan
+        .families
+        .fragment
+        .fetch
+        .get(&color)
+        .is_some_and(|sc| sc.view.views)
+    {
+        let Some(view) = view_layer(cx, fb)? else {
+            return Err(cx.fail("a views access without its ViewIndex"));
+        };
+        let u32_ = fb.module().ty(SType::Int {
+            width: 32,
+            signed: false,
+        })?;
+        let uvec3 = fb.module().ty(SType::Vector { elem: u32_, len: 3 })?;
+        let x = fb.composite_extract(pixel, &[0])?;
+        let y = fb.composite_extract(pixel, &[1])?;
+        let texel = fb.composite_construct(uvec3, &[x, y, view])?;
+        // And the invocation's sample of a multisampled views image.
+        let ops = operands(cx, fb)?;
+        return Ok((image, texel, ops));
+    }
     if samples != StorageSamples::Planes {
         let ops = operands(cx, fb)?;
         return Ok((image, pixel, ops));
@@ -2282,6 +2355,17 @@ pub(super) fn operands(
         sample: Some(sample),
         ..ImageOperands::default()
     })
+}
+
+/// The invocation's `ViewIndex`, loaded, for a function that accesses a
+/// views image (`StorageView::views`); `None` for another.
+fn view_layer(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<Option<SValue>> {
+    let Some(object) = cx.plan.families.fragment.fetch_view else {
+        return Ok(None);
+    };
+    let g = stage_io::object_global(cx, object)?;
+    let p = fb.module().global_value(g)?;
+    fb.load(p, MemAccess::default()).map(Some)
 }
 
 /// The invocation's `SampleId`, loaded, for a per-sample function; `None` for one sample.
@@ -2924,6 +3008,11 @@ fn srgb_texel(
     }
     let f4 = form.with(Held::Float(crate::lower::arith::FloatFmt::F32));
     let test = crate::lower::arith::nan::NanTest::for_modes(&cx.plan.families.arith.modes);
+    // A blended write blends over the texel read first, decoded.
+    let part = match sc.view.blend {
+        Some(eq) => srgb_blended(cx, fb, color, sc, eq, (form, part), table)?,
+        None => part,
+    };
     let rgba = math::pack(fb, PackFormat::Unorm4x8Srgb, f4, part, Some(table), test)?;
     let mut word = rgba_order(fb, sc.view.format, rgba)?;
     if sc.view.merges() {
@@ -2961,6 +3050,43 @@ fn srgb_texel(
     let zero = fb.u32_const(0)?;
     let zero = fb.module().const_value(zero)?;
     fb.composite_construct(uvec4, &[word, zero, zero, zero])
+}
+
+/// The output `part` of `form` (four `f32` lanes) blended into the 8-bit sRGB
+/// attachment `color` by Metal's blend `eq`, over the texel read first at the invocation's pixel
+/// inside the interlock, decoded as a fetch reads it ([`srgb_decode`]), by the 8-bit unorm model of
+/// the format's unorm twin (`extended_range::blend::blend_srgb`, the blend color from
+/// `PushField::HalfBlendColor` where the blend reads it): the linear result, which the caller
+/// encodes by Metal's sRGB write.
+fn srgb_blended(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    color: u32,
+    sc: &StorageColor,
+    eq: BlendEquation,
+    (form, part): (Form, SValue),
+    table: GlobalId,
+) -> BResult<SValue> {
+    let math = extended_range::blend::BlendMath::of(cx.entry.compile.fast_math);
+    let pf = srgb8_twin(sc.view.pixel_format).unwrap_or(sc.view.pixel_format);
+    let arith = match form.float_fmt() {
+        Some(FloatFmt::Half) => extended_range::blend::BlendArith::Half,
+        _ => extended_range::blend::BlendArith::Float,
+    };
+    let Ok(b) = extended_range::Blend::unorm8(&eq, pf, written(sc.view.kept), (math, arith)) else {
+        return Err(cx.fail("an sRGB blend outside the 8-bit unorm model"));
+    };
+    let texel = read_texel(cx, fb, color, sc)?;
+    let word = fb.composite_extract(texel, &[0])?;
+    let d = srgb_decode(fb, sc.view.format, word, table)?;
+    let constant = match b.reads_constant() {
+        true => {
+            let field = cx.push_field(fb, PushField::HalfBlendColor)?;
+            Some(fb.composite_extract(field, &[0])?)
+        }
+        false => None,
+    };
+    extended_range::blend::blend_srgb(fb, &b, arith, (part, d), constant)
 }
 
 /// The `uvec4` texel that writes output `part` of `form` (`float` or `half` lanes) to word

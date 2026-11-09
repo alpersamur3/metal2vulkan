@@ -130,6 +130,10 @@ pub fn storage_attachments(
             Ok(view) if view.format == format && view.kept == kept && view.blend == blend => {
                 multisampled_image |= view.samples == StorageSamples::Multisampled;
                 let view_of = match view.samples {
+                    // An amplified pipeline's views image, multisampled or not.
+                    StorageSamples::One | StorageSamples::Multisampled if view.views => {
+                        StorageAttachmentView::AttachmentLayers
+                    }
                     StorageSamples::One | StorageSamples::Multisampled => {
                         StorageAttachmentView::Attachment
                     }
