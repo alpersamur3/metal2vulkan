@@ -303,9 +303,10 @@ pub struct BindState {
 pub enum FragmentTests {
     /// The tests may drop a fragment and the encoder counts the fragments that pass them (a
     /// visibility result mode is set); or the draw does not state them. Such a draw of a function
-    /// that stores before the tests is refused `NotImplemented(FramebufferFetch)`: a store before
-    /// them would keep what they drop, and early tests would count what the function then
-    /// discards. (A draw whose tests write but count nothing is [`FragmentTests::Depth`] or
+    /// that stores before the tests runs its early-tests variant, which counts what the function
+    /// then discards, where the function has one, and is refused
+    /// `NotImplemented(FramebufferFetch)` otherwise: a store before them would keep what they
+    /// drop. (A draw whose tests write but count nothing is [`FragmentTests::Depth`] or
     /// [`FragmentTests::Stencil`].)
     #[default]
     Any,

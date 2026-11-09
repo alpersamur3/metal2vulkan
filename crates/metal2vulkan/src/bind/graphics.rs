@@ -14,9 +14,10 @@
 //!   cells, so a pass of more than one layer or an amplified draw is not implemented. An attachment
 //!   the fragment function reads in the interlocked storage form
 //!   (`GraphicsState::storage_attachments`) is `WriteSource::TileAttachment` in the attachment's
-//!   own format, likewise one 2D view, so such a pass or draw is not implemented either, but for an
-//!   amplified pipeline's views images (`StorageAttachmentView::AttachmentLayers`, a 2D array of
-//!   the layers the draw's instance renders) drawn as multiview views. A fragment
+//!   own format, likewise one 2D view: a layered pass drawn without amplification reads and
+//!   writes that one view whatever layer a draw picks; an amplified draw is not implemented, but
+//!   into an amplified pipeline's views images (`StorageAttachmentView::AttachmentLayers`, a 2D
+//!   array of the layers the draw's instance renders) drawn as multiview views. A fragment
 //!   function's threadgroup arguments (`RuntimeFact::TileThreadgroupMemory`) are the pass's tile
 //!   memory, `WriteSource::TileMemory` as a tile function's (`plan::compute`): the shape's
 //!   `tile_threadgroup` places each argument, and its `render_area` and `imageblock_size` (the
@@ -109,7 +110,7 @@
 //!   variant of a draw that holds the `half` shadow of an extended-range color the function writes
 //!   (`BindShape::extended_shadows`): the plan of the pipeline as compiled selects such a moved
 //!   writer's tests from `RuntimeFact::MovableStorageWrites`. A mesh pipeline's is not
-//!   implemented, nor a multisampled, layered or amplified draw's.
+//!   implemented, nor a multisampled draw's, nor an amplified one's but beside views images.
 //! - **Snapshot reads**. A draw the consumer reads a texture of its own subpass for through a
 //!   snapshot (`BindShape::snapshot_textures`) runs the variant whose fragment function reads it so
 //!   (`VariantKey::snapshot_textures`, `lower::fragment`'s `snapshot`), for each slot of the
@@ -167,7 +168,14 @@
 //!   one whose stencil test acts and whose tests write, `Stencil`, or a `Drop` draw of a function
 //!   without the early-tests variant, runs the variant whose function runs both,
 //!   `VariantKey::shader_stencil`, in a pass with a depth and a stencil attachment; a pass with a
-//!   stencil attachment alone is `NotImplemented(FramebufferFetch)` at it.)
+//!   stencil attachment alone is `NotImplemented(FramebufferFetch)` at it.) A draw whose tests
+//!   count a visibility result (`Any`) runs the early-tests variant where the function has one:
+//!   a fragment the function then discards is counted, as Metal's later tests would not count
+//!   it. A layered pass holds no depth stand-in (the storage form is one 2D view there): a draw
+//!   whose tests may drop a fragment runs the early-tests variant where the function has one (a
+//!   fragment it discards has passed the tests, and their writes are made), and one of a function
+//!   without it runs as compiled, its stores before the tests kept where the tests drop the
+//!   fragment.
 //! - **Capture form**. A pipeline compiled under `VariantKey::captured_positions`
 //!   (`RuntimeFact::CapturedPositions`), which a consumer asks for and no bind shape does, plans
 //!   its own variant. Its draws leave `PushHole::CaptureAddress` to the consumer (the first
@@ -1107,10 +1115,11 @@ fn plan(p: &RenderPipeline, device: &Device, shape: &BindShape) -> Result<Bindin
     {
         return Err(not_implemented(Feature::Imageblocks));
     }
-    // An attachment read in the interlocked storage form is one 2D view: what a layered pass, or an
-    // amplified draw, reads and writes of each layer or view is not modelled.
-    // But not an amplified pipeline's views images (`AttachmentLayers`) drawn as multiview
-    // views, whose function reads and writes each view's layer at its `ViewIndex`.
+    // An attachment read in the interlocked storage form is one 2D view. A layered pass drawn
+    // without amplification reads and writes that view whatever layer a draw picks (visionOS's
+    // mono passes of two layers draw so). What an amplified draw reads and writes of each view is
+    // not modelled, but in an amplified pipeline's views images (`AttachmentLayers`) drawn as
+    // multiview views, whose function reads and writes each view's layer at its `ViewIndex`.
     let layered_storage = !p.graphics.storage_attachments.is_empty()
         && p.graphics
             .storage_attachments
@@ -1119,15 +1128,14 @@ fn plan(p: &RenderPipeline, device: &Device, shape: &BindShape) -> Result<Bindin
         && amplification_draws.is_none();
     if !p.graphics.storage_attachments.is_empty()
         && !layered_storage
-        && (shape.render_target_array_length > 1 || shape.vertex_amplification.count > 1)
+        && shape.vertex_amplification.count > 1
     {
         return Err(not_implemented(Feature::FramebufferFetch));
     }
-    // The shader-side stencil's shadow is one 2D image: the same holds.
+    // The shader-side stencil's shadow is one 2D image: a layered pass's draws share it, and an
+    // amplified draw's is not modelled.
     let shadow = shadow_template(p);
-    if shadow.is_some()
-        && (shape.render_target_array_length > 1 || shape.vertex_amplification.count > 1)
-    {
+    if shadow.is_some() && shape.vertex_amplification.count > 1 {
         return Err(not_implemented(Feature::StencilExport));
     }
     // A fragment function's tile threadgroup memory is the pass's, every tile's in one buffer:
@@ -1224,12 +1232,11 @@ fn plan(p: &RenderPipeline, device: &Device, shape: &BindShape) -> Result<Bindin
         return Err(not_implemented(Feature::MeshShading));
     }
     // Nor a multisampled draw's, whose storage form reads and writes the attachment per sample,
-    // which runs the function per sample where a plain writer runs it per pixel; nor a layered
-    // pass's or an amplified draw's, whose storage form is one 2D view (above).
+    // which runs the function per sample where a plain writer runs it per pixel; nor an amplified
+    // draw's, whose storage form is one 2D view (above), but beside views images.
     if !interlocked_colors.is_empty()
         && (p.graphics.rasterization_samples.as_raw() > 1
-            || (!layered_storage
-                && (shape.render_target_array_length > 1 || shape.vertex_amplification.count > 1)))
+            || (!layered_storage && shape.vertex_amplification.count > 1))
     {
         return Err(not_implemented(Feature::FramebufferFetch));
     }
@@ -1483,6 +1490,23 @@ fn plan(p: &RenderPipeline, device: &Device, shape: &BindShape) -> Result<Bindin
     let stencil = p.graphics.stencil_format.is_some();
     let (read_only_tests, shader_tests, window_depth_varying, shader_stencil) =
         match (tested, shape.fragment_tests) {
+            // A layered pass holds no depth stand-in: a draw whose tests may drop a fragment runs
+            // the early-tests variant where the function has one. A fragment the function then
+            // discards has passed the tests, and their writes are made, where Metal's would not.
+            (
+                Some((_, true)),
+                FragmentTests::Drop
+                | FragmentTests::Depth { .. }
+                | FragmentTests::Stencil
+                | FragmentTests::Any,
+            ) if tested_attachments && shape.render_target_array_length > 1 => {
+                (true, false, false, false)
+            }
+            // And a function without that variant runs as compiled: its stores before the tests
+            // are kept where the tests then drop the fragment.
+            (Some((_, false)), _) if tested_attachments && shape.render_target_array_length > 1 => {
+                (false, false, false, false)
+            }
             (Some((_, true)), FragmentTests::Drop | FragmentTests::Depth { writes: false })
                 if tested_attachments =>
             {
@@ -1519,6 +1543,14 @@ fn plan(p: &RenderPipeline, device: &Device, shape: &BindShape) -> Result<Bindin
                 return Err(BindError::Unsupported(
                     Unsupported::not_implemented(Feature::FramebufferFetch).at_attachment(at),
                 ));
+            }
+            // A draw that counts a visibility result runs the early-tests variant where the
+            // function has one: a fragment the function then discards is counted, where Metal's
+            // later tests would not count it.
+            (Some((_, true)), FragmentTests::Any | FragmentTests::Stencil)
+                if tested_attachments =>
+            {
+                (true, false, false, false)
             }
             (Some(_), FragmentTests::Any | FragmentTests::Stencil) if tested_attachments => {
                 return Err(not_implemented(Feature::FramebufferFetch));
