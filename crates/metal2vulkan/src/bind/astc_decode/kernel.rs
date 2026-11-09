@@ -1,4 +1,4 @@
-//! The GPU's decode of ASTC LDR blocks into a decoded twin's texels: the module
+//! The GPU's decode of ASTC blocks into a decoded twin's texels: the module
 //! [`astc_decode_module`](super::astc_decode_module) serializes, the same decode as the CPU's
 //! ([`AstcDecode::decode`]) in integer operations alone.
 //!
@@ -7,11 +7,12 @@
 //! weight) computes the plain, trit and quint forms of its value and selects the range's, and
 //! every error condition joins one flag, which turns the texel magenta. The tables of the trits,
 //! the quints and the unquantizations are the CPU decode's own functions, tabulated as the module
-//! is built.
+//! is built. An HDR format's module also unpacks the HDR colour endpoint modes, all four
+//! unpackings computed and the mode's selected, and maps each channel to its FP16 value.
 
 use super::{
-    quints, trits, unquantize_color, unquantize_weight, AstcDecode, AstcTexels, Range, RANGES,
-    WEIGHT_RANGES,
+    quints, trits, unquantize_color, unquantize_weight, AstcDecode, AstcTexels, Range, HALF_ONE,
+    RANGES, WEIGHT_RANGES,
 };
 use crate::bind::block_decode::{table, BlockDecodeModule, BLOCKS, SHAPE, TEXELS};
 use crate::bind::ycbcr_convert::{scalar, words_buffer};
@@ -23,8 +24,8 @@ use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::BResult;
 use crate::spirv::ids::{GlobalId, TypeId, Value};
 use crate::spirv::ir::{
-    BinOp, ConstBits, Constant, ConvOp, ExecMode, ExecModel, IoDir, MemAccess, Type, TypedModule,
-    UnOp,
+    BinOp, ConstBits, Constant, ConvOp, ExecMode, ExecModel, GlslOp, IoDir, MemAccess, Type,
+    TypedModule, UnOp,
 };
 
 /// The module's tables (the module docs), as `Private` arrays.
@@ -562,6 +563,490 @@ impl K<'_, '_> {
         Ok((out, hdr))
     }
 
+    // -----------------------------------------------------------------------------------------
+    // HDR endpoints and FP16 values (`super::hdr_endpoints`, `super::unorm16_to_half` and the
+    // rest), in integer operations; signed values are two's complement words.
+
+    /// Bit `i` of `v`.
+    fn bitk(&mut self, v: Value, i: u32) -> BResult<Value> {
+        self.field(v, i, 1)
+    }
+
+    /// `x | b << at` where `on`, else `x`.
+    fn put(&mut self, x: Value, on: Value, b: Value, at: u32) -> BResult<Value> {
+        let placed = self.shlk(b, at)?;
+        let zero = self.k(0)?;
+        let placed = self.sel(on, placed, zero)?;
+        self.or(x, placed)
+    }
+
+    /// Whether the one-hot `oh` is one of the modes `modes` names: `oh & modes != 0`.
+    fn in_modes(&mut self, oh: Value, modes: u32) -> BResult<Value> {
+        let m = self.andk(oh, modes)?;
+        self.opk(BinOp::INotEqual, m, 0)
+    }
+
+    /// The signed `v` clamped into `low` to `high`.
+    fn sclamp(&mut self, v: Value, low: u32, high: u32) -> BResult<Value> {
+        let lo = self.k(low)?;
+        let hi = self.k(high)?;
+        let under = self.op(BinOp::SLessThan, v, lo)?;
+        let v = self.sel(under, lo, v)?;
+        let over = self.op(BinOp::SGreaterThan, v, hi)?;
+        self.sel(over, hi, v)
+    }
+
+    /// The signed `v`, at least 0.
+    fn smax0(&mut self, v: Value) -> BResult<Value> {
+        let zero = self.k(0)?;
+        let under = self.op(BinOp::SLessThan, v, zero)?;
+        self.sel(under, zero, v)
+    }
+
+    /// `a` and `b` swapped where `swap`.
+    fn swap(&mut self, swap: Value, a: Value, b: Value) -> BResult<(Value, Value)> {
+        Ok((self.sel(swap, b, a)?, self.sel(swap, a, b)?))
+    }
+
+    /// Mode 2's luminance (`super::hdr_luminance_large`), each endpoint's three channels.
+    fn hdr_luminance_large(&mut self, v0: Value, v1: Value) -> BResult<[[Value; 3]; 2]> {
+        let ge = self.op(BinOp::UGreaterThanEqual, v1, v0)?;
+        let v0s = self.shlk(v0, 4)?;
+        let v1s = self.shlk(v1, 4)?;
+        let up = self.addk(v1s, 8)?;
+        let down = self.addk(v0s, u32::MAX - 7)?;
+        let y0 = self.sel(ge, v0s, up)?;
+        let y1 = self.sel(ge, v1s, down)?;
+        let y0 = self.shlk(y0, 4)?;
+        let y1 = self.shlk(y1, 4)?;
+        Ok([[y0; 3], [y1; 3]])
+    }
+
+    /// Mode 3's luminance (`super::hdr_luminance_small`).
+    fn hdr_luminance_small(&mut self, v0: Value, v1: Value) -> BResult<[[Value; 3]; 2]> {
+        let top = self.bitk(v0, 7)?;
+        let top = self.opk(BinOp::INotEqual, top, 0)?;
+        let low = self.andk(v0, 0x7F)?;
+        let hi_a = self.andk(v1, 0xE0)?;
+        let hi_a = self.shlk(hi_a, 4)?;
+        let lo_a = self.shlk(low, 2)?;
+        let y0_a = self.or(hi_a, lo_a)?;
+        let d_a = self.andk(v1, 0x1F)?;
+        let d_a = self.shlk(d_a, 2)?;
+        let hi_b = self.andk(v1, 0xF0)?;
+        let hi_b = self.shlk(hi_b, 4)?;
+        let lo_b = self.shlk(low, 1)?;
+        let y0_b = self.or(hi_b, lo_b)?;
+        let d_b = self.andk(v1, 0xF)?;
+        let d_b = self.shlk(d_b, 1)?;
+        let y0 = self.sel(top, y0_a, y0_b)?;
+        let d = self.sel(top, d_a, d_b)?;
+        let y1 = self.add(y0, d)?;
+        let over = self.opk(BinOp::UGreaterThan, y1, 0xFFF)?;
+        let most = self.k(0xFFF)?;
+        let y1 = self.sel(over, most, y1)?;
+        let y0 = self.shlk(y0, 4)?;
+        let y1 = self.shlk(y1, 4)?;
+        Ok([[y0; 3], [y1; 3]])
+    }
+
+    /// Mode 7's RGB, a base and a scale (`super::hdr_rgb_scale`).
+    fn hdr_rgb_scale(&mut self, [v0, v1, v2, v3]: [Value; 4]) -> BResult<[[Value; 3]; 2]> {
+        let m0 = self.andk(v0, 0xC0)?;
+        let m0 = self.shrk(m0, 6)?;
+        let m1 = self.bitk(v1, 7)?;
+        let m1 = self.shlk(m1, 2)?;
+        let m2 = self.bitk(v2, 7)?;
+        let m2 = self.shlk(m2, 3)?;
+        let modeval = self.or(m0, m1)?;
+        let modeval = self.or(modeval, m2)?;
+        let high = self.andk(modeval, 0xC)?;
+        let not_c = self.opk(BinOp::INotEqual, high, 0xC)?;
+        let all = self.eqk(modeval, 0xF)?;
+        let zero = self.k(0)?;
+        let low2 = self.andk(modeval, 3)?;
+        let top2 = self.shrk(modeval, 2)?;
+        let maj_c = self.sel(all, zero, low2)?;
+        let majcomp = self.sel(not_c, top2, maj_c)?;
+        let four = self.k(4)?;
+        let five = self.k(5)?;
+        let mode_c = self.sel(all, five, four)?;
+        let mode = self.sel(not_c, low2, mode_c)?;
+        // Red, green, blue and the scale.
+        let mut x = [
+            self.andk(v0, 0x3F)?,
+            self.andk(v1, 0x1F)?,
+            self.andk(v2, 0x1F)?,
+            self.andk(v3, 0x1F)?,
+        ];
+        let bit0 = self.bitk(v1, 6)?;
+        let bit1 = self.bitk(v1, 5)?;
+        let bit2 = self.bitk(v2, 6)?;
+        let bit3 = self.bitk(v2, 5)?;
+        let bit4 = self.bitk(v3, 7)?;
+        let bit5 = self.bitk(v3, 6)?;
+        let bit6 = self.bitk(v3, 5)?;
+        let one = self.k(1)?;
+        let oh = self.shl(one, mode)?;
+        let (red, green, blue, scale) = (0, 1, 2, 3);
+        for (i, modes, b, at) in [
+            (green, 0x30, bit0, 6),
+            (green, 0x3A, bit1, 5),
+            (blue, 0x30, bit2, 6),
+            (blue, 0x3A, bit3, 5),
+            (scale, 0x3D, bit6, 5),
+            (scale, 0x2D, bit5, 6),
+            (scale, 0x04, bit4, 7),
+            (red, 0x3B, bit4, 6),
+            (red, 0x04, bit3, 6),
+            (red, 0x10, bit5, 7),
+            (red, 0x0F, bit2, 7),
+            (red, 0x05, bit1, 8),
+            (red, 0x0A, bit0, 8),
+            (red, 0x05, bit0, 9),
+            (red, 0x02, bit6, 9),
+            (red, 0x01, bit3, 10),
+            (red, 0x02, bit5, 10),
+        ] {
+            let on = self.in_modes(oh, modes)?;
+            x[i] = self.put(x[i], on, b, at)?;
+        }
+        // Up to 12 bits: modes 0 to 5 shift by 1, 1, 2, 3, 4, 5.
+        let first = self.eqk(mode, 0)?;
+        let shift = self.sel(first, one, mode)?;
+        let red = self.shl(x[red], shift)?;
+        let green = self.shl(x[green], shift)?;
+        let blue = self.shl(x[blue], shift)?;
+        let scale = self.shl(x[scale], shift)?;
+        let not_five = self.opk(BinOp::INotEqual, mode, 5)?;
+        let green_d = self.sub(red, green)?;
+        let blue_d = self.sub(red, blue)?;
+        let green = self.sel(not_five, green_d, green)?;
+        let blue = self.sel(not_five, blue_d, blue)?;
+        let is1 = self.eqk(majcomp, 1)?;
+        let is2 = self.eqk(majcomp, 2)?;
+        let (red, green) = self.swap(is1, red, green)?;
+        let (red, blue) = self.swap(is2, red, blue)?;
+        let mut ends = [[zero; 3]; 2];
+        for (ch, c) in [red, green, blue].into_iter().enumerate() {
+            let high = self.smax0(c)?;
+            ends[1][ch] = self.shlk(high, 4)?;
+            let low = self.sub(c, scale)?;
+            let low = self.smax0(low)?;
+            ends[0][ch] = self.shlk(low, 4)?;
+        }
+        Ok(ends)
+    }
+
+    /// Modes 11, 14 and 15's RGB (`super::hdr_rgb`).
+    fn hdr_rgb(&mut self, v: [Value; 6]) -> BResult<[[Value; 3]; 2]> {
+        let [v0, v1, v2, v3, v4, v5] = v;
+        let mut top = [v0; 6];
+        for (slot, &x) in top.iter_mut().zip(&v) {
+            *slot = self.bitk(x, 7)?;
+        }
+        let m1 = self.shlk(top[2], 1)?;
+        let m2 = self.shlk(top[3], 2)?;
+        let modeval = self.or(top[1], m1)?;
+        let modeval = self.or(modeval, m2)?;
+        let j1 = self.shlk(top[5], 1)?;
+        let majcomp = self.or(top[4], j1)?;
+        // Direct: the major-channel field 3.
+        let mut direct = [[v0; 3]; 2];
+        for (end, (r, g, b)) in direct.iter_mut().zip([(v0, v2, v4), (v1, v3, v5)]) {
+            end[0] = self.shlk(r, 8)?;
+            end[1] = self.shlk(g, 8)?;
+            let b = self.andk(b, 0x7F)?;
+            end[2] = self.shlk(b, 9)?;
+        }
+        let a40 = self.andk(v1, 0x40)?;
+        let a40 = self.shlk(a40, 2)?;
+        // `a`, `b0`, `b1`, `c`, `d0` and `d1`.
+        let mut x = [
+            self.or(v0, a40)?,
+            self.andk(v2, 0x3F)?,
+            self.andk(v3, 0x3F)?,
+            self.andk(v1, 0x3F)?,
+            self.andk(v4, 0x7F)?,
+            self.andk(v5, 0x7F)?,
+        ];
+        // The differences' bits, 7, 6, 7, 6, 5, 6, 5, 6 by mode: 6 for an odd mode, else 5 for
+        // modes 4 and 6 and 7 for 0 and 2.
+        let odd = self.andk(modeval, 1)?;
+        let odd = self.opk(BinOp::INotEqual, odd, 0)?;
+        let four = self.andk(modeval, 4)?;
+        let four = self.opk(BinOp::INotEqual, four, 0)?;
+        let five = self.k(5)?;
+        let six = self.k(6)?;
+        let seven = self.k(7)?;
+        let even_bits = self.sel(four, five, seven)?;
+        let dbits = self.sel(odd, six, even_bits)?;
+        let bit0 = self.bitk(v2, 6)?;
+        let bit1 = self.bitk(v3, 6)?;
+        let bit2 = self.bitk(v4, 6)?;
+        let bit3 = self.bitk(v5, 6)?;
+        let bit4 = self.bitk(v4, 5)?;
+        let bit5 = self.bitk(v5, 5)?;
+        let one = self.k(1)?;
+        let oh = self.shl(one, modeval)?;
+        let (a, b0, b1, c, d0, d1) = (0, 1, 2, 3, 4, 5);
+        for (i, modes, b, at) in [
+            (a, 0xA4, bit0, 9),
+            (a, 0x08, bit2, 9),
+            (a, 0x50, bit4, 9),
+            (a, 0x50, bit5, 10),
+            (a, 0xA0, bit1, 10),
+            (a, 0xC0, bit2, 11),
+            (c, 0x04, bit1, 6),
+            (c, 0xE8, bit3, 6),
+            (c, 0x20, bit2, 7),
+            (b0, 0x5B, bit0, 6),
+            (b1, 0x5B, bit1, 6),
+            (b0, 0x12, bit2, 7),
+            (b1, 0x12, bit3, 7),
+            (d0, 0xAF, bit4, 5),
+            (d1, 0xAF, bit5, 5),
+            (d0, 0x05, bit2, 6),
+            (d1, 0x05, bit3, 6),
+        ] {
+            let on = self.in_modes(oh, modes)?;
+            x[i] = self.put(x[i], on, b, at)?;
+        }
+        // `d0` and `d1` are signed `dbits`-bit values.
+        let thirty_two = self.k(32)?;
+        let sx = self.sub(thirty_two, dbits)?;
+        for d in [d0, d1] {
+            let up = self.shl(x[d], sx)?;
+            x[d] = self.op(BinOp::ShiftRightArithmetic, up, sx)?;
+        }
+        // Up to 12 bits.
+        let half = self.shrk(modeval, 1)?;
+        let shift = self.opk(BinOp::BitwiseXor, half, 3)?;
+        for slot in x.iter_mut() {
+            *slot = self.shl(*slot, shift)?;
+        }
+        let g1 = self.sub(x[a], x[b0])?;
+        let bl1 = self.sub(x[a], x[b1])?;
+        let r0 = self.sub(x[a], x[c])?;
+        let g0 = self.sub(g1, x[c])?;
+        let g0 = self.sub(g0, x[d0])?;
+        let bl0 = self.sub(bl1, x[c])?;
+        let bl0 = self.sub(bl0, x[d1])?;
+        let mut zero_end = [r0, g0, bl0];
+        let mut one_end = [x[a], g1, bl1];
+        for x in zero_end.iter_mut().chain(one_end.iter_mut()) {
+            *x = self.sclamp(*x, 0, 0xFFF)?;
+        }
+        let is1 = self.eqk(majcomp, 1)?;
+        let is2 = self.eqk(majcomp, 2)?;
+        for end in [&mut zero_end, &mut one_end] {
+            let (r, g) = self.swap(is1, end[0], end[1])?;
+            let (r, b) = self.swap(is2, r, end[2])?;
+            *end = [r, g, b];
+        }
+        let is3 = self.eqk(majcomp, 3)?;
+        let mut ends = [zero_end, one_end];
+        for (end, direct) in ends.iter_mut().zip(direct) {
+            for (x, d) in end.iter_mut().zip(direct) {
+                let up = self.shlk(*x, 4)?;
+                *x = self.sel(is3, d, up)?;
+            }
+        }
+        Ok(ends)
+    }
+
+    /// Mode 15's alpha (`super::hdr_alpha`).
+    fn hdr_alpha(&mut self, v6: Value, v7: Value) -> BResult<[Value; 2]> {
+        let m0 = self.bitk(v6, 7)?;
+        let m1 = self.shrk(v7, 6)?;
+        let m1 = self.andk(m1, 2)?;
+        let modeval = self.or(m0, m1)?;
+        let a6 = self.andk(v6, 0x7F)?;
+        let a7 = self.andk(v7, 0x7F)?;
+        let direct0 = self.shlk(a6, 5)?;
+        let direct1 = self.shlk(a7, 5)?;
+        let up = self.addk(modeval, 1)?;
+        let moved = self.shl(a7, up)?;
+        let moved = self.andk(moved, 0x780)?;
+        let base = self.or(a6, moved)?;
+        let mask = self.k(0x3F)?;
+        let mask = self.shr(mask, modeval)?;
+        let bias = self.k(32)?;
+        let bias = self.shr(bias, modeval)?;
+        let delta = self.and(a7, mask)?;
+        let delta = self.op(BinOp::BitwiseXor, delta, bias)?;
+        let delta = self.sub(delta, bias)?;
+        let four = self.k(4)?;
+        let shift = self.sub(four, modeval)?;
+        let base = self.shl(base, shift)?;
+        let delta = self.shl(delta, shift)?;
+        let sum = self.add(base, delta)?;
+        let sum = self.sclamp(sum, 0, 0xFFF)?;
+        let direct = self.eqk(modeval, 3)?;
+        let a0 = self.sel(direct, direct0, base)?;
+        let a1 = self.sel(direct, direct1, sum)?;
+        Ok([self.shlk(a0, 4)?, self.shlk(a1, 4)?])
+    }
+
+    /// The endpoints of an HDR colour endpoint mode `cem` from its unquantized values `v`
+    /// (`super::hdr_endpoints`), in the interpolator's 16 bits, and whether its alpha is HDR
+    /// (all but mode 14's).
+    fn hdr_endpoints(&mut self, cem: Value, v: [Value; 8]) -> BResult<([[Value; 4]; 2], Value)> {
+        let large = self.hdr_luminance_large(v[0], v[1])?;
+        let small = self.hdr_luminance_small(v[0], v[1])?;
+        let scale = self.hdr_rgb_scale([v[0], v[1], v[2], v[3]])?;
+        let mut rgb = self.hdr_rgb([v[0], v[1], v[2], v[3], v[4], v[5]])?;
+        for (mode, ends) in [(7, scale), (3, small), (2, large)] {
+            let here = self.eqk(cem, mode)?;
+            for (end, own) in rgb.iter_mut().zip(ends) {
+                for (x, o) in end.iter_mut().zip(own) {
+                    *x = self.sel(here, o, *x)?;
+                }
+            }
+        }
+        let hdr_alpha = self.hdr_alpha(v[6], v[7])?;
+        let is14 = self.eqk(cem, 14)?;
+        let is15 = self.eqk(cem, 15)?;
+        let opaque = self.k(0x7800)?;
+        let mut alpha = [opaque; 2];
+        for (i, slot) in alpha.iter_mut().enumerate() {
+            let ldr = self.mulk(v[6 + i], 257)?;
+            let a = self.sel(is14, ldr, opaque)?;
+            *slot = self.sel(is15, hdr_alpha[i], a)?;
+        }
+        let lns_alpha = self.not(is14)?;
+        let ends = [0, 1].map(|e| [rgb[e][0], rgb[e][1], rgb[e][2], alpha[e]]);
+        Ok((ends, lns_alpha))
+    }
+
+    /// `super::unorm16_to_half(c)`.
+    fn unorm16_to_half(&mut self, c: Value) -> BResult<Value> {
+        let msb = self.f.glsl(GlslOp::FindUMsb, &[c])?;
+        let sixteen = self.k(16)?;
+        let up = self.sub(sixteen, msb)?;
+        // A `c` under 4 shifts by 15 to 17 here, a value the subnormal choice replaces.
+        let below = self.shl(c, up)?;
+        let below = self.andk(below, 0xFFFF)?;
+        let mantissa = self.shrk(below, 6)?;
+        let exponent = self.addk(msb, u32::MAX)?;
+        let exponent = self.shlk(exponent, 10)?;
+        let normal = self.or(exponent, mantissa)?;
+        let small = self.opk(BinOp::ULessThan, c, 4)?;
+        let subnormal = self.shlk(c, 8)?;
+        let h = self.sel(small, subnormal, normal)?;
+        let full = self.eqk(c, 0xFFFF)?;
+        let one = self.k(u32::from(HALF_ONE))?;
+        self.sel(full, one, h)
+    }
+
+    /// `super::lns_to_half(c)`.
+    fn lns_to_half(&mut self, c: Value) -> BResult<Value> {
+        let e = self.shrk(c, 11)?;
+        let m = self.andk(c, 0x7FF)?;
+        let m3 = self.mulk(m, 3)?;
+        let m4 = self.mulk(m, 4)?;
+        let m4 = self.addk(m4, u32::MAX - 511)?;
+        let m5 = self.mulk(m, 5)?;
+        let m5 = self.addk(m5, u32::MAX - 2047)?;
+        let under_512 = self.opk(BinOp::ULessThan, m, 512)?;
+        let under_1536 = self.opk(BinOp::ULessThan, m, 1536)?;
+        let mt = self.sel(under_1536, m4, m5)?;
+        let mt = self.sel(under_512, m3, mt)?;
+        let e = self.shlk(e, 10)?;
+        let mt = self.shrk(mt, 3)?;
+        let h = self.or(e, mt)?;
+        let over = self.opk(BinOp::UGreaterThan, h, 0x7BFF)?;
+        let most = self.k(0x7BFF)?;
+        self.sel(over, most, h)
+    }
+
+    /// The bits of the `f32` of the FP16 value `h` (`super::half_to_f32`).
+    fn half_to_f32_bits(&mut self, h: Value) -> BResult<Value> {
+        let sign = self.shrk(h, 15)?;
+        let sign = self.shlk(sign, 31)?;
+        let e = self.field(h, 10, 5)?;
+        let m = self.andk(h, 0x3FF)?;
+        let m13 = self.shlk(m, 13)?;
+        let e32 = self.addk(e, 112)?;
+        let e32 = self.shlk(e32, 23)?;
+        let normal = self.or(sign, e32)?;
+        let normal = self.or(normal, m13)?;
+        let top = self.k(0xFF << 23)?;
+        let special = self.or(sign, top)?;
+        let special = self.or(special, m13)?;
+        // Subnormal: `m · 2^-24`, its leading one at bit `msb` (a zero `m` shifts by 24 here, a
+        // value the zero choice replaces).
+        let msb = self.f.glsl(GlslOp::FindUMsb, &[m])?;
+        let e_sub = self.addk(msb, 103)?;
+        let e_sub = self.shlk(e_sub, 23)?;
+        let twenty_three = self.k(23)?;
+        let up = self.sub(twenty_three, msb)?;
+        let m_sub = self.shl(m, up)?;
+        let m_sub = self.andk(m_sub, 0x7F_FFFF)?;
+        let sub = self.or(sign, e_sub)?;
+        let sub = self.or(sub, m_sub)?;
+        let no_mantissa = self.eqk(m, 0)?;
+        let small = self.sel(no_mantissa, sign, sub)?;
+        let is_zero_e = self.eqk(e, 0)?;
+        let is_top_e = self.eqk(e, 0x1F)?;
+        let bits = self.sel(is_top_e, special, normal)?;
+        self.sel(is_zero_e, small, bits)
+    }
+
+    /// `super::unorm8_of_half(h)`.
+    fn unorm8_of_half(&mut self, h: Value) -> BResult<Value> {
+        let negative = self.andk(h, 0x8000)?;
+        let negative = self.opk(BinOp::INotEqual, negative, 0)?;
+        let zero_h = self.eqk(h, 0)?;
+        let none = self.lor(negative, zero_h)?;
+        let full = self.opk(BinOp::UGreaterThanEqual, h, u32::from(HALF_ONE))?;
+        let e = self.field(h, 10, 5)?;
+        let m = self.andk(h, 0x3FF)?;
+        let lead = self.opk(BinOp::BitwiseOr, m, 0x400)?;
+        let e_zero = self.eqk(e, 0)?;
+        let less = self.addk(e, u32::MAX)?;
+        // Below 1.0 the exponent is at most 14; a larger one (1.0 or more, or a negative value's)
+        // shifts by 15 to 30 here, a value the full or the none choice replaces.
+        let zero = self.k(0)?;
+        let shift = self.sel(e_zero, zero, less)?;
+        let normal = self.shl(lead, shift)?;
+        let units = self.sel(e_zero, m, normal)?;
+        let scaled = self.mulk(units, 255)?;
+        let scaled = self.addk(scaled, 1 << 23)?;
+        let code = self.shrk(scaled, 24)?;
+        let top = self.k(255)?;
+        let code = self.sel(full, top, code)?;
+        self.sel(none, zero, code)
+    }
+
+    /// The FP16 value nearest `num / den` (`super::half_of_ratio`), `den` an odd constant of 4095
+    /// or less.
+    fn half_of_ratio(&mut self, num: Value, den: u32) -> BResult<Value> {
+        // The least `p` of 1 to 12 with `num · 2^p ≥ den`.
+        let mut p = self.k(12)?;
+        for i in (1..12).rev() {
+            let q = self.shlk(num, i)?;
+            let fits = self.opk(BinOp::UGreaterThanEqual, q, den)?;
+            let here = self.k(i)?;
+            p = self.sel(fits, here, p)?;
+        }
+        let q = self.shl(num, p)?;
+        let t = self.mulk(q, 2048)?;
+        let t = self.addk(t, den)?;
+        let m = self.opk(BinOp::UDiv, t, 2 * den)?;
+        let fifteen = self.k(15)?;
+        let e = self.sub(fifteen, p)?;
+        let e = self.shlk(e, 10)?;
+        let h = self.add(e, m)?;
+        let h = self.addk(h, u32::MAX - 1023)?;
+        let full = self.opk(BinOp::UGreaterThanEqual, num, den)?;
+        let one = self.k(u32::from(HALF_ONE))?;
+        let h = self.sel(full, one, h)?;
+        let nothing = self.eqk(num, 0)?;
+        let zero = self.k(0)?;
+        self.sel(nothing, zero, h)
+    }
+
     /// `hash52(p)`.
     fn hash52(&mut self, p: Value) -> BResult<Value> {
         let xor = |k: &mut Self, a: Value, b: Value| k.op(BinOp::BitwiseXor, a, b);
@@ -674,9 +1159,9 @@ impl K<'_, '_> {
     }
 }
 
-/// The texel's channels, each its 16-bit interpolation result `C`, and whether the texel is an
-/// error one: the decode of the block `words` at texel `(s, t)` of a block of `decode`'s
-/// footprint (`super::decode_block` and `super::void_extent`).
+/// The texel's channels, each its 16-bit interpolation result `C` (an HDR format's FP16 value),
+/// and whether the texel is an error one: the decode of the block `words` at texel `(s, t)` of a
+/// block of `decode`'s footprint (`super::decode_block` and `super::void_extent`).
 fn texel(
     k: &mut K<'_, '_>,
     decode: AstcDecode,
@@ -894,7 +1379,15 @@ fn texel(
         *slot = k.unquantize(tables, color_range, raw)?;
     }
     let ([e0, e1], hdr) = k.endpoints(cem, v)?;
-    let partition_bad = k.lor(bad, hdr)?;
+    // An HDR format's HDR modes unpack their own endpoints; an LDR or sRGB format's read magenta.
+    let hdr_ends = match decode.hdr {
+        true => Some(k.hdr_endpoints(cem, v)?),
+        false => None,
+    };
+    let partition_bad = match decode.hdr {
+        true => bad,
+        false => k.lor(bad, hdr)?,
+    };
     // The weights, from bit 127 down: the stream of the block's bits reversed.
     let mut reversed = words;
     for (slot, &w) in reversed.iter_mut().zip(words.iter().rev()) {
@@ -959,15 +1452,32 @@ fn texel(
             }
             false => k.mulk(e, 257),
         };
-        let c0 = widen(k, e0[ch as usize])?;
-        let c1 = widen(k, e1[ch as usize])?;
+        let mut c0 = widen(k, e0[ch as usize])?;
+        let mut c1 = widen(k, e1[ch as usize])?;
+        let mut lns = None;
+        if let Some(([h0, h1], lns_alpha)) = hdr_ends {
+            c0 = k.sel(hdr, h0[ch as usize], c0)?;
+            c1 = k.sel(hdr, h1[ch as usize], c1)?;
+            lns = Some(match ch {
+                3 => k.land(hdr, lns_alpha)?,
+                _ => hdr,
+            });
+        }
         let sixty_four = k.k(64)?;
         let rest = k.sub(sixty_four, w)?;
         let a = k.mul(c0, rest)?;
         let b = k.mul(c1, w)?;
         let sum = k.add(a, b)?;
         let sum = k.addk(sum, 32)?;
-        *slot = k.shrk(sum, 6)?;
+        let c = k.shrk(sum, 6)?;
+        *slot = match lns {
+            None => c,
+            Some(lns) => {
+                let log = k.lns_to_half(c)?;
+                let linear = k.unorm16_to_half(c)?;
+                k.sel(lns, log, linear)?
+            }
+        };
     }
     // A void-extent block (`super::void_extent`).
     let void_mode = k.andk(mode, 0x1ff)?;
@@ -990,12 +1500,21 @@ fn texel(
     let empty = k.lor(empty_s, empty_t)?;
     let some = k.not(all_ones)?;
     let empty = k.land(some, empty)?;
-    let void_bad = k.lor(hdr_void, reserved_void)?;
+    // An HDR format's void-extent block of HDR values reads them; an LDR or sRGB format's is an
+    // error block.
+    let void_bad = match decode.hdr {
+        true => reserved_void,
+        false => k.lor(hdr_void, reserved_void)?,
+    };
     let void_bad = k.lor(void_bad, empty)?;
     let mut color = [zero; 4];
     for (i, slot) in color.iter_mut().enumerate() {
         let word = words[2 + i / 2];
         *slot = k.field(word, 16 * (i as u32 % 2), 16)?;
+        if decode.hdr {
+            let half = k.unorm16_to_half(*slot)?;
+            *slot = k.sel(hdr_void, *slot, half)?;
+        }
     }
     let channels = k.sel4(void, color, channels)?;
     let bad = k.sel(void, void_bad, partition_bad)?;
@@ -1068,16 +1587,21 @@ pub(super) fn typed_module(decode: AstcDecode, texels: AstcTexels) -> BResult<Ty
         let y0 = k.mulk(by, bh)?;
         let t = k.sub(y, y0)?;
         let (channels, bad) = texel(&mut k, decode, words, [s, t])?;
-        // An error texel is magenta: each channel's `C` all ones, green 0.
-        let all = k.k(0xffff)?;
+        // An error texel is magenta (`AstcDecode::error_texel`): each channel's `C` all ones, an
+        // HDR format's FP16 1.0, green 0.
+        let all = k.k(match decode.hdr {
+            true => u32::from(HALF_ONE),
+            false => 0xffff,
+        })?;
         let channels = k.sel4(bad, [all, zero, all, all], channels)?;
         let out: Vec<Value> = match texels {
             AstcTexels::Unorm8 => {
                 let mut packed = zero;
                 for (ch, c) in (0u32..).zip(channels) {
-                    let code = match decode.srgb {
-                        true => k.shrk(c, 8)?,
-                        false => {
+                    let code = match (decode.hdr, decode.srgb) {
+                        (true, _) => k.unorm8_of_half(c)?,
+                        (false, true) => k.shrk(c, 8)?,
+                        (false, false) => {
                             let twelve = k.shrk(c, 4)?;
                             let scaled = k.mulk(twelve, 255)?;
                             let scaled = k.addk(scaled, 2047)?;
@@ -1089,6 +1613,33 @@ pub(super) fn typed_module(decode: AstcDecode, texels: AstcTexels) -> BResult<Ty
                 }
                 vec![packed]
             }
+            AstcTexels::Half => {
+                let mut halves = [zero; 4];
+                for (ch, (slot, c)) in halves.iter_mut().zip(channels).enumerate() {
+                    *slot = match (decode.hdr, decode.srgb, ch) {
+                        (true, ..) => c,
+                        (false, true, 3) => {
+                            let code = k.shrk(c, 8)?;
+                            k.half_of_ratio(code, 255)?
+                        }
+                        (false, true, _) => {
+                            let code = k.shrk(c, 8)?;
+                            let step = k.entry(k.tables.srgb_steps, code)?;
+                            k.half_of_ratio(step, 4095)?
+                        }
+                        (false, false, _) => {
+                            let twelve = k.shrk(c, 4)?;
+                            k.half_of_ratio(twelve, 4095)?
+                        }
+                    };
+                }
+                let mut pairs = Vec::with_capacity(2);
+                for pair in halves.chunks(2) {
+                    let high = k.shlk(pair[1], 16)?;
+                    pairs.push(k.or(pair[0], high)?);
+                }
+                pairs
+            }
             AstcTexels::Float => {
                 let u = Form {
                     held: Held::Int {
@@ -1099,6 +1650,10 @@ pub(super) fn typed_module(decode: AstcDecode, texels: AstcTexels) -> BResult<Ty
                 };
                 let mut words = Vec::with_capacity(4);
                 for (ch, c) in channels.into_iter().enumerate() {
+                    if decode.hdr {
+                        words.push(k.half_to_f32_bits(c)?);
+                        continue;
+                    }
                     let value = match (decode.srgb, ch) {
                         (true, 3) => {
                             let code = k.shrk(c, 8)?;

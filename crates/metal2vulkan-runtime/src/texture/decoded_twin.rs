@@ -344,13 +344,17 @@ impl Decoded {
         use Format as F;
         // An ASTC texture's binding views name its candidate's 8-bit format (its `_sRGB` form's
         // `R8G8B8A8_SRGB`, or its raw view `R8G8B8A8_UNORM`, whose codes its twin holds): the
-        // twin's own view of it, or an LDR twin's exact values.
+        // twin's own view of it, or an LDR twin's exact values; an HDR texture's name its FP16
+        // texels' `R16G16B16A16_SFLOAT`, the twin's own format.
         // A PVRTC texture's name the same formats, and the twin holds their codes; so does an
         // ETC2 or EAC 8-bit format's, and an 11-bit one's name its compact texels' format. A
         // 4:2:2 texture's name the codes' `R8G8B8A8_UNORM` alone (it has no sRGB form).
         let named = matches!(format, F::R8G8B8A8_UNORM | F::R8G8B8A8_SRGB);
         let decode = match self.decode {
             TwinDecode::Block(decode) => decode,
+            TwinDecode::Astc(astc, _) if astc.hdr => {
+                return (format == F::R16G16B16A16_SFLOAT).then_some(self.decode.texel_format());
+            }
             TwinDecode::Astc(_, texels) => {
                 return named.then_some(match texels {
                     AstcTexels::Unorm8 => format,
@@ -475,8 +479,9 @@ impl Device {
     /// form's 8-bit codes either way, which its slots read raw and decode through Metal's table,
     /// exactly (`metal::texel_format::srgb_raw_on`); an LDR form's Metal's exact values where
     /// `DevicePolicy::decoded_texels` asks for them and the device samples, filters and copies
-    /// into their format, else 8-bit codes. Refused where the device does not even take the
-    /// codes' format so (no conformant device).
+    /// into their format, else 8-bit codes; an HDR form's FP16 values, exactly, either way (as
+    /// `float`s where the device takes no halves so). Refused where the device does not even take
+    /// the codes' format so (no conformant device), or an HDR form's halves or `float`s.
     fn astc_texels(&self, decode: AstcDecode) -> Result<AstcTexels, Error> {
         let facts = self
             .shared()
@@ -487,18 +492,19 @@ impl Device {
                 .optimal(decode.texel_format(texels))
                 .contains(TWIN_FEATURES)
         };
-        let wanted = match self.compile_device().policy().decoded_texels {
-            DecodedTexelsPolicy::Exact if !decode.srgb => AstcTexels::Float,
-            _ => AstcTexels::Unorm8,
+        let (wanted, fallback) = match self.compile_device().policy().decoded_texels {
+            _ if decode.hdr => (AstcTexels::Half, AstcTexels::Float),
+            DecodedTexelsPolicy::Exact if !decode.srgb => (AstcTexels::Float, AstcTexels::Unorm8),
+            _ => (AstcTexels::Unorm8, AstcTexels::Unorm8),
         };
-        [wanted, AstcTexels::Unorm8]
+        [wanted, fallback]
             .into_iter()
             .find(|&texels| takes(texels))
             .ok_or_else(|| {
                 Error::Unsupported(Unsupported::needs(
                     Feature::Format,
                     Capability::Format {
-                        format: decode.texel_format(AstcTexels::Unorm8),
+                        format: decode.texel_format(fallback),
                         usage: FormatUsage::SampledImageFilterLinear,
                     },
                 ))

@@ -913,8 +913,8 @@ fn a_swizzled_candidate_needs_the_subset_s_view_swizzle() {
 /// The ASTC HDR and PVRTC RGBA formats are their `SFLOAT` and PVRTC1 blocks where the profile
 /// exposes them: on `moltenvk-m3` (a 1.4 device with `VK_IMG_format_pvrtc`) they map directly;
 /// on the 1.2 floor listing the same blocks without the extensions, the refusal names the
-/// extension, and for a PVRTC format the format of its decoded twin's codes, which that floor does
-/// not list either.
+/// extension, and the format of the decoded twin's texels (a PVRTC format's codes, an ASTC HDR
+/// format's FP16 values), which that floor does not list either.
 #[test]
 fn compressed_extension_formats_follow_exposure() {
     use FormatUsage as U;
@@ -965,6 +965,13 @@ fn compressed_extension_formats_follow_exposure() {
             };
             needs.push(vec![Capability::Format {
                 format: codes,
+                usage: U::SampledImage,
+            }]);
+        }
+        // An ASTC HDR format's decoded twin, of FP16 texels.
+        if crate::bind::AstcDecode::of(pf).is_some_and(|d| d.hdr) {
+            needs.push(vec![Capability::Format {
+                format: vk::Format::R16G16B16A16_SFLOAT,
                 usage: U::SampledImage,
             }]);
         }

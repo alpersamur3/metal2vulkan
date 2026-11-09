@@ -1,31 +1,36 @@
-//! The ASTC decode against blocks the specification's rules decide outright, and against Metal's
-//! reads of seeded random blocks on an Apple M3 Max (macOS 27.0.1).
+//! The ASTC decode against blocks the specification's rules decide outright, against Metal's
+//! reads of seeded random blocks on an Apple M3 Max (macOS 27.0.1), and an HDR format's against
+//! ARM's reference codec (astcenc) of seeded random blocks.
 
 use super::kernel::typed_module;
-use super::{AstcDecode, AstcTexels, Illegal};
+use super::{
+    half_of_ratio, half_to_f32, lns_to_half, unorm16_to_half, unorm8_of_half, AstcDecode,
+    AstcTexels, Illegal, HALF_ONE,
+};
 use crate::bind::block_decode::{BlockDecodeModule, BLOCKS, SHAPE, TEXELS};
 use crate::metal::PixelFormat;
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources};
 use crate::spirv::testing::{assert_valid, committed_profiles};
 
-/// The fourteen 2D footprints, linear and sRGB, decode, and no other format does (the HDR forms
-/// and Apple's 4x2 and 8x4 footprints among them).
+/// The fourteen 2D footprints, linear, sRGB and HDR, decode, and no other format does (Apple's
+/// 4x2 and 8x4 footprints among them).
 #[test]
-fn the_ldr_and_srgb_formats_alone_decode() {
+fn the_ldr_srgb_and_hdr_formats_alone_decode() {
     let decoded: Vec<(PixelFormat, AstcDecode)> = PixelFormat::ALL
         .iter()
         .filter_map(|&pf| AstcDecode::of(pf).map(|d| (pf, d)))
         .collect();
-    assert_eq!(decoded.len(), 28);
+    assert_eq!(decoded.len(), 42);
     for (pf, d) in decoded {
         let name = pf.name();
         let footprint = format!("_{}x{}_", d.width, d.height);
         assert!(name.contains(&footprint), "{name}: {d:?}");
         assert_eq!(name.ends_with("_sRGB"), d.srgb, "{name}");
-        assert!(name.ends_with("_LDR") || d.srgb, "{name}");
+        assert_eq!(name.ends_with("_HDR"), d.hdr, "{name}");
+        assert!(name.ends_with("_LDR") || d.srgb || d.hdr, "{name}");
     }
     for pf in [
-        PixelFormat::ASTC8x8HDR,
+        PixelFormat::ASTC4x2HDR,
         PixelFormat::ASTC4x2LDR,
         PixelFormat::ASTC8x4SRGB,
         PixelFormat::BC7RGBAUnorm,
@@ -213,9 +218,13 @@ fn the_eight_bit_twin_holds_the_nearest_codes() {
 #[test]
 fn the_astc_decode_kernels_are_valid_on_every_committed_profile() {
     let profiles = committed_profiles().expect("profiles");
-    for pf in [PixelFormat::ASTC4x4LDR, PixelFormat::ASTC12x12SRGB] {
+    for pf in [
+        PixelFormat::ASTC4x4LDR,
+        PixelFormat::ASTC12x12SRGB,
+        PixelFormat::ASTC6x6HDR,
+    ] {
         let decode = AstcDecode::of(pf).expect("a decode");
-        for texels in [AstcTexels::Unorm8, AstcTexels::Float] {
+        for texels in [AstcTexels::Unorm8, AstcTexels::Float, AstcTexels::Half] {
             for (_, p) in &profiles {
                 assert_valid(typed_module(decode, texels).expect("module"), p);
             }
@@ -301,7 +310,11 @@ fn modes_of(block: &[u8; 16]) -> (Vec<u32>, bool) {
 fn covering_blocks(decode: AstcDecode, seed: u64, each: usize, invalid: usize) -> Vec<u8> {
     let (mut modes, mut partitions, mut planes, mut void) = ([0; 16], [0; 5], 0, 0);
     let (mut good, mut bad) = (Vec::new(), Vec::new());
-    for block in seeded_blocks(seed, 8192).as_chunks::<16>().0 {
+    let source = match decode.hdr {
+        true => hdr_seeded_blocks(seed, 8192),
+        false => seeded_blocks(seed, 8192),
+    };
+    for block in source.as_chunks::<16>().0 {
         if decode.block_values(block).is_none() {
             if bad.len() < invalid * 16 {
                 bad.extend_from_slice(block);
@@ -391,7 +404,13 @@ fn the_astc_kernel_is_the_decode_on_every_texel() {
     for decode in [four, AstcDecode { srgb: true, ..four }] {
         assert_kernel_decodes(decode, AstcTexels::Float, &blocks, size, &both[..1]);
         assert_kernel_decodes(decode, AstcTexels::Unorm8, &blocks, size, &both);
+        assert_kernel_decodes(decode, AstcTexels::Half, &blocks, size, &both[..1]);
     }
+    let hdr = AstcDecode::of(PixelFormat::ASTC4x4HDR).expect("a decode");
+    let (blocks, size) = two_layers(hdr, covering_blocks(hdr, 222, 3, 4), 8);
+    assert_kernel_decodes(hdr, AstcTexels::Half, &blocks, size, &both);
+    assert_kernel_decodes(hdr, AstcTexels::Float, &blocks, size, &both[..1]);
+    assert_kernel_decodes(hdr, AstcTexels::Unorm8, &blocks, size, &both[..1]);
     for raw in 205..=218u32 {
         let Some(linear) = PixelFormat::try_from(raw).ok().and_then(AstcDecode::of) else {
             continue;
@@ -411,6 +430,13 @@ fn the_astc_kernel_is_the_decode_on_every_texel() {
         for decode in [linear, srgb] {
             assert_kernel_decodes(decode, AstcTexels::Float, &blocks, size, &both[..1]);
         }
+        let hdr = AstcDecode::of(PixelFormat::try_from(raw + 18).expect("an HDR format"))
+            .expect("a decode");
+        let mut blocks = covering_blocks(hdr, u64::from(raw + 18), 1, 0);
+        blocks.truncate(16 * valid);
+        blocks.extend_from_slice(&covering_blocks(hdr, u64::from(raw + 18), 0, 1));
+        let (blocks, size) = two_layers(hdr, blocks, 2);
+        assert_kernel_decodes(hdr, AstcTexels::Half, &blocks, size, &both[..1]);
     }
 }
 
@@ -419,7 +445,12 @@ fn the_astc_kernel_is_the_decode_on_every_texel() {
 /// blocks) and the 12x12.
 #[test]
 fn the_compared_blocks_cover_every_mode() {
-    for pf in [PixelFormat::ASTC4x4LDR, PixelFormat::ASTC12x12LDR] {
+    for pf in [
+        PixelFormat::ASTC4x4LDR,
+        PixelFormat::ASTC12x12LDR,
+        PixelFormat::ASTC4x4HDR,
+        PixelFormat::ASTC12x12HDR,
+    ] {
         let decode = AstcDecode::of(pf).expect("a decode");
         let blocks = covering_blocks(decode, u64::from(pf.as_raw()), 2, 0);
         let (mut modes, mut partitions, mut planes, mut void) = ([0; 16], [0; 5], 0, 0);
@@ -441,5 +472,252 @@ fn the_compared_blocks_cover_every_mode() {
             "{pf:?}: {partitions:?}"
         );
         assert!(modes.iter().all(|&n| n > 0), "{pf:?}: {modes:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// HDR formats.
+
+/// Seeded blocks for the HDR forms: [`seeded_blocks`]'s draws, whose void-extent blocks (1 in 8)
+/// hold HDR values (bit 9 set) where the third draw's bit 9 is set.
+fn hdr_seeded_blocks(seed: u64, count: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut out = Vec::with_capacity(count * 16);
+    for _ in 0..count {
+        let (mut low, high, k) = (next(), next(), next());
+        if k % 8 == 0 {
+            low = (low & !0xFFF) | 0xDFC | ((k >> 9) & 1) << 9;
+            if (k >> 8) & 1 == 1 {
+                low |= ((1 << 52) - 1) << 12;
+            }
+        }
+        out.extend_from_slice(&low.to_le_bytes());
+        out.extend_from_slice(&high.to_le_bytes());
+    }
+    out
+}
+
+/// Every texel of 1024 seeded HDR blocks (32 x 32 of them, seeded by the HDR form's raw value) of
+/// each footprint is the reference codec's: the FP16 texels' FNV-1a digest equals the digest of
+/// ARM's astcenc (5.x, `8f05514`, its HDR profile into `ASTCENC_TYPE_F16` texels) of the same
+/// blocks, its error texels (four NaNs) read as magenta and the texels here with each signalling
+/// NaN quieted ([`quieted`]: astcenc's come out of `f32`s; a void-extent block's NaN values are
+/// undefined, the specification says, and this decode keeps them). Of each footprint 124 to 274 blocks are
+/// valid (void-extent blocks, LDR and HDR, among them), some of HDR colour endpoint modes; the
+/// rest are error blocks of every kind.
+#[test]
+fn hdr_blocks_decode_as_the_reference_codec_does() {
+    const DIGESTS: [(u32, u64); 14] = [
+        (222, 0x8534_49d0_c22d_071c),
+        (223, 0x21da_ab07_c4c3_c983),
+        (224, 0x69f3_1077_da51_fe07),
+        (225, 0x4a87_a1b8_9746_7995),
+        (226, 0xd302_9d48_ea21_f274),
+        (228, 0x1d84_92f1_0747_475d),
+        (229, 0x3495_8053_386b_372d),
+        (230, 0x2bd0_11de_05c7_cea6),
+        (231, 0xb956_31ab_3e84_1d0b),
+        (232, 0xfe8b_5806_bb37_30a0),
+        (233, 0xcef0_9094_df6a_659a),
+        (234, 0xfcf3_0f10_11d8_c9ee),
+        (235, 0x4b54_1b3f_08d4_a13f),
+        (236, 0xbf6e_cbd4_76c1_7525),
+    ];
+    for (raw, digest) in DIGESTS {
+        let pf = PixelFormat::try_from(raw).expect("an ASTC HDR format");
+        let d = AstcDecode::of(pf).expect("a decode");
+        assert!(d.hdr, "{pf:?}");
+        let blocks = hdr_seeded_blocks(u64::from(raw), 1024);
+        let size = [32 * d.width, 32 * d.height, 1];
+        let texels = d.decode(AstcTexels::Half, &blocks, size);
+        assert_eq!(fnv1a(&quieted(&texels)), digest, "{pf:?}");
+        let mut hdr_modes = 0;
+        for block in blocks.as_chunks::<16>().0 {
+            if d.block_values(block).is_none() || u128::from_le_bytes(*block) & 0x1FF == 0x1FC {
+                continue;
+            }
+            let (modes, _) = modes_of(block);
+            hdr_modes += modes
+                .iter()
+                .filter(|m| [2, 3, 7, 11, 14, 15].contains(*m))
+                .count();
+        }
+        assert!(
+            hdr_modes >= 5,
+            "{pf:?}: {hdr_modes} partitions of HDR modes"
+        );
+    }
+}
+
+/// FP16 `texels` with each signalling NaN quieted (its mantissa's top bit set), as a conversion
+/// through `f32` quiets them.
+fn quieted(texels: &[u8]) -> Vec<u8> {
+    let quiet = |h: u16| match h & 0x7C00 == 0x7C00 && h & 0x3FF != 0 {
+        true => h | 0x200,
+        false => h,
+    };
+    (texels.as_chunks::<2>().0.iter())
+        .flat_map(|&p| quiet(u16::from_le_bytes(p)).to_le_bytes())
+        .collect()
+}
+
+/// An HDR format's void-extent block of HDR values reads its four FP16 values, one of UNORM16
+/// values reads each over 65536 rounded toward zero (65535 reading 1.0); an error block reads
+/// magenta, in every form of texels.
+#[test]
+fn hdr_void_extent_and_error_blocks_read_as_the_rules_say() {
+    let d = AstcDecode::of(PixelFormat::ASTC8x8HDR).expect("a decode");
+    let block = |low: u64, color: [u16; 4]| {
+        let high =
+            (color.iter().enumerate()).fold(0u64, |acc, (i, &c)| acc | u64::from(c) << (16 * i));
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&low.to_le_bytes());
+        bytes[8..].copy_from_slice(&high.to_le_bytes());
+        bytes
+    };
+    let constant = 0xDFC | ((1u64 << 52) - 1) << 12;
+    let halves = [0x4500u16, 0xC000, 0x0001, 0x7BFF];
+    assert_eq!(
+        d.block_values(&block(constant | 1 << 9, halves)),
+        Some(vec![halves; 64])
+    );
+    let unorm = [0xFFFFu16, 0x8000, 0x0003, 0x0000];
+    assert_eq!(
+        d.block_values(&block(constant, unorm)),
+        Some(vec![[HALF_ONE, 0x3800, 0x0300, 0]; 64])
+    );
+    assert_eq!(
+        d.block_values_why(&block(constant & !(1 << 11), halves))
+            .err(),
+        Some(Illegal::VoidExtentReserved)
+    );
+    assert_eq!(
+        d.block_values_why(&[0; 16]).err(),
+        Some(Illegal::ReservedMode)
+    );
+    let read = |texels: AstcTexels| {
+        let mut out = vec![0; 64 * AstcDecode::texel_bytes(texels) as usize];
+        d.decode_into(texels, &[0; 16], [8, 8, 1], &mut out);
+        out[..AstcDecode::texel_bytes(texels) as usize].to_vec()
+    };
+    let one = HALF_ONE.to_le_bytes();
+    assert_eq!(read(AstcTexels::Half), [one, [0, 0], one, one].concat());
+    let float: Vec<f32> = (read(AstcTexels::Float).as_chunks::<4>().0.iter())
+        .map(|&w| f32::from_le_bytes(w))
+        .collect();
+    assert_eq!(float, [1.0, 0.0, 1.0, 1.0]);
+    assert_eq!(read(AstcTexels::Unorm8), [255, 0, 255, 255]);
+}
+
+/// A block built by the specification's layout, of HDR luminance of a large range (mode 2) and
+/// the endpoint bytes `0x40` and `0xC0` (block mode `0x213`, as above): the 12-bit endpoints
+/// `0x400` and `0xC00`, whose weights of 0 and 64 read `lns_to_half` of `0x4000` and `0xC000`,
+/// and alpha 1.0.
+#[test]
+fn an_hdr_block_of_the_specification_s_layout_reads_its_endpoints() {
+    let d = AstcDecode::of(PixelFormat::ASTC8x8HDR).expect("a decode");
+    let base: u128 = 0x213 | 2 << 13 | 0x40 << 17 | 0xC0 << 25;
+    let zero = d.block_values(&base.to_le_bytes()).expect("valid");
+    let low = lns_to_half(0x4000);
+    assert_eq!(low, 0x2000);
+    assert!(
+        zero.iter().all(|&t| t == [low, low, low, HALF_ONE]),
+        "{:?}",
+        zero[0]
+    );
+    let ones = base | ((1u128 << 40) - 1) << 88;
+    let one = d.block_values(&ones.to_le_bytes()).expect("valid");
+    let high = lns_to_half(0xC000);
+    assert_eq!(high, 0x6000);
+    assert!(
+        one.iter().all(|&t| t == [high, high, high, HALF_ONE]),
+        "{:?}",
+        one[0]
+    );
+    assert_eq!(
+        d.metal_value([low, high, HALF_ONE, 0]),
+        [0.0078125, 512.0, 1.0, 0.0]
+    );
+    // The LDR form reads the HDR mode's partition magenta.
+    let ldr = AstcDecode::of(PixelFormat::ASTC8x8LDR).expect("a decode");
+    let texels = ldr
+        .block_values(&base.to_le_bytes())
+        .expect("a valid block");
+    assert!(texels.iter().all(|&t| t == [0xFFFF, 0, 0xFFFF, 0xFFFF]));
+}
+
+/// Every FP16 value converts to its `f32` exactly; every 16-bit `C` converts to the FP16 value at
+/// or just below `C / 65536` (65535 to 1.0); every FP16 value's 8-bit code is the nearest of its
+/// value clamped to 0 to 1.
+#[test]
+fn the_fp16_conversions_are_exact() {
+    for h in 0..=u16::MAX {
+        let (s, e, m) = (h >> 15, (h >> 10) & 0x1F, h & 0x3FF);
+        let magnitude = match e {
+            0 => f64::from(m) * 2f64.powi(-24),
+            0x1F => f64::INFINITY,
+            _ => f64::from(0x400 | m) * 2f64.powi(i32::from(e) - 25),
+        };
+        let want = if s == 1 { -magnitude } else { magnitude };
+        let got = half_to_f32(h);
+        match (e, m) {
+            (0x1F, 0) => assert_eq!(f64::from(got), want, "{h:#06x}"),
+            (0x1F, _) => assert!(got.is_nan() && (got.to_bits() >> 13) & 0x3FF == u32::from(m)),
+            _ => assert_eq!(f64::from(got), want, "{h:#06x}"),
+        }
+        if e != 0x1F {
+            let code = (want.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8;
+            assert_eq!(unorm8_of_half(h), code, "{h:#06x}");
+        }
+    }
+    for c in 0..=0xFFFFu32 {
+        let h = unorm16_to_half(c);
+        let value = f64::from(half_to_f32(h));
+        let exact = f64::from(c) / 65536.0;
+        if c == 0xFFFF {
+            assert_eq!(h, HALF_ONE);
+            continue;
+        }
+        assert!(value <= exact, "{c:#06x}: {value} > {exact}");
+        assert!(
+            f64::from(half_to_f32(h + 1)) > exact,
+            "{c:#06x}: {h:#06x} not the largest"
+        );
+    }
+}
+
+/// The half twin of an LDR or sRGB format holds the FP16 value nearest each value Metal reads,
+/// never on a tie; an HDR format's holds its FP16 values themselves, which its `float` twin
+/// holds widened.
+#[test]
+fn the_half_twin_holds_the_nearest_halves() {
+    for den in [255u32, 4095] {
+        for num in 0..=den {
+            let h = half_of_ratio(num, den);
+            let exact = f64::from(num) / f64::from(den);
+            let off = |h: u16| (f64::from(half_to_f32(h)) - exact).abs();
+            assert!(num == 0 || off(h) < off(h - 1), "{num}/{den}: {h:#06x}");
+            assert!(num == den || off(h) < off(h + 1), "{num}/{den}: {h:#06x}");
+        }
+    }
+    let blocks = hdr_seeded_blocks(230, 256);
+    let d = AstcDecode::of(PixelFormat::ASTC8x8HDR).expect("a decode");
+    let size = [16 * 8, 16 * 8, 1];
+    let halves = d.decode(AstcTexels::Half, &blocks, size);
+    let floats = d.decode(AstcTexels::Float, &blocks, size);
+    for (h, f) in halves
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(floats.as_chunks::<4>().0)
+    {
+        let (h, f) = (half_to_f32(u16::from_le_bytes(*h)), f32::from_le_bytes(*f));
+        assert!(h.to_bits() == f.to_bits(), "{h} {f}");
     }
 }

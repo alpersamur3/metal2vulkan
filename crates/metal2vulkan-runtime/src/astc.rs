@@ -1,5 +1,5 @@
-//! ASTC LDR textures on a device without their ASTC block: their blocks held as raw bytes in a
-//! carrier, which copies move, and their samples read a decoded twin.
+//! ASTC textures (LDR, sRGB and HDR) on a device without their ASTC block: their blocks held as
+//! raw bytes in a carrier, which copies move, and their samples read a decoded twin.
 //!
 //! - **Metal's answers** (an Apple M3 Max under macOS 27.0.1, our own probe): every ASTC LDR
 //!   format makes a texture, `Shared`, `Private` and memoryless, of every type but 1D and
@@ -20,7 +20,8 @@
 //!   blit out of it hand back the blocks written. Its sampled views present its decoded twin
 //!   (`texture/decoded_twin.rs`), Metal's decode of the blocks in the texels
 //!   `DevicePolicy::decoded_texels` names (an sRGB form's 8-bit codes under either, which its
-//!   slots read raw and decode through Metal's table, exactly), decoded after each write as a BC
+//!   slots read raw and decode through Metal's table, exactly; an HDR form's FP16 values under
+//!   either, `R16G16B16A16_SFLOAT`, exactly), decoded after each write as a BC
 //!   texture's twin is: on the GPU (`bind::astc_decode_module`), or a host write's on the CPU.
 //!   A view in the texture's other colour space (its `_sRGB` or LDR form) presents a second twin
 //!   of that form's decode, made at the first such view. Refused: a heap's or a sparse heap's

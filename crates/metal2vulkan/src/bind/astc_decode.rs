@@ -1,11 +1,12 @@
-//! An ASTC LDR texture's texels as Metal decodes them, from its blocks, for a device without
-//! ASTC: the texels a decoded twin of the texture holds (the runtime's `texture/decoded_twin.rs`).
+//! An ASTC texture's texels as Metal decodes them, from its blocks, for a device without ASTC:
+//! the texels a decoded twin of the texture holds (the runtime's `texture/decoded_twin.rs`).
 //!
 //! **The decode** is the Khronos Data Format Specification's (its ASTC chapter): the block mode,
 //! the integer sequence encoding of the colour endpoints and the weights, the colour endpoint
 //! modes, the partition function and the weight grid's infill, written here from the
-//! specification. Each channel of a texel comes out as its 16-bit interpolation result `C` of the
-//! two 8-bit endpoints widened to 16 bits (`e · 257`, or `e · 256 + 128` for an `_sRGB` format).
+//! specification. Each channel of a texel of an LDR or sRGB format comes out as its 16-bit
+//! interpolation result `C` of the two 8-bit endpoints widened to 16 bits (`e · 257`, or
+//! `e · 256 + 128` for an `_sRGB` format); of an HDR format, as its FP16 value (below).
 //!
 //! **Metal's answers** (an Apple M3 Max under macOS 27.0.1, our own probe: 4096 blocks of each of
 //! the fourteen footprints, about 70% valid blocks of random modes, void-extent blocks and error
@@ -24,12 +25,31 @@
 //!   own texels, the block's other partitions decoding as they are.
 //! - A void-extent block's texels are its four 16-bit values, as `C`.
 //!
+//! **HDR formats** (`_HDR`): the specification's HDR profile, each channel an FP16 value, which a
+//! `float` read reads exactly. Not measured on Apple hardware: matched bit for bit against ARM's
+//! reference codec, astcenc (its HDR profile into FP16 texels, seeded blocks of every footprint).
+//!
+//! - An **LDR colour endpoint mode**'s channel is `C` (the endpoints widened `e · 257`) over
+//!   65536, rounded toward zero to FP16; a `C` of 65535 reads 1.0.
+//! - An **HDR colour endpoint mode** (2, 3, 7, 11, 14 and 15) unpacks 12-bit pseudo-logarithmic
+//!   endpoints (astcenc's unpacking, the specification's), shifted up 4 bits and interpolated as
+//!   `C`; the top 5 bits of `C` are the exponent and the low 11 the mantissa of the FP16 value,
+//!   by the specification's piecewise-linear rule, at most `0x7BFF` (65504). The RGB and
+//!   luminance modes' alpha is 1.0; mode 14's alpha is an LDR mode's.
+//! - A **void-extent block** of HDR values (bit 9 set) reads its four FP16 values as they are;
+//!   one of UNORM16 values reads each as an LDR mode's `C`.
+//! - **Error blocks** read magenta, `(1, 0, 1, 1)`, as an LDR format's do. (The specification
+//!   lets an HDR decode return magenta or four NaNs; astcenc returns NaNs, Metal's choice is not
+//!   measured.)
+//!
 //! **The twin's texels** ([`AstcTexels`]): [`AstcTexels::Float`] holds each texel's value exactly
-//! (`R32G32B32A32_SFLOAT`); [`AstcTexels::Unorm8`] holds 8-bit codes (`R8G8B8A8_UNORM`): a linear
-//! channel the code nearest its value, at most `1/510` off it, and an sRGB format's channels the
-//! code `C >> 8` itself, which a function reads raw through the image's `R8G8B8A8_UNORM` view and
-//! decodes through Metal's table (`metal::texel_format::srgb_raw_on`), exactly. The runtime holds
-//! an sRGB format's twin in those codes whatever its policy.
+//! (`R32G32B32A32_SFLOAT`); [`AstcTexels::Half`] holds each value's nearest FP16
+//! (`R16G16B16A16_SFLOAT`), an HDR format's exactly; [`AstcTexels::Unorm8`] holds 8-bit codes
+//! (`R8G8B8A8_UNORM`): a linear channel the code nearest its value (an HDR one's clamped to 0 to
+//! 1), at most `1/510` off it, and an sRGB format's channels the code `C >> 8` itself, which a
+//! function reads raw through the image's `R8G8B8A8_UNORM` view and decodes through Metal's
+//! table (`metal::texel_format::srgb_raw_on`), exactly. The runtime holds an sRGB format's twin
+//! in those codes whatever its policy, and an HDR format's in halves.
 //!
 //! **The GPU's decode** ([`astc_decode_module`]) is this decode in integer operations, each
 //! texel's from its block alone, writing the texels [`decode`](AstcDecode::decode) writes; its
@@ -60,7 +80,8 @@ pub fn astc_decode_module(
     decode_module(device, kernel::typed_module(decode, texels)?, "ASTC decode")
 }
 
-/// How an ASTC LDR format's blocks decode: its footprint and whether its colour is sRGB-encoded.
+/// How an ASTC format's blocks decode: its footprint, whether its colour is sRGB-encoded and
+/// whether it is an HDR format.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -71,6 +92,9 @@ pub struct AstcDecode {
     pub height: u32,
     /// Whether the format is an `_sRGB` one.
     pub srgb: bool,
+    /// Whether the format is an `_HDR` one: its blocks decode in the HDR profile, each channel an
+    /// FP16 value (the module docs).
+    pub hdr: bool,
 }
 
 /// The texels a decoded twin of an ASTC texture holds (the module docs).
@@ -79,11 +103,14 @@ pub struct AstcDecode {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AstcTexels {
     /// `R8G8B8A8_UNORM` codes: a linear channel the code nearest Metal's 12-bit value (at most
-    /// `1/510` off it), an sRGB format's channels Metal's own codes, which a function reads raw
-    /// and decodes through Metal's table.
+    /// `1/510` off it; an HDR value clamped to 0 to 1 first), an sRGB format's channels Metal's
+    /// own codes, which a function reads raw and decodes through Metal's table.
     Unorm8,
     /// `R32G32B32A32_SFLOAT`: each channel Metal's value exactly.
     Float,
+    /// `R16G16B16A16_SFLOAT`: each channel the FP16 value nearest Metal's, an HDR format's
+    /// exactly (its values are FP16 values).
+    Half,
 }
 
 /// The 2D footprints Vulkan's ASTC formats have, in Metal's raw-value order.
@@ -111,40 +138,54 @@ impl AstcDecode {
     /// The bytes of every block.
     pub const BLOCK_BYTES: u32 = 16;
 
-    /// The decode of `pf`'s blocks: the ASTC LDR formats of the fourteen 2D footprints and their
-    /// `_sRGB` forms; `None` for every other format (the HDR ones, and Apple's 4x2 and 8x4
-    /// footprints, included).
+    /// The decode of `pf`'s blocks: the ASTC LDR formats of the fourteen 2D footprints, their
+    /// `_sRGB` forms and their `_HDR` forms; `None` for every other format (Apple's 4x2 and 8x4
+    /// footprints included).
     pub fn of(pf: PixelFormat) -> Option<AstcDecode> {
         use PixelFormat as P;
-        let (srgb, index) = match pf {
-            P::ASTC4x4SRGB => (true, 0),
-            P::ASTC5x4SRGB => (true, 1),
-            P::ASTC5x5SRGB => (true, 2),
-            P::ASTC6x5SRGB => (true, 3),
-            P::ASTC6x6SRGB => (true, 4),
-            P::ASTC8x5SRGB => (true, 5),
-            P::ASTC8x6SRGB => (true, 6),
-            P::ASTC8x8SRGB => (true, 7),
-            P::ASTC10x5SRGB => (true, 8),
-            P::ASTC10x6SRGB => (true, 9),
-            P::ASTC10x8SRGB => (true, 10),
-            P::ASTC10x10SRGB => (true, 11),
-            P::ASTC12x10SRGB => (true, 12),
-            P::ASTC12x12SRGB => (true, 13),
-            P::ASTC4x4LDR => (false, 0),
-            P::ASTC5x4LDR => (false, 1),
-            P::ASTC5x5LDR => (false, 2),
-            P::ASTC6x5LDR => (false, 3),
-            P::ASTC6x6LDR => (false, 4),
-            P::ASTC8x5LDR => (false, 5),
-            P::ASTC8x6LDR => (false, 6),
-            P::ASTC8x8LDR => (false, 7),
-            P::ASTC10x5LDR => (false, 8),
-            P::ASTC10x6LDR => (false, 9),
-            P::ASTC10x8LDR => (false, 10),
-            P::ASTC10x10LDR => (false, 11),
-            P::ASTC12x10LDR => (false, 12),
-            P::ASTC12x12LDR => (false, 13),
+        let (srgb, hdr, index) = match pf {
+            P::ASTC4x4SRGB => (true, false, 0),
+            P::ASTC5x4SRGB => (true, false, 1),
+            P::ASTC5x5SRGB => (true, false, 2),
+            P::ASTC6x5SRGB => (true, false, 3),
+            P::ASTC6x6SRGB => (true, false, 4),
+            P::ASTC8x5SRGB => (true, false, 5),
+            P::ASTC8x6SRGB => (true, false, 6),
+            P::ASTC8x8SRGB => (true, false, 7),
+            P::ASTC10x5SRGB => (true, false, 8),
+            P::ASTC10x6SRGB => (true, false, 9),
+            P::ASTC10x8SRGB => (true, false, 10),
+            P::ASTC10x10SRGB => (true, false, 11),
+            P::ASTC12x10SRGB => (true, false, 12),
+            P::ASTC12x12SRGB => (true, false, 13),
+            P::ASTC4x4LDR => (false, false, 0),
+            P::ASTC5x4LDR => (false, false, 1),
+            P::ASTC5x5LDR => (false, false, 2),
+            P::ASTC6x5LDR => (false, false, 3),
+            P::ASTC6x6LDR => (false, false, 4),
+            P::ASTC8x5LDR => (false, false, 5),
+            P::ASTC8x6LDR => (false, false, 6),
+            P::ASTC8x8LDR => (false, false, 7),
+            P::ASTC10x5LDR => (false, false, 8),
+            P::ASTC10x6LDR => (false, false, 9),
+            P::ASTC10x8LDR => (false, false, 10),
+            P::ASTC10x10LDR => (false, false, 11),
+            P::ASTC12x10LDR => (false, false, 12),
+            P::ASTC12x12LDR => (false, false, 13),
+            P::ASTC4x4HDR => (false, true, 0),
+            P::ASTC5x4HDR => (false, true, 1),
+            P::ASTC5x5HDR => (false, true, 2),
+            P::ASTC6x5HDR => (false, true, 3),
+            P::ASTC6x6HDR => (false, true, 4),
+            P::ASTC8x5HDR => (false, true, 5),
+            P::ASTC8x6HDR => (false, true, 6),
+            P::ASTC8x8HDR => (false, true, 7),
+            P::ASTC10x5HDR => (false, true, 8),
+            P::ASTC10x6HDR => (false, true, 9),
+            P::ASTC10x8HDR => (false, true, 10),
+            P::ASTC10x10HDR => (false, true, 11),
+            P::ASTC12x10HDR => (false, true, 12),
+            P::ASTC12x12HDR => (false, true, 13),
             _ => return None,
         };
         let [width, height] = FOOTPRINTS[index];
@@ -152,6 +193,7 @@ impl AstcDecode {
             width,
             height,
             srgb,
+            hdr,
         })
     }
 
@@ -161,34 +203,38 @@ impl AstcDecode {
     }
 
     /// The Vulkan format of the twin's texels of `texels`: `R8G8B8A8_UNORM` (an sRGB format's
-    /// viewed as `R8G8B8A8_SRGB` too, where its linear samples are the device's filter) or
-    /// `R32G32B32A32_SFLOAT`.
+    /// viewed as `R8G8B8A8_SRGB` too, where its linear samples are the device's filter),
+    /// `R32G32B32A32_SFLOAT` or `R16G16B16A16_SFLOAT`.
     pub fn texel_format(self, texels: AstcTexels) -> Format {
         match texels {
             AstcTexels::Unorm8 => Format::R8G8B8A8_UNORM,
             AstcTexels::Float => Format::R32G32B32A32_SFLOAT,
+            AstcTexels::Half => Format::R16G16B16A16_SFLOAT,
         }
     }
 
-    /// The Metal pixel format whose texels the twin's of `texels` are: `RGBA8Unorm` or
-    /// `RGBA32Float`.
+    /// The Metal pixel format whose texels the twin's of `texels` are: `RGBA8Unorm`,
+    /// `RGBA32Float` or `RGBA16Float`.
     pub fn texel_pixel_format(self, texels: AstcTexels) -> PixelFormat {
         match texels {
             AstcTexels::Unorm8 => PixelFormat::RGBA8Unorm,
             AstcTexels::Float => PixelFormat::RGBA32Float,
+            AstcTexels::Half => PixelFormat::RGBA16Float,
         }
     }
 
-    /// The bytes of a twin's texel of `texels`: 4 or 16.
+    /// The bytes of a twin's texel of `texels`: 4, 16 or 8.
     pub fn texel_bytes(texels: AstcTexels) -> u32 {
         match texels {
             AstcTexels::Unorm8 => 4,
             AstcTexels::Float => 16,
+            AstcTexels::Half => 8,
         }
     }
 
-    /// The block's texels, each channel's 16-bit interpolation result `C` (red, green, blue,
-    /// alpha), row-major; `None` for an error block (whose texels read magenta).
+    /// The block's texels, each channel's 16-bit interpolation result `C` (an LDR or sRGB
+    /// format's) or FP16 value (an HDR format's) (red, green, blue, alpha), row-major; `None` for
+    /// an error block (whose texels read magenta).
     pub fn block_values(self, block: &[u8; 16]) -> Option<Vec<[u16; 4]>> {
         self.block_values_why(block).ok()
     }
@@ -200,9 +246,21 @@ impl AstcDecode {
         Ok(out[..(self.width * self.height) as usize].to_vec())
     }
 
-    /// The `float` channels Metal reads of a texel whose 16-bit interpolation results are `c`
-    /// (the module docs).
+    /// The values of an error texel, magenta: each channel's `C` all ones (green 0), or an HDR
+    /// format's FP16 1.0 (green 0).
+    pub(crate) fn error_texel(self) -> [u16; 4] {
+        match self.hdr {
+            true => [HALF_ONE, 0, HALF_ONE, HALF_ONE],
+            false => [0xFFFF, 0, 0xFFFF, 0xFFFF],
+        }
+    }
+
+    /// The `float` channels Metal reads of a texel whose 16-bit interpolation results (an HDR
+    /// format's FP16 values) are `c` (the module docs).
     pub fn metal_value(self, c: [u16; 4]) -> [f32; 4] {
+        if self.hdr {
+            return c.map(half_to_f32);
+        }
         let table = twelve_bit_values();
         std::array::from_fn(|ch| match (self.srgb, ch) {
             (true, 3) => (f64::from(c[ch] >> 8) / 255.0) as f32,
@@ -211,16 +269,31 @@ impl AstcDecode {
         })
     }
 
-    /// The twin's texel of `texels` of a texel whose 16-bit interpolation results are `c`, its
-    /// bytes in `out` ([`texel_bytes`](Self::texel_bytes) of them).
+    /// The FP16 value nearest the value Metal reads of channel `ch` of a texel whose 16-bit
+    /// interpolation result (an HDR format's FP16 value, itself) is `c`.
+    fn half_value(self, ch: usize, c: u16) -> u16 {
+        match (self.hdr, self.srgb, ch) {
+            (true, ..) => c,
+            (false, true, 3) => half_of_ratio(u32::from(c >> 8), 255),
+            (false, true, _) => {
+                half_of_ratio(u32::from(SRGB_DECODE_STEPS[usize::from(c >> 8)]), 4095)
+            }
+            (false, false, _) => half_of_ratio(u32::from(c >> 4), 4095),
+        }
+    }
+
+    /// The twin's texel of `texels` of a texel whose 16-bit interpolation results (an HDR
+    /// format's FP16 values) are `c`, its bytes in `out` ([`texel_bytes`](Self::texel_bytes) of
+    /// them).
     fn twin_texel(self, texels: AstcTexels, c: [u16; 4], out: &mut [u8]) {
         match texels {
             AstcTexels::Unorm8 => {
                 for (byte, c) in out.iter_mut().zip(c) {
-                    *byte = match self.srgb {
-                        true => (c >> 8) as u8,
+                    *byte = match (self.hdr, self.srgb) {
+                        (true, _) => unorm8_of_half(c),
+                        (false, true) => (c >> 8) as u8,
                         // The code nearest `k / 4095`: no `k` lies on a half code.
-                        false => ((u32::from(c >> 4) * 255 + 2047) / 4095) as u8,
+                        (false, false) => ((u32::from(c >> 4) * 255 + 2047) / 4095) as u8,
                     };
                 }
             }
@@ -232,6 +305,11 @@ impl AstcDecode {
                     .zip(self.metal_value(c))
                 {
                     *word = value.to_le_bytes();
+                }
+            }
+            AstcTexels::Half => {
+                for (ch, pair) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    *pair = self.half_value(ch, c[ch]).to_le_bytes();
                 }
             }
         }
@@ -277,7 +355,7 @@ impl AstcDecode {
                 .try_into()
                 .expect("a block's 16 bytes");
             if decode_block(self, u128::from_le_bytes(block), &mut values).is_err() {
-                values.fill(ERROR_TEXEL);
+                values.fill(self.error_texel());
             }
             let (z, by, bx) = (b / (across * down), b / across % down, b % across);
             for (ty, y) in (by * bh..(by * bh + bh).min(height)).enumerate() {
@@ -297,6 +375,96 @@ fn twelve_bit_values() -> &'static [f32; 4096] {
     TABLE.get_or_init(|| std::array::from_fn(|k| (k as f64 / 4095.0) as f32))
 }
 
+// ---------------------------------------------------------------------------------------------
+// FP16 values: an HDR format's texels, and the half twin's.
+
+/// FP16 1.0.
+pub(crate) const HALF_ONE: u16 = 0x3C00;
+
+/// The FP16 value of the 16-bit interpolation result `c` of an LDR colour endpoint mode in the
+/// HDR profile (the specification's `decode_float16`): `c / 65536` rounded toward zero, 65535
+/// reading 1.0.
+pub(crate) fn unorm16_to_half(c: u32) -> u16 {
+    match c {
+        0xFFFF => HALF_ONE,
+        // Subnormal: `c · 2^-16` is `(c << 8) · 2^-24`.
+        0..4 => (c << 8) as u16,
+        _ => {
+            let msb = 31 - c.leading_zeros();
+            // The bits below the leading one, the top ten of them the mantissa.
+            let mantissa = ((c << (16 - msb)) & 0xFFFF) >> 6;
+            ((msb - 1) << 10 | mantissa) as u16
+        }
+    }
+}
+
+/// The FP16 value of the 16-bit interpolation result `c` of an HDR colour endpoint mode's
+/// pseudo-logarithmic endpoints: its top 5 bits the exponent, its low 11 the mantissa mapped by
+/// the specification's piecewise-linear rule; an infinity or a NaN reads `0x7BFF`.
+pub(crate) fn lns_to_half(c: u32) -> u16 {
+    let (e, m) = (c >> 11, c & 0x7FF);
+    let mt = match m {
+        0..512 => 3 * m,
+        512..1536 => 4 * m - 512,
+        _ => 5 * m - 2048,
+    };
+    ((e << 10 | mt >> 3).min(0x7BFF)) as u16
+}
+
+/// The `f32` of the FP16 value `h`, exactly.
+pub(crate) fn half_to_f32(h: u16) -> f32 {
+    let h = u32::from(h);
+    let sign = (h >> 15) << 31;
+    let (e, m) = ((h >> 10) & 0x1F, h & 0x3FF);
+    f32::from_bits(match (e, m) {
+        (0, 0) => sign,
+        // Subnormal: `m · 2^-24`, its leading one at bit `msb`.
+        (0, _) => {
+            let msb = 31 - m.leading_zeros();
+            sign | (msb + 103) << 23 | (m << (23 - msb)) & 0x7F_FFFF
+        }
+        (0x1F, _) => sign | 0xFF << 23 | m << 13,
+        _ => sign | (e + 112) << 23 | m << 13,
+    })
+}
+
+/// The 8-bit code nearest the FP16 value `h` clamped to 0 to 1 (`⌊v · 255 + 1/2⌋`): 0 for a
+/// negative value or zero, 255 for 1.0 or more (an infinity or a NaN of either sign reads as its
+/// sign says).
+pub(crate) fn unorm8_of_half(h: u16) -> u8 {
+    let h = u32::from(h);
+    if h & 0x8000 != 0 || h == 0 {
+        return 0;
+    }
+    if h >= u32::from(HALF_ONE) {
+        return 255;
+    }
+    let (e, m) = (h >> 10, h & 0x3FF);
+    // The value in units of `2^-24`, below `2^24`.
+    let units = match e {
+        0 => m,
+        _ => (0x400 | m) << (e - 1),
+    };
+    ((units * 255 + (1 << 23)) >> 24) as u8
+}
+
+/// The FP16 value nearest `num / den`, for an odd `den` of 4095 or less and `num` of 0 to `den`
+/// (Metal's value of an LDR or sRGB channel, `k / 4095` or `c / 255`): no such quotient lies on a
+/// tie between two FP16 values, and every one but 0 is normal.
+pub(crate) fn half_of_ratio(num: u32, den: u32) -> u16 {
+    if num == 0 {
+        return 0;
+    }
+    if num >= den {
+        return HALF_ONE;
+    }
+    // The least `p` that puts `num / den · 2^p` in `[1, 2)`, at most 12.
+    let p = (1..=12).find(|&p| num << p >= den).unwrap_or(12);
+    // `⌊num · 2^(p + 10) / den + 1/2⌋`, of 1024 to 2048 (2048 carries into the exponent).
+    let m = ((num << p) * 2048 + den) / (2 * den);
+    (((15 - p) << 10) + m - 1024) as u16
+}
+
 /// Why a block is an error block (the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Illegal {
@@ -313,9 +481,6 @@ pub(crate) enum Illegal {
     VoidExtentReserved,
     VoidExtentEmpty,
 }
-
-/// The error colour's 16-bit values: magenta.
-const ERROR_TEXEL: [u16; 4] = [0xFFFF, 0, 0xFFFF, 0xFFFF];
 
 // ---------------------------------------------------------------------------------------------
 // The integer sequence encoding.
@@ -734,6 +899,232 @@ fn endpoints(cem: u32, v: &[i32; 8]) -> Option<[[u32; 4]; 2]> {
     })
 }
 
+/// A partition's two endpoints in the interpolator's 16 bits, and which channels hold HDR
+/// (pseudo-logarithmic) values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ends {
+    e: [[u32; 4]; 2],
+    lns: [bool; 4],
+}
+
+/// The endpoints of colour endpoint mode `cem` of a block of `fmt` from its unquantized values
+/// `v`, in the interpolator's 16 bits: an LDR mode's 8-bit endpoints widened as `fmt` widens
+/// them (`e · 256 + 128` for an sRGB format, else `e · 257`), an HDR mode's unpacked
+/// ([`hdr_endpoints`]); `None` for an HDR mode of an LDR or sRGB format (its partition reads
+/// magenta).
+fn ends_of(fmt: AstcDecode, cem: u32, v: &[i32; 8]) -> Option<Ends> {
+    match endpoints(cem, v) {
+        Some(ends) => {
+            let widen = |e: [u32; 4]| -> [u32; 4] {
+                e.map(|c| match fmt.srgb {
+                    true => c << 8 | 0x80,
+                    false => c * 257,
+                })
+            };
+            Some(Ends {
+                e: ends.map(widen),
+                lns: [false; 4],
+            })
+        }
+        None if fmt.hdr => Some(hdr_endpoints(cem, v)),
+        None => None,
+    }
+}
+
+/// The endpoints of an HDR colour endpoint mode `cem` (2, 3, 7, 11, 14 or 15) from its
+/// unquantized values `v`, as ARM's reference codec unpacks them (the specification's): each
+/// colour channel a 12-bit pseudo-logarithmic value shifted up 4 bits; alpha 1.0 (`0x7800`,
+/// pseudo-logarithmic) for the luminance and RGB modes, mode 14's two 8-bit values widened
+/// `e · 257` (an LDR alpha), mode 15's unpacked HDR alpha.
+fn hdr_endpoints(cem: u32, v: &[i32; 8]) -> Ends {
+    let [rgb0, rgb1] = match cem {
+        2 => hdr_luminance_large(v[0], v[1]),
+        3 => hdr_luminance_small(v[0], v[1]),
+        7 => hdr_rgb_scale([v[0], v[1], v[2], v[3]]),
+        _ => hdr_rgb([v[0], v[1], v[2], v[3], v[4], v[5]]),
+    };
+    let ([a0, a1], lns_alpha) = match cem {
+        14 => ([v[6] as u32 * 257, v[7] as u32 * 257], false),
+        15 => (hdr_alpha(v[6], v[7]), true),
+        _ => ([0x7800, 0x7800], true),
+    };
+    let rgba = |rgb: [u32; 3], a: u32| [rgb[0], rgb[1], rgb[2], a];
+    Ends {
+        e: [rgba(rgb0, a0), rgba(rgb1, a1)],
+        lns: [true, true, true, lns_alpha],
+    }
+}
+
+/// `v << shift` in two's complement, as astcenc's `safe_signed_lsh` shifts.
+fn lsh(v: i32, shift: u32) -> i32 {
+    ((v as u32) << shift) as i32
+}
+
+/// Mode 2, HDR luminance of a large range: the two 12-bit values, swapped and moved in half a
+/// step where the second byte is the smaller.
+fn hdr_luminance_large(v0: i32, v1: i32) -> [[u32; 3]; 2] {
+    let (y0, y1) = match v1 >= v0 {
+        true => (v0 << 4, v1 << 4),
+        false => ((v1 << 4) + 8, (v0 << 4) - 8),
+    };
+    [[(y0 << 4) as u32; 3], [(y1 << 4) as u32; 3]]
+}
+
+/// Mode 3, HDR luminance of a small range: a base and an offset, their precision by the first
+/// byte's top bit; the second value at most `0xFFF`.
+fn hdr_luminance_small(v0: i32, v1: i32) -> [[u32; 3]; 2] {
+    let (y0, d) = match v0 & 0x80 != 0 {
+        true => (((v1 & 0xE0) << 4) | ((v0 & 0x7F) << 2), (v1 & 0x1F) << 2),
+        false => (((v1 & 0xF0) << 4) | ((v0 & 0x7F) << 1), (v1 & 0xF) << 1),
+    };
+    let y1 = (y0 + d).min(0xFFF);
+    [[(y0 << 4) as u32; 3], [(y1 << 4) as u32; 3]]
+}
+
+/// Mode 7, HDR RGB of a base and a scale: the major channel, the mode's bit allocation and the
+/// two differences, the first endpoint the second less the scale (each at least 0).
+fn hdr_rgb_scale([v0, v1, v2, v3]: [i32; 4]) -> [[u32; 3]; 2] {
+    let modeval = ((v0 & 0xC0) >> 6) | (((v1 & 0x80) >> 7) << 2) | (((v2 & 0x80) >> 7) << 3);
+    let (majcomp, mode) = if modeval & 0xC != 0xC {
+        (modeval >> 2, modeval & 3)
+    } else if modeval != 0xF {
+        (modeval & 3, 4)
+    } else {
+        (0, 5)
+    };
+    let (mut red, mut green, mut blue, mut scale) = (v0 & 0x3F, v1 & 0x1F, v2 & 0x1F, v3 & 0x1F);
+    let bit = |v: i32, i: u32| (v >> i) & 1;
+    let (bit0, bit1, bit2, bit3) = (bit(v1, 6), bit(v1, 5), bit(v2, 6), bit(v2, 5));
+    let (bit4, bit5, bit6) = (bit(v3, 7), bit(v3, 6), bit(v3, 5));
+    let oh = 1 << mode;
+    let put = |x: &mut i32, modes: i32, b: i32, at: u32| {
+        if oh & modes != 0 {
+            *x |= b << at;
+        }
+    };
+    put(&mut green, 0x30, bit0, 6);
+    put(&mut green, 0x3A, bit1, 5);
+    put(&mut blue, 0x30, bit2, 6);
+    put(&mut blue, 0x3A, bit3, 5);
+    put(&mut scale, 0x3D, bit6, 5);
+    put(&mut scale, 0x2D, bit5, 6);
+    put(&mut scale, 0x04, bit4, 7);
+    put(&mut red, 0x3B, bit4, 6);
+    put(&mut red, 0x04, bit3, 6);
+    put(&mut red, 0x10, bit5, 7);
+    put(&mut red, 0x0F, bit2, 7);
+    put(&mut red, 0x05, bit1, 8);
+    put(&mut red, 0x0A, bit0, 8);
+    put(&mut red, 0x05, bit0, 9);
+    put(&mut red, 0x02, bit6, 9);
+    put(&mut red, 0x01, bit3, 10);
+    put(&mut red, 0x02, bit5, 10);
+    // Up to 12 bits.
+    let shift = [1, 1, 2, 3, 4, 5][mode as usize];
+    red <<= shift;
+    green <<= shift;
+    blue <<= shift;
+    scale <<= shift;
+    // Modes 0 to 4 hold green and blue as differences from red.
+    if mode != 5 {
+        green = red - green;
+        blue = red - blue;
+    }
+    match majcomp {
+        1 => std::mem::swap(&mut red, &mut green),
+        2 => std::mem::swap(&mut red, &mut blue),
+        _ => {}
+    }
+    let one = [red, green, blue].map(|c| (c.max(0) as u32) << 4);
+    let zero = [red, green, blue].map(|c| ((c - scale).max(0) as u32) << 4);
+    [zero, one]
+}
+
+/// Modes 11, 14 and 15's RGB, HDR: two direct 12-bit endpoints where the major-channel field is
+/// 3, else a base, two differences and a scale by the mode's bit allocation, each channel clamped
+/// to 0 to `0xFFF`.
+fn hdr_rgb([v0, v1, v2, v3, v4, v5]: [i32; 6]) -> [[u32; 3]; 2] {
+    let modeval = ((v1 & 0x80) >> 7) | (((v2 & 0x80) >> 7) << 1) | (((v3 & 0x80) >> 7) << 2);
+    let majcomp = ((v4 & 0x80) >> 7) | (((v5 & 0x80) >> 7) << 1);
+    if majcomp == 3 {
+        return [
+            [v0 << 8, v2 << 8, (v4 & 0x7F) << 9].map(|c| c as u32),
+            [v1 << 8, v3 << 8, (v5 & 0x7F) << 9].map(|c| c as u32),
+        ];
+    }
+    let mut a = v0 | ((v1 & 0x40) << 2);
+    let (mut b0, mut b1, mut c) = (v2 & 0x3F, v3 & 0x3F, v1 & 0x3F);
+    let (mut d0, mut d1) = (v4 & 0x7F, v5 & 0x7F);
+    let dbits: u32 = [7, 6, 7, 6, 5, 6, 5, 6][modeval as usize];
+    let bit = |v: i32, i: u32| (v >> i) & 1;
+    let (bit0, bit1, bit2, bit3) = (bit(v2, 6), bit(v3, 6), bit(v4, 6), bit(v5, 6));
+    let (bit4, bit5) = (bit(v4, 5), bit(v5, 5));
+    let oh = 1 << modeval;
+    let put = |x: &mut i32, modes: i32, b: i32, at: u32| {
+        if oh & modes != 0 {
+            *x |= b << at;
+        }
+    };
+    put(&mut a, 0xA4, bit0, 9);
+    put(&mut a, 0x08, bit2, 9);
+    put(&mut a, 0x50, bit4, 9);
+    put(&mut a, 0x50, bit5, 10);
+    put(&mut a, 0xA0, bit1, 10);
+    put(&mut a, 0xC0, bit2, 11);
+    put(&mut c, 0x04, bit1, 6);
+    put(&mut c, 0xE8, bit3, 6);
+    put(&mut c, 0x20, bit2, 7);
+    put(&mut b0, 0x5B, bit0, 6);
+    put(&mut b1, 0x5B, bit1, 6);
+    put(&mut b0, 0x12, bit2, 7);
+    put(&mut b1, 0x12, bit3, 7);
+    put(&mut d0, 0xAF, bit4, 5);
+    put(&mut d1, 0xAF, bit5, 5);
+    put(&mut d0, 0x05, bit2, 6);
+    put(&mut d1, 0x05, bit3, 6);
+    // `d0` and `d1` are signed `dbits`-bit values.
+    let sx = 32 - dbits;
+    d0 = lsh(d0, sx) >> sx;
+    d1 = lsh(d1, sx) >> sx;
+    // Up to 12 bits.
+    let shift = ((modeval >> 1) ^ 3) as u32;
+    [a, b0, b1, c, d0, d1] = [a, b0, b1, c, d0, d1].map(|x| lsh(x, shift));
+    let clamp = |x: i32| x.clamp(0, 0xFFF);
+    let mut one = [a, a - b0, a - b1].map(clamp);
+    let mut zero = [a - c, a - b0 - c - d0, a - b1 - c - d1].map(clamp);
+    match majcomp {
+        1 => {
+            one.swap(0, 1);
+            zero.swap(0, 1);
+        }
+        2 => {
+            one.swap(0, 2);
+            zero.swap(0, 2);
+        }
+        _ => {}
+    }
+    [zero.map(|x| (x as u32) << 4), one.map(|x| (x as u32) << 4)]
+}
+
+/// Mode 15's alpha, HDR: two direct 12-bit values (mode 3 of its two bits), else a base and a
+/// signed difference, the second clamped to 0 to `0xFFF`; each shifted up 4 bits.
+fn hdr_alpha(v6: i32, v7: i32) -> [u32; 2] {
+    let modeval = ((v6 >> 7) & 1) | ((v7 >> 6) & 2);
+    let (mut v6, mut v7) = (v6 & 0x7F, v7 & 0x7F);
+    let (a0, a1) = if modeval == 3 {
+        (v6 << 5, v7 << 5)
+    } else {
+        v6 |= (v7 << (modeval + 1)) & 0x780;
+        v7 &= 0x3F >> modeval;
+        v7 ^= 32 >> modeval;
+        v7 -= 32 >> modeval;
+        v6 <<= 4 - modeval;
+        v7 = lsh(v7, (4 - modeval) as u32);
+        (v6, (v6 + v7).clamp(0, 0xFFF))
+    };
+    [(a0 << 4) as u32, (a1 << 4) as u32]
+}
+
 // ---------------------------------------------------------------------------------------------
 // Partitions.
 
@@ -918,7 +1309,7 @@ fn decode_block(fmt: AstcDecode, block: u128, out: &mut [[u16; 4]]) -> Result<()
     let (bw, bh) = (fmt.width, fmt.height);
     let mode = field(block, 0, 11) as u32;
     if mode & 0x1FF == 0x1FC {
-        return void_extent(block, &mut out[..(bw * bh) as usize]);
+        return void_extent(fmt, block, &mut out[..(bw * bh) as usize]);
     }
     let bm = block_mode(mode).ok_or(Illegal::ReservedMode)?;
     let [gw, gh] = bm.grid;
@@ -999,16 +1390,20 @@ fn decode_block(fmt: AstcDecode, block: u128, out: &mut [[u16; 4]]) -> Result<()
         value_count as usize,
         &mut values,
     );
-    let mut ends: [Option<[[u32; 4]; 2]>; 4] = [None; 4];
+    let mut partition_ends: [Option<Ends>; 4] = [None; 4];
     let mut at = 0;
-    for (p, end) in ends.iter_mut().enumerate().take(partitions as usize) {
+    for (p, end) in partition_ends
+        .iter_mut()
+        .enumerate()
+        .take(partitions as usize)
+    {
         let n = (2 * ((cems[p] >> 2) + 1)) as usize;
         let mut v = [0i32; 8];
         for (slot, &raw) in v.iter_mut().zip(&values[at..at + n]) {
             *slot = unquantize_color(color_range, raw) as i32;
         }
         at += n;
-        *end = endpoints(cems[p], &v);
+        *end = ends_of(fmt, cems[p], &v);
     }
     // The weights, read from bit 127 down.
     let mut weights = [0u32; 64];
@@ -1054,26 +1449,30 @@ fn decode_block(fmt: AstcDecode, block: u128, out: &mut [[u16; 4]]) -> Result<()
             let w1 = if bm.dual { infill(1) } else { w0 };
             let p = partition.as_ref().map_or(0, |parts| parts.of(s, t));
             let texel = &mut out[(t * bw + s) as usize];
-            let Some([e0, e1]) = ends[p] else {
-                *texel = ERROR_TEXEL;
+            let Some(ends) = partition_ends[p] else {
+                *texel = fmt.error_texel();
                 continue;
             };
             for ch in 0..4 {
-                let (c0, c1) = match fmt.srgb {
-                    true => (e0[ch] << 8 | 0x80, e1[ch] << 8 | 0x80),
-                    false => (e0[ch] * 257, e1[ch] * 257),
-                };
+                let [c0, c1] = [ends.e[0][ch], ends.e[1][ch]];
                 let w = if ch == ccs { w1 } else { w0 };
-                texel[ch] = ((c0 * (64 - w) + c1 * w + 32) >> 6) as u16;
+                let c = (c0 * (64 - w) + c1 * w + 32) >> 6;
+                texel[ch] = match (fmt.hdr, ends.lns[ch]) {
+                    (false, _) => c as u16,
+                    (true, true) => lns_to_half(c),
+                    (true, false) => unorm16_to_half(c),
+                };
             }
         }
     }
     Ok(())
 }
 
-/// A void-extent block's texels: its constant colour, or why it is an error block.
-fn void_extent(block: u128, out: &mut [[u16; 4]]) -> Result<(), Illegal> {
-    if (block >> 9) & 1 == 1 {
+/// A void-extent block's texels of a block of `fmt`: its constant colour (an HDR format's FP16
+/// values, of an LDR one's UNORM16 values as an LDR mode's `C`), or why it is an error block.
+fn void_extent(fmt: AstcDecode, block: u128, out: &mut [[u16; 4]]) -> Result<(), Illegal> {
+    let hdr_values = (block >> 9) & 1 == 1;
+    if hdr_values && !fmt.hdr {
         return Err(Illegal::HdrVoidExtent);
     }
     if (block >> 10) & 3 != 3 {
@@ -1085,7 +1484,13 @@ fn void_extent(block: u128, out: &mut [[u16; 4]]) -> Result<(), Illegal> {
     if !all_ones && (s0 >= s1 || t0 >= t1) {
         return Err(Illegal::VoidExtentEmpty);
     }
-    let color: [u16; 4] = std::array::from_fn(|i| field(block, 64 + 16 * i as u32, 16) as u16);
+    let color: [u16; 4] = std::array::from_fn(|i| {
+        let c = field(block, 64 + 16 * i as u32, 16) as u16;
+        match fmt.hdr && !hdr_values {
+            true => unorm16_to_half(u32::from(c)),
+            false => c,
+        }
+    });
     out.fill(color);
     Ok(())
 }
