@@ -615,7 +615,11 @@ fn slot(
         texel_of(staging_format(pixel_format)).ok_or_else(not_implemented)?;
     // The cell holds a normalized texel's bits, whose member is `float` or `half` lanes of
     // the format's channels or four, as an access's type tells; an aliased layout's member of it is
-    // not read yet.
+    // not read yet. Another format of fewer than four channels may be held as a member of four of
+    // its lanes (`tile_downsample_N`'s `half4` over `R16Float`): the access reads and writes
+    // the member, the staging moves the format's channels, and the other lanes hold what the
+    // function stored there, else zero.
+    let mut wide: Option<Form> = None;
     let (norm, form, bytes, member) = match normalized(pixel_format) {
         Some((n, _)) => {
             if aliased {
@@ -641,16 +645,21 @@ fn slot(
             let held = crate::lower::arith::legal::held_on(cx.profile, held)?;
             let form = Form { held, lanes };
             let bytes = u32::from(form.bits() / 8) * u32::from(lanes);
-            (None, form, bytes, bytes)
+            if lanes < 4 && size == bytes / u32::from(lanes) * 4 {
+                wide = Some(Form { held, lanes: 4 });
+            }
+            (None, form, bytes, if wide.is_some() { size } else { bytes })
         }
     };
     if member != size || offset.checked_add(size).is_none_or(|e| e > cell_bytes) {
         return Err(not_implemented());
     }
     let align = offset_align(offset).min(offset_align(cell_bytes));
+    // The path of the member's bytes: a widened member's are its four lanes'.
+    let accessed = if wide.is_some() { member } else { bytes };
     let path = if align >= 4 {
         Path::Aligned
-    } else if bytes <= 2 && bytes <= align {
+    } else if accessed <= 2 && accessed <= align {
         Path::OneWord
     } else {
         Path::Bytes
@@ -666,7 +675,14 @@ fn slot(
     Ok(TileSlot {
         color,
         offset,
-        leaf: Leaf { form, bytes, path },
+        leaf: match wide {
+            Some(form) => Leaf {
+                form,
+                bytes: member,
+                path,
+            },
+            None => Leaf { form, bytes, path },
+        },
         bits,
         pixel_format,
         class,
