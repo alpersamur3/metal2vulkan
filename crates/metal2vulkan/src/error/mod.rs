@@ -340,8 +340,17 @@ pub struct Unsupported {
 }
 
 impl Unsupported {
-    /// Not implemented by this translator version on any device.
+    /// Not implemented by this translator version on any device. A developer's aid: where
+    /// `M2V_NI_WHERE` is set (read once per process), each one made says on stderr where in
+    /// the translator it was made.
+    #[track_caller]
     pub fn not_implemented(feature: Feature) -> Unsupported {
+        if ni_where() {
+            eprintln!(
+                "not_implemented({feature:?}) at {}",
+                std::panic::Location::caller()
+            );
+        }
         Unsupported {
             feature,
             needs: Needs::NotImplemented,
@@ -1930,3 +1939,9 @@ impl std::error::Error for BindError {}
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `M2V_NI_WHERE` is set, read once per process ([`Unsupported::not_implemented`]).
+fn ni_where() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("M2V_NI_WHERE").is_some())
+}

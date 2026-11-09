@@ -60,6 +60,10 @@ options:
                            name (RGBA8Unorm, ...); with a kernel, compiles a tile pipeline
   --depth-format FORMAT    the depth attachment's pixel format
   --stencil-format FORMAT  the stencil attachment's pixel format
+  --blend I:SRC_RGB:DST_RGB:SRC_A:DST_A[:OP_RGB:OP_A]
+                           blending on at color attachment I: Metal blend factors (One,
+                           SourceAlpha, OneMinusSourceAlpha, BlendColor, ...) and operations (Add,
+                           Max, ...; default Add), with or without the MTLBlend prefix
   --raster-samples N       the render pipeline's sample count (default: 1)
   --vertex-amplification-count N
                            the render pipeline's maximum vertex amplification count (default: 1)
@@ -67,6 +71,10 @@ options:
   --emit-meta FILE         write the pipeline's interface, layout, dependencies, and stages as JSON
   --no-spirv-val           skip spirv-val (by default it runs when found)
   -h, --help               show this help
+
+environment:
+  M2V_NI_WHERE             set: each NotImplemented refusal the translator makes says on stderr
+                           where in the translator it was made
 "#;
 
 /// The options that name a descriptor file, and the name of its copy in a repro bundle.
@@ -88,6 +96,8 @@ struct Args {
     stage_input: Option<String>,
     vertex_descriptor: Option<String>,
     color_formats: BTreeMap<usize, PixelFormat>,
+    blend_specs: BTreeMap<usize, [metal2vulkan::metal::BlendFactor; 4]>,
+    blend_ops: BTreeMap<usize, [metal2vulkan::metal::BlendOperation; 2]>,
     depth_format: Option<PixelFormat>,
     stencil_format: Option<PixelFormat>,
     raster_samples: Option<u32>,
@@ -340,7 +350,19 @@ fn compile(args: &Args, device: &Device, library: &Library) -> Result<Compiled, 
                 None => None,
             };
             for (&index, &format) in &args.color_formats {
-                descriptor.color_attachments[index] = Some(ColorAttachmentDescriptor::new(format));
+                let mut a = ColorAttachmentDescriptor::new(format);
+                if let Some(f) = args.blend_specs.get(&index) {
+                    a.blending_enabled = true;
+                    a.source_rgb_blend_factor = f[0];
+                    a.destination_rgb_blend_factor = f[1];
+                    a.source_alpha_blend_factor = f[2];
+                    a.destination_alpha_blend_factor = f[3];
+                }
+                if let Some(o) = args.blend_ops.get(&index) {
+                    a.rgb_blend_operation = o[0];
+                    a.alpha_blend_operation = o[1];
+                }
+                descriptor.color_attachments[index] = Some(a);
             }
             descriptor.depth_format = args.depth_format;
             descriptor.stencil_format = args.stencil_format;
@@ -709,6 +731,38 @@ fn parse_args(args: &[String]) -> Args {
                 parsed
                     .color_formats
                     .insert(index, pixel_format(format).unwrap_or_else(|e| fail(&e)));
+            }
+            "--blend" => {
+                let spec = value();
+                let mut it = spec.split(':');
+                let index = it
+                    .next()
+                    .and_then(|i| i.parse::<usize>().ok())
+                    .filter(|&i| i < 8)
+                    .unwrap_or_else(|| fail("--blend requires I:SRC_RGB:DST_RGB:SRC_A:DST_A"));
+                let factor = |n: Option<&str>| {
+                    let n =
+                        n.unwrap_or_else(|| fail("--blend requires I:SRC_RGB:DST_RGB:SRC_A:DST_A"));
+                    let n = n.strip_prefix("MTLBlendFactor").unwrap_or(n);
+                    metal2vulkan::metal::BlendFactor::from_name(&format!("MTLBlendFactor{n}"))
+                        .unwrap_or_else(|| fail(&format!("unknown Metal blend factor `{n}`")))
+                };
+                let f = [
+                    factor(it.next()),
+                    factor(it.next()),
+                    factor(it.next()),
+                    factor(it.next()),
+                ];
+                let op = |n: Option<&str>| {
+                    let n = n.unwrap_or("Add");
+                    let n = n.strip_prefix("MTLBlendOperation").unwrap_or(n);
+                    metal2vulkan::metal::BlendOperation::from_name(&format!("MTLBlendOperation{n}"))
+                        .unwrap_or_else(|| fail(&format!("unknown Metal blend operation `{n}`")))
+                };
+                parsed.blend_specs.insert(index, f);
+                parsed
+                    .blend_ops
+                    .insert(index, [op(it.next()), op(it.next())]);
             }
             "--depth-format" => {
                 parsed.depth_format = Some(pixel_format(&value()).unwrap_or_else(|e| fail(&e)));
