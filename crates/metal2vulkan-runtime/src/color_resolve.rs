@@ -133,10 +133,25 @@ pub(super) fn of_attachment(
     device: &Device,
     source: &Target,
 ) -> Result<Option<ColorResolveFormat>, Error> {
-    match exact(device, source.format, source.samples) {
+    let rules = extended(source.texture.pixel_format(), source.samples)
+        .or_else(|| exact(device, source.format, source.samples));
+    match rules {
         Some(rules) if takes_input(source)? || copied(device, source)? => Ok(Some(rules)),
         _ => Ok(None),
     }
+}
+
+/// The exact resolve of a color attachment of the extended-range `pixel_format` at `samples`
+/// (`bind::ColorResolveFormat::extended`: a one-plane form at 2 or 4 samples, held in its raw
+/// unsigned integer format): the only resolve of its raw texels, which no device's `AVERAGE`
+/// resolve answers, under either `ResolvePolicy`. Announced as `unmeasured-resolve`: no probe has
+/// closed Metal's resolve of such a format. `None` for another format or count.
+pub(super) fn extended(
+    pixel_format: metal2vulkan::metal::PixelFormat,
+    samples: u32,
+) -> Option<ColorResolveFormat> {
+    let form = metal2vulkan::metal::format::ExtendedRange::of(pixel_format)?;
+    ColorResolveFormat::extended(form).filter(|rules| rules.resolves(samples))
 }
 
 /// Whether the exact resolve may read the color attachment `source`, whose image takes no input
@@ -198,7 +213,8 @@ pub(super) fn input_candidate(plan: &ImagePlan, device: &Device) -> Option<Image
     let samples = plan.samples.as_raw();
     let candidate = usage.contains(ImageUsageFlags::COLOR_ATTACHMENT)
         && !usage.contains(ImageUsageFlags::INPUT_ATTACHMENT)
-        && exact(device, plan.format, samples).is_some();
+        && (exact(device, plan.format, samples).is_some()
+            || extended(plan.pixel_format, samples).is_some());
     candidate.then(|| ImagePlan {
         usage: usage | ImageUsageFlags::INPUT_ATTACHMENT,
         ..plan.clone()
