@@ -1608,7 +1608,8 @@ fn target(
             metal2vulkan::metal::format::vk_format(plan.pixel_format, &[usage].into(), profile)
         {
             if u.needs == metal2vulkan::error::Needs::NotImplemented {
-                return Err(Error::Unsupported(u));
+                // Named: the refusal's line is all a crash report carries of the pass.
+                return Err(Error::Unsupported(u.naming_format(plan.pixel_format)));
             }
         }
     }
