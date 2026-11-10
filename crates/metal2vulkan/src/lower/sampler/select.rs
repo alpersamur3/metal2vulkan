@@ -1304,10 +1304,14 @@ fn select_extended(
                         at: at_level,
                     };
                     // A level from derivatives or gradients is Vulkan's level of detail, where
-                    // the word states a mip filter.
+                    // the word states a mip filter, or two filters the level chooses between.
                     if matches!(at_level, LevelAt::Derived { .. }) {
                         let on = NoteOn::Sampler(n);
-                        let when = any_of([NoteTest::differ(on, SamplerWord::MIP_FILTER, 0)]);
+                        let when = any_of([
+                            NoteTest::differ(on, SamplerWord::MIP_FILTER, 0),
+                            NoteTest::equal(on, SamplerWord::LINEAR, SamplerWord::MIN_LINEAR),
+                            NoteTest::equal(on, SamplerWord::LINEAR, SamplerWord::MAG_LINEAR),
+                        ]);
                         cx.note_when(PrecisionNote::DeviceSampleLevel, when, m)?;
                     }
                 }

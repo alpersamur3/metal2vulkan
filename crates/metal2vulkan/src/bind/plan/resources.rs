@@ -1772,13 +1772,20 @@ impl ResourcePlanner<'_> {
     }
 
     /// Check the runtime sampler bound at `slot`, which samples an extended-range texture of
-    /// `form` (a 3D one where `volume`) by fetches: its word must state one filter for
-    /// minification and magnification (nearest or linear), no anisotropy, and no mip filter, a
+    /// `form` (a 3D one where `volume`) by fetches: its word must state no mip filter, a
     /// nearest one, or a linear one where the form's levels' blend is built
     /// (`ExtendedRange::blends_levels`; not a 3D texture's) and the clamp's maximum is past every
     /// texture's last level (its word's `SamplerWord::LEVEL_MAX` 0, a nearest mip
     /// filter's level at it 15: the function clamps a linear one's level by the clamp's minimum
-    /// alone, `lower::sampler::extended`): else `NotImplemented(Format)`. Every address mode is the
+    /// alone, `lower::sampler::extended`), and under a linear mip filter one filter for
+    /// minification and magnification (nearest or linear): else `NotImplemented(Format)`, naming the
+    /// form and the word. Two filters are each the fetches' at the sample's level of detail
+    /// (`lower::sampler::extended::word_filter_at`; iOS 26's Preview binds a nearest minification
+    /// and linear magnification without a mip filter). An anisotropic word samples as its plain
+    /// filter, which the fetches read alone:
+    /// anisotropy only sharpens the level a slanted surface reads, and Metal's anisotropic filter
+    /// of these forms is not measured (as a constexpr sampler's, `lower::sampler::select`; iOS
+    /// 26's Preview binds such a sampler). Every address mode is the
     /// fetches' (a `MirrorClampToEdge` axis's taps mirrored once and clamped; a padded form's under
     /// every mode, measured). An unbound slot's word is 0, a nearest sampler's. A word that states
     /// a `Cubic` filter is the plan's cubic-sampler variant's (`VariantKey::cubic_samplers`), whose
@@ -1807,13 +1814,17 @@ impl ResourcePlanner<'_> {
             }
             _ => false,
         };
-        let isotropic = word & SamplerWord::ANISOTROPIC == 0;
-        if word & SamplerWord::CUBIC != 0 || (one_filter && levels && isotropic) {
+        // The levels' blend takes one filter for both levels' taps (`level_taps`).
+        let filters = one_filter || mip != SamplerMipFilter::Linear.as_raw();
+        if word & SamplerWord::CUBIC != 0 || (filters && levels) {
             return Ok(());
         }
-        Err(BindError::Unsupported(Unsupported::not_implemented(
-            Feature::Format,
-        )))
+        // Named: the refusal's line is all a crash report carries of the sampler.
+        Err(BindError::Unsupported(
+            Unsupported::not_implemented(Feature::Format).naming(crate::error::DiagName::new(
+                format!("{form:?} sampled through runtime sampler word {word:#x}"),
+            )),
+        ))
     }
 
     /// The `SamplerState { slot, fields }` specialization: the bound sampler's word masked by

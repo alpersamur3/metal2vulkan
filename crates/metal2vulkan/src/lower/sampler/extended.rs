@@ -785,13 +785,13 @@ fn sampled(
         };
     }
     let x = match levels(cx, fb, &t, r, level, &tex)? {
-        None => filters(cx, fb, &t, &at, &tex, &r.state)?,
+        None => filters(cx, fb, &t, &at, &tex, (&r.state, level))?,
         Some(Levels { first, blend: None }) => {
             let at = At {
                 level: Some(first),
                 ..at
             };
-            filters(cx, fb, &t, &at, &tex, &r.state)?
+            filters(cx, fb, &t, &at, &tex, (&r.state, level))?
         }
         // A linear mip filter's two levels, blended where the second weighs anything.
         Some(Levels {
@@ -833,7 +833,7 @@ fn sampled(
                     level: Some(first),
                     ..at
                 };
-                let x = filters(cx, fb, t, &at, tex, state)?;
+                let x = filters(cx, fb, t, &at, tex, (state, level))?;
                 Ok(ArmEnd::FallThrough(vec![x]))
             });
             let Merged(merged) = fb.if_(cx, blends, both, Some(one))?;
@@ -847,14 +847,16 @@ fn sampled(
 }
 
 /// The filtered texel at `at` of `tex` (unswizzled) by `state`: a constexpr sampler's linear or
-/// nearest filter, or the filter a runtime sampler's word states.
+/// nearest filter, or the filter a runtime sampler's word states, its magnification or its
+/// minification filter by the sample's level of detail `lod` ([`level_at`], [`word_filter_at`];
+/// both filters linear where the sample has none).
 fn filters(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     t: &Tys,
     at: &At<'_>,
     tex: &Texture,
-    state: &State,
+    (state, lod): (&State, Option<SValue>),
 ) -> BResult<SValue> {
     match state {
         State::Constant {
@@ -877,7 +879,10 @@ fn filters(
             let word = super::emit::sampler_word(cx, fb, Pixel::Spec(*sampler))?;
             let axes = usize::from(tex.image.plane);
             let addressing = Addressing::Word { word, axes };
-            let linear = word_linear(fb, t, word)?;
+            let linear = match lod {
+                Some(lod) => word_filter_at(fb, t, word, lod)?,
+                None => word_linear(fb, t, word)?,
+            };
             let filtered: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, cx| {
                 let x = filtered(cx, fb, t, at, tex, addressing)?;
                 Ok(ArmEnd::FallThrough(vec![x]))
@@ -1286,6 +1291,38 @@ fn level_taps(
                 .map_err(|_| cx.fail("an extended-range level's branch without its taps"))
         }
     }
+}
+
+/// Whether runtime sampler word `word` filters linearly a sample at level of detail `lod` (an
+/// `f32`, [`level_at`]'s, its bias in it), as a `bool`: its magnification filter where `lod` is at
+/// most 0 and the word's level clamp starts at level 0 (`SamplerWord::LEVEL_MIN` 0; a clamp that
+/// starts above it puts every sample past 0, a fractional one below level 1 is not read here), else
+/// its minification filter, as Vulkan chooses (Metal's choice on Apple's GPUs is not measured for
+/// these forms; where the word's two filters differ the sample's level is the device's, noted as
+/// `DeviceSampleLevel` by `select`). A NaN `lod` minifies.
+fn word_filter_at(
+    fb: &mut FunctionBuilder<'_>,
+    t: &Tys,
+    word: SValue,
+    lod: SValue,
+) -> BResult<SValue> {
+    let states = |fb: &mut FunctionBuilder<'_>, mask: u32| -> BResult<SValue> {
+        let m = scalar(fb, t.u32_, u64::from(mask))?;
+        let m = value(fb, m)?;
+        let zero = scalar(fb, t.u32_, 0)?;
+        let zero = value(fb, zero)?;
+        let have = fb.binary(BinOp::BitwiseAnd, word, m)?;
+        fb.binary(BinOp::INotEqual, have, zero)
+    };
+    let mag = states(fb, SamplerWord::MAG_LINEAR)?;
+    let min = states(fb, SamplerWord::MIN_LINEAR)?;
+    let clamped = states(fb, SamplerWord::LEVEL_MIN)?;
+    let zero = scalar(fb, t.f32_, 0)?;
+    let zero = value(fb, zero)?;
+    let low = fb.binary(BinOp::FOrdLessThanEqual, lod, zero)?;
+    let from_zero = fb.unary(crate::spirv::ir::UnOp::LogicalNot, clamped)?;
+    let magnified = fb.binary(BinOp::LogicalAnd, low, from_zero)?;
+    fb.select(magnified, mag, min)
 }
 
 /// Whether runtime sampler word `word` states linear minification and magnification (a `bool`): a
