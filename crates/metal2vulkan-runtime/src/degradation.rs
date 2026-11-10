@@ -3716,6 +3716,28 @@ impl Device {
                 )
             });
         }
+        // An extended-range color's resolve of its raw texels (`color_resolve::extended`).
+        let extended = colors.clone().find(|color| {
+            color
+                .resolve
+                .as_ref()
+                .and_then(|r| r.shader)
+                .is_some_and(|rules| rules.extended_range().is_some())
+        });
+        if let Some(color) = extended {
+            self.degrade(Degradation::UnmeasuredResolve, || {
+                (
+                    format!(
+                        "a resolve of a {:?} color attachment of {} samples",
+                        color.target.texture.pixel_format(),
+                        color.target.samples
+                    ),
+                    "no probe has closed Metal's resolve of an extended-range format: each \
+                     sample's tile value is resolved by the 16-bit float rule and encoded"
+                        .to_owned(),
+                )
+            });
+        }
         let unmeasured = colors.clone().find(|color| {
             color.resolve.is_some() && color.target.samples > color_resolve::METAL_SAMPLES
         });

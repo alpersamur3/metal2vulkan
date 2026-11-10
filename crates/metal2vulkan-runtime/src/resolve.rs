@@ -387,7 +387,8 @@ impl<'a> Wanted<'a> {
 
 /// The refusal of a resolve from or into a texture of `pf` that the runtime does not model: an
 /// extended-range format's, whose resolve in Metal matches no average of its samples' values
-/// measured. The format's Resolve capability answers it too (`families::formats`).
+/// measured. The format's Resolve capability answers it too (`families::formats`). A render pass
+/// still resolves a one-plane form at 2 and 4 samples, unmeasured (`color_resolve::extended`).
 pub(crate) fn unmodelled_resolve(pf: PixelFormat) -> Option<Unsupported> {
     ExtendedRange::of(pf).map(|_| Unsupported::not_implemented(Feature::Format))
 }
@@ -465,21 +466,31 @@ pub(super) fn color(
     ) {
         return Err(problem(call, RenderPassProblem::ResolveFormat(which)));
     }
-    if let Some(unsupported) = [source.texture.pixel_format(), texture.pixel_format()]
-        .into_iter()
-        .find_map(unmodelled_resolve)
-    {
-        return Err(Error::Unsupported(unsupported));
+    // A one-plane extended-range color at 2 or 4 samples resolves into a texture held in its raw
+    // format too, by the exact resolve of its raw texels (`color_resolve::extended`); another
+    // extended-range resolve is not modelled, refused naming its format.
+    let pixel_format = source.texture.pixel_format();
+    let held = |pf: PixelFormat| ExtendedRange::of(pf).map(ExtendedRange::raw_format);
+    let extended = color_resolve::extended(pixel_format, source.samples)
+        .filter(|_| held(texture.pixel_format()) == held(pixel_format));
+    if extended.is_none() {
+        if let Some((pf, unsupported)) = [pixel_format, texture.pixel_format()]
+            .into_iter()
+            .find_map(|pf| Some((pf, unmodelled_resolve(pf)?)))
+        {
+            return Err(Error::Unsupported(unsupported.naming_format(pf)));
+        }
     }
     // An attachment rendered through the view of its word (`metal::format::WordAttachment`) holds
     // each sample's stored codes, while Metal resolves its tile's values: not modelled.
     let word = metal2vulkan::metal::format::WordAttachment::of(
-        source.texture.pixel_format(),
+        pixel_format,
         device.compile_device().profile(),
     );
     if word.is_some_and(|w| w.word_format() == source.format) {
         return Err(Error::Unsupported(
-            metal2vulkan::error::Unsupported::not_implemented(metal2vulkan::error::Feature::Format),
+            metal2vulkan::error::Unsupported::not_implemented(metal2vulkan::error::Feature::Format)
+                .naming_format(pixel_format),
         ));
     }
     single_sampled(call, which, source)?;
@@ -499,7 +510,20 @@ pub(super) fn color(
         // SAFETY: every member of the union is four 32-bit values; any bits are a valid `u32`.
         resolve.clear = Some(unsafe { clear.uint32 });
     }
-    resolve.shader = color_resolve::of_attachment(device, source)?;
+    resolve.shader = match extended {
+        // No device's average resolves the raw texels (an unsigned integer format): the exact
+        // resolve, or refused where it cannot read the samples.
+        Some(rules) => Some(
+            color_resolve::of_attachment(device, source)?
+                .filter(|r| *r == rules)
+                .ok_or_else(|| {
+                    Error::Unsupported(
+                        Unsupported::not_implemented(Feature::Format).naming_format(pixel_format),
+                    )
+                })?,
+        ),
+        None => color_resolve::of_attachment(device, source)?,
+    };
     Ok(Some(resolve))
 }
 

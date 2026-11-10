@@ -96,6 +96,8 @@ use crate::budget::{Budget, Meter};
 use crate::device::requirements::Requirements;
 use crate::device::Device;
 use crate::error::{Error, Feature, InternalError, InternalKind, Unsupported};
+use crate::lower::arith::extended_range;
+use crate::metal::format::ExtendedRange;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage, Symbol};
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
@@ -220,6 +222,9 @@ pub struct ColorResolveFormat {
     /// Whether the result is written through the raw twin's view
     /// ([`ColorResolveFormat::written_raw`]).
     written_raw: bool,
+    /// The extended-range form whose raw texels the format holds
+    /// ([`ColorResolveFormat::extended`]); `None` for a format of channels.
+    extended: Option<ExtendedRange>,
 }
 
 /// A channel of `rule` at bit `offset`.
@@ -293,7 +298,34 @@ impl ColorResolveFormat {
             format,
             channels,
             written_raw: false,
+            extended: None,
         })
+    }
+
+    /// The resolve of an extended-range color of `form`, held in its raw format
+    /// (`ExtendedRange::raw_format`): `BGR10_XR` and `BGRA10_XR` and their `_sRGB` twins, the
+    /// one-plane forms Metal makes a multisample texture of. Metal resolves the `half`s its tile
+    /// memory holds; no probe has closed its rule, so the module applies the 16-bit float rule to
+    /// each sample's tile value (`extended_range::tile_value`) and stores the encode of the
+    /// result, at 2 and 4 samples ([`resolves`](Self::resolves)); a pixel whose samples hold the
+    /// same codes keeps them. `None` for another form: the two-plane form has no multisample
+    /// texture, and a padded or bfloat form's tile memory is unmeasured.
+    pub fn extended(form: ExtendedRange) -> Option<ColorResolveFormat> {
+        match form {
+            ExtendedRange::Bgr10 { .. } | ExtendedRange::Bgra10 { .. } => Some(ColorResolveFormat {
+                format: form.raw_format(),
+                channels: [None; 4],
+                written_raw: false,
+                extended: Some(form),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The extended-range form whose raw texels the format holds
+    /// ([`extended`](Self::extended)); `None` for a format of channels.
+    pub fn extended_range(self) -> Option<ExtendedRange> {
+        self.extended
     }
 
     /// The Vulkan format.
@@ -310,6 +342,10 @@ impl ColorResolveFormat {
     /// channel): a 16-bit float, `RG11B10Float` or `RGB9E5Float` format's at 2 and 4 samples, any
     /// other's at every count.
     pub fn resolves(self, samples: u32) -> bool {
+        if self.extended.is_some() {
+            // The 16-bit float rule's counts.
+            return samples == 2 || samples == 4;
+        }
         self.channels
             .iter()
             .flatten()
@@ -1335,12 +1371,23 @@ fn alike(
     texels: &[Value],
     source: ResolveSource,
 ) -> BResult<Value> {
+    alike_words(f, t, texels, source.reads_bits())
+}
+
+/// Whether every texel of `texels` has the first's bits, as a `bool`: `uvec4`s where `bits`, else
+/// `vec4`s compared by their bits.
+fn alike_words(
+    f: &mut FunctionBuilder<'_>,
+    t: Types,
+    texels: &[Value],
+    bits: bool,
+) -> BResult<Value> {
     let uvec4 = f.module().ty(Type::Vector {
         elem: t.u32_,
         len: 4,
     })?;
     let words = |f: &mut FunctionBuilder<'_>, texel: Value| -> BResult<Value> {
-        match source.reads_bits() {
+        match bits {
             true => Ok(texel),
             false => f.convert(ConvOp::Bitcast, texel, uvec4),
         }
@@ -1443,6 +1490,9 @@ pub fn fragment_typed_module(
     samples: u32,
     source: ResolveSource,
 ) -> BResult<TypedModule> {
+    if let Some(form) = format.extended {
+        return extended_fragment_typed_module(form, samples, source);
+    }
     let mut b = ModuleBuilder::new();
     let t = Types::new(&mut b)?;
     let srgb = if format.srgb() {
@@ -1542,6 +1592,186 @@ pub fn fragment_typed_module(
     let value = f.composite_construct(t.vec4, &lanes)?;
     let output = f.module().global_value(output)?;
     f.store(output, value, MemAccess::default())?;
+    f.ret(None)?;
+    let id = f.finish()?;
+    b.entry(ExecModel::Fragment, id, vec![ExecMode::OriginUpperLeft])?;
+    b.finalize()
+}
+
+/// The raw texel of `form` (its raw format's `uvec4`, as a read of an attachment in that format
+/// gives it) from `texel`, a sample's texel read from `source`: itself from the attachment, or
+/// from a bits copy whose texel is the raw format's own (`PlanesCopy::R32` of `BGR10_XR`'s word);
+/// `BGRA10_XR`'s four 16-bit fields unpacked from the two words of its `PlanesCopy::Rg32` copy,
+/// the lowest field first.
+fn extended_raw(
+    f: &mut FunctionBuilder<'_>,
+    t: Types,
+    form: ExtendedRange,
+    texel: Value,
+    source: ResolveSource,
+) -> BResult<Value> {
+    let ResolveSource::Planes(PlanesCopy::Rg32) = source else {
+        return Ok(texel);
+    };
+    if !matches!(form, ExtendedRange::Bgra10 { .. }) {
+        return Ok(texel);
+    }
+    let uvec4 = f.module().ty(Type::Vector {
+        elem: t.u32_,
+        len: 4,
+    })?;
+    let low = uint(f, t, 0xFFFF)?;
+    let sixteen = uint(f, t, 16)?;
+    let mut lanes = Vec::with_capacity(4);
+    for word in 0..2 {
+        let w = f.composite_extract(texel, &[word])?;
+        lanes.push(f.binary(BinOp::BitwiseAnd, w, low)?);
+        lanes.push(f.binary(BinOp::ShiftRightLogical, w, sixteen)?);
+    }
+    f.composite_construct(uvec4, &lanes)
+}
+
+/// The fragment stage of an extended-range color of `form` at `samples` (2 or 4) reading
+/// `source` ([`ColorResolveFormat::extended`]): each sample's raw texel, its codes kept where
+/// every sample holds the same bits, else each sample's tile value
+/// (`extended_range::tile_value`), each lane resolved by the 16-bit float rule
+/// ([`resolve_half`]) and the result encoded as Metal's store encodes it
+/// (`extended_range::encode`), written to the `uvec4` output at `Location` 0 in the raw format.
+/// The source reads unsigned integers: the attachment in its raw format, or a bits copy of its
+/// sample planes.
+fn extended_fragment_typed_module(
+    form: ExtendedRange,
+    samples: u32,
+    source: ResolveSource,
+) -> BResult<TypedModule> {
+    if !(samples == 2 || samples == 4) {
+        return Err(crate::spirv::error::BuildError::IdSpaceExhausted);
+    }
+    let mut b = ModuleBuilder::new();
+    let t = Types::new(&mut b)?;
+    let uvec4 = b.ty(Type::Vector {
+        elem: t.u32_,
+        len: 4,
+    })?;
+    let (image, coord) = match source {
+        ResolveSource::InputAttachment | ResolveSource::RawInputAttachment => {
+            let ty = b.ty(Type::Image(ImageType {
+                sampled_type: t.u32_,
+                dim: Dim::SubpassData,
+                depth: false,
+                arrayed: false,
+                multisampled: true,
+                usage: ImageUsage::Storage,
+                format: crate::spv::ImageFormat::Unknown,
+            }))?;
+            (
+                b.resource(SOURCE_INPUT, StorageClass::UniformConstant, ty)?,
+                None,
+            )
+        }
+        ResolveSource::Planes(copy) => {
+            // A float copy (`PlanesCopy::Alpha8`) holds no raw texel.
+            if !copy.moves_bits() {
+                return Err(crate::spirv::error::BuildError::IdSpaceExhausted);
+            }
+            let ty = b.ty(Type::Image(ImageType {
+                sampled_type: t.u32_,
+                dim: Dim::D2,
+                depth: false,
+                arrayed: true,
+                multisampled: false,
+                usage: ImageUsage::Sampled,
+                format: crate::spv::ImageFormat::Unknown,
+            }))?;
+            let coord = b.builtin(crate::spv::BuiltIn::FragCoord, IoDir::Input, t.vec4)?;
+            (
+                b.resource(SOURCE_PLANES, StorageClass::UniformConstant, ty)?,
+                Some(coord),
+            )
+        }
+    };
+    // An `_sRGB` form's color channels decode and encode through Metal's table.
+    let table = match form.srgb() {
+        true => Some(extended_range::declare(&mut b)?),
+        false => None,
+    };
+    let output = b.fixed_io(0, IoDir::Output, uvec4, false)?;
+    let void = b.ty(Type::Void)?;
+    let mut f = b.function(void)?;
+    let image = f.module().global_value(image)?;
+    let image = f.load(image, MemAccess::default())?;
+    let ivec2 = f.module().ty(Type::Vector {
+        elem: t.i32_,
+        len: 2,
+    })?;
+    let uvec3 = f.module().ty(Type::Vector {
+        elem: t.u32_,
+        len: 3,
+    })?;
+    let pixel = match coord {
+        Some(coord) => {
+            let coord = f.module().global_value(coord)?;
+            let coord = f.load(coord, MemAccess::default())?;
+            let x = f.composite_extract(coord, &[0])?;
+            let y = f.composite_extract(coord, &[1])?;
+            let x = f.convert(ConvOp::ConvertFToU, x, t.u32_)?;
+            let y = f.convert(ConvOp::ConvertFToU, y, t.u32_)?;
+            Some((x, y))
+        }
+        None => None,
+    };
+    let mut texels = Vec::with_capacity(samples as usize);
+    for s in 0..samples {
+        let texel = match pixel {
+            None => {
+                let origin = f.module().constant(Constant::Null { ty: ivec2 })?;
+                let origin = f.module().const_value(origin)?;
+                let sample = int(&mut f, t, s as i32)?;
+                let ops = ImageOperands {
+                    sample: Some(sample),
+                    ..ImageOperands::default()
+                };
+                f.read(image, origin, &ops, TexelMemory::PRIVATE)?
+            }
+            Some((x, y)) => {
+                let layer = uint(&mut f, t, s)?;
+                let at = f.composite_construct(uvec3, &[x, y, layer])?;
+                let level = uint(&mut f, t, 0)?;
+                let ops = ImageOperands {
+                    lod: Some(level),
+                    ..ImageOperands::default()
+                };
+                f.fetch(image, at, &ops)?
+            }
+        };
+        texels.push(extended_raw(&mut f, t, form, texel, source)?);
+    }
+    let same = alike_words(&mut f, t, &texels, true)?;
+    let first = texels[0];
+    let kept: ArmFn<'_, ()> = Box::new(move |_, _| Ok(ArmEnd::FallThrough(vec![first])));
+    let average: ArmFn<'_, ()> = Box::new(|f, _| {
+        let mut lanes: [Vec<Value>; 4] = Default::default();
+        for &raw in &texels {
+            let value = extended_range::tile_value(f, form, raw, table)?;
+            let bits = f.convert(ConvOp::Bitcast, value, uvec4)?;
+            for (lane, codes) in (0u32..).zip(lanes.iter_mut()) {
+                codes.push(f.composite_extract(bits, &[lane])?);
+            }
+        }
+        let mut resolved = Vec::with_capacity(4);
+        for codes in &lanes {
+            resolved.push(resolve_half(f, t, codes)?);
+        }
+        let value = f.composite_construct(t.vec4, &resolved)?;
+        let raw = extended_range::encode(f, form, value, table)?;
+        Ok(ArmEnd::FallThrough(vec![raw]))
+    });
+    let merged = f.if_(&mut (), same, kept, Some(average))?.0;
+    let raw = *merged
+        .first()
+        .ok_or(crate::spirv::error::BuildError::IdSpaceExhausted)?;
+    let output = f.module().global_value(output)?;
+    f.store(output, raw, MemAccess::default())?;
     f.ret(None)?;
     let id = f.finish()?;
     b.entry(ExecModel::Fragment, id, vec![ExecMode::OriginUpperLeft])?;
