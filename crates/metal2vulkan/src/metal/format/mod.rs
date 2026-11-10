@@ -162,7 +162,14 @@ pub enum FormatEmulation {
     /// (`bind::ycbcr_store`, the encode kernel's store of every texel). Exact for an attachment
     /// a fragment function writes unblended through a mask of red, green and blue; admitted for
     /// that usage only (no blend: the pipeline refuses one), but a code format's blend, not
-    /// measured, which iOS 26 asks of `RGB8_444_2P` soon after an app leaves the screen.
+    /// measured, which iOS 26 asks of `RGB8_444_2P` soon after an app leaves the screen. A 4:4:4
+    /// code format (`RGB8_444_2P`, `RGB10_444_2P`) is also read through framebuffer fetch, the
+    /// image's floats taken to Metal's tile of halves (`lower::arith::texel_round::code_tile`; not
+    /// measured, `PrecisionNote::UnmeasuredCodeFormatFetch`), and loaded as Metal loads it (each
+    /// texel's `code / (2^b - 1)`, an Apple M3 Max under macOS 27.0.1, probe `ycp`), the consumer
+    /// filling the image with those floats (red Cr, green luma, blue Cb, alpha 1) from the planes
+    /// before the pass (`bind::ycbcr_convert_floats_module`), which the pass's store returns to the
+    /// same codes; a converted format's fetch and load stay refused.
     YCbCrRendered,
     /// A pipeline's color attachment of a packed 10-bit two-plane YCbCr format whose pass is
     /// refused ([`ycbcr_pass_refused`]): `R32G32B32A32_SFLOAT`, which no pass renders into.
@@ -1976,8 +1983,12 @@ pub fn ycbcr_writes_stored(pf: PixelFormat) -> bool {
 /// mask, `NotImplemented(Format)`). The 4:4:4 code formats too (`RGB8_444_2P` and `RGB10_444_2P`),
 /// not measured: iOS 26 draws into `RGB8_444_2P`, and a pass stores each texel's codes as a
 /// function's write does (`bind::ycbcr_write`, green, blue and red as codes), which is what their
-/// planes hold. Not the `_sRGB`, other code or packed formats, whose stores no rule matches yet (a
-/// packed one's pass is refused, [`ycbcr_pass_refused`]).
+/// planes hold; and their attachment may be loaded (each texel the floats `code / (2^b - 1)` its
+/// planes hold, Metal's load on an Apple M3 Max under macOS 27.0.1, which the store returns to the
+/// same codes) and read through framebuffer fetch (the floats taken to Metal's tile of halves, not
+/// measured). Not the `_sRGB`, other code or packed
+/// formats, whose stores no rule matches yet (a packed one's pass is refused,
+/// [`ycbcr_pass_refused`]).
 pub fn ycbcr_renders(pf: PixelFormat) -> bool {
     // Every such layout is held ([`ycbcr`]), whose representation asks this.
     ycbcr_format(pf).is_some_and(|f| {

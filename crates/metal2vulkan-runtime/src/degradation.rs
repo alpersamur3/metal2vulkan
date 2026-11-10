@@ -2037,6 +2037,13 @@ degradations! {
         /// rounding of a level may read another level or filter than Metal's near a boundary, and
         /// the query answers the device's level.
         DeviceSampleLevel = "device-sample-level";
+        /// A fragment function reads a color attachment of a 4:4:4 two-plane YCbCr code format
+        /// (`RGB8_444_2P`, `RGB10_444_2P`) through framebuffer fetch: red, green and blue each the
+        /// `half` the pass's float rounds to (to nearest even at 8 bits, toward zero at 10, as
+        /// Metal's tile holds a drawn channel of the format, measured through its pass stores) and
+        /// alpha 1, which no probe has read through fetch on a Mac; a loaded texel reads its code
+        /// over `2^b - 1` rounded so.
+        UnmeasuredCodeFormatFetch = "unmeasured-code-format-fetch";
     }
 }
 

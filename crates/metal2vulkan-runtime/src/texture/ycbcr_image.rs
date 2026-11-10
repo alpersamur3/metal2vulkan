@@ -26,7 +26,9 @@ use ash::vk;
 use metal2vulkan::bind::{YCbCrCodes, YCbCrOutput, YCbCrPlanes};
 use metal2vulkan::device::FormatUsage;
 use metal2vulkan::error::{Feature, Unsupported};
-use metal2vulkan::metal::format::{vk_format, ycbcr_format, ycbcr_renders, ChromaSubsampling};
+use metal2vulkan::metal::format::{
+    vk_format, ycbcr_format, ycbcr_renders, ChromaSubsampling, YCbCrReads,
+};
 use metal2vulkan::metal::{PixelFormat, SamplerAddressMode, TextureType, TextureUsage};
 use metal2vulkan::vk::{
     ComponentMapping, Format, FormatFeatureFlags2, ImageAspectFlags, ImageCreateFlags,
@@ -328,7 +330,8 @@ impl Texture {
             usage: ImageUsageFlags::STORAGE,
         })?;
         let (raw, at) = texels.buffer.at(span.start);
-        let write_back = YCbCrWriteBack::new(device, (&planes, span.clone()), at, (view, false))?;
+        let write_back =
+            YCbCrWriteBack::new(device, (&planes, span.clone()), at, (view, false), None)?;
         let (bytes, tracked) = texels.buffer.tracked(span);
         let copies = ShadowCopies {
             source: ShadowSource::YCbCrWrite {
@@ -355,6 +358,16 @@ impl Texture {
     }
 }
 
+/// Whether a pass may load a render shadow of `pf` (`ycbcr.rs`, the module docs' passes): a
+/// 4:4:4 code format, `RGB8_444_2P` or `RGB10_444_2P`, whose loaded floats `code / (2^b - 1)` the
+/// store returns to the same codes. A converted format's load stays refused.
+pub(crate) fn ycbcr_code_loaded(pf: PixelFormat) -> bool {
+    ycbcr_renders(pf)
+        && ycbcr_format(pf).is_some_and(|f| {
+            f.reads == YCbCrReads::Codes && f.subsampling == ChromaSubsampling::Chroma444
+        })
+}
+
 impl Texture {
     /// The render shadow of a two-plane YCbCr texture a pass stores as Metal does
     /// (`metal::format::ycbcr_renders`), for Metal's `call`, made at its first need and kept
@@ -362,7 +375,10 @@ impl Texture {
     /// is `R32G32B32A32_SFLOAT`, the color attachment a pass renders the values it leaves in
     /// each texel into (`FormatEmulation::YCbCrRendered`), and its copies, a clear in and the
     /// store of every texel's codes back into the planes (`ShadowSource::YCbCrWrite` of a
-    /// store, `ycbcr.rs`), which leaves the texture's converted texels stale. Refused
+    /// store, `ycbcr.rs`), which leaves the texture's converted texels stale. A 4:4:4 code
+    /// format's (`RGB8_444_2P`, `RGB10_444_2P`) copy in is a load instead, every texel the floats
+    /// of its planes' codes written through an `R32G32B32A32_SFLOAT` storage view
+    /// (`YCbCrWriteBack::loads`), which a pass that loads the attachment reads. Refused
     /// (`Unsupported`, `NotImplemented`, `Feature::Format`, naming the format) for a texture
     /// over plane 1 of its surface, one of a size its chroma blocks do not tile, and one whose
     /// texels are no conversion of planes, none of whose stores is measured; as `new_texture`
@@ -411,19 +427,25 @@ impl Texture {
         let facts = device.shared().textures.facts(profile);
         let plan = plan_image(&float, usage, false, &facts)
             .map_err(|refusal| image_error(call, refusal))?;
-        // Rendered, read by the store through a view of its bits, and cleared.
+        // Rendered, read by the store through a view of its bits, and cleared; a code format's
+        // loaded through a view of its floats.
         let needed = ImageUsageFlags::COLOR_ATTACHMENT
             | ImageUsageFlags::STORAGE
             | ImageUsageFlags::TRANSFER_DST;
         let mapping =
             vk_format(pf, &[FormatUsage::ColorAttachment].into(), profile).map_err(|_| gap())?;
         let bits = Format::R32G32B32A32_UINT;
+        let loads = ycbcr_code_loaded(pf);
+        let stores = |format| {
+            facts
+                .optimal(format)
+                .contains(FormatFeatureFlags2::STORAGE_IMAGE)
+        };
         if plan.format != Format::R32G32B32A32_SFLOAT
             || mapping.format != plan.format
             || !plan.usage.contains(needed)
-            || !facts
-                .optimal(bits)
-                .contains(FormatFeatureFlags2::STORAGE_IMAGE)
+            || !stores(bits)
+            || (loads && !stores(plan.format))
         {
             return Err(gap());
         }
@@ -458,8 +480,24 @@ impl Texture {
             layer_count: 1,
             usage: ImageUsageFlags::STORAGE,
         })?;
+        // A code format's load writes the floats of its codes through a view of the floats.
+        let floats = match loads {
+            true => Some(image.own_view(&VkView {
+                view_type: ImageViewType::TYPE_2D,
+                format: Format::R32G32B32A32_SFLOAT,
+                components: ComponentMapping::IDENTITY,
+                aspect: ImageAspectFlags::COLOR,
+                base_level: 0,
+                level_count: 1,
+                base_layer: 0,
+                layer_count: 1,
+                usage: ImageUsageFlags::STORAGE,
+            })?),
+            false => None,
+        };
         let (raw, at) = texels.buffer.at(span.start);
-        let write_back = YCbCrWriteBack::new(device, (&planes, span.clone()), at, (view, true))?;
+        let write_back =
+            YCbCrWriteBack::new(device, (&planes, span.clone()), at, (view, true), floats)?;
         let (bytes, tracked) = texels.buffer.tracked(span);
         let copies = ShadowCopies {
             source: ShadowSource::YCbCrWrite {

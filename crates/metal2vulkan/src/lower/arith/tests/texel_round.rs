@@ -512,3 +512,49 @@ fn srgb_steps_read_the_twelve_bit_table() {
         false,
     );
 }
+
+/// `code_tile`, a 4:4:4 two-plane YCbCr code-format attachment's tile value from its render
+/// shadow's floats: red, green and blue each the probe's `half` (to nearest even at 8 bits, toward
+/// zero saturating at 10), and alpha 1 whatever the shadow's alpha held. Every probe lands in each
+/// of the three channels, and every code's `code / (2^b - 1)` of both widths too.
+#[test]
+fn code_tile_rounds_red_green_and_blue_and_reads_alpha_one() {
+    let v4 = Form {
+        held: Held::Float(FloatFmt::F32),
+        lanes: 4,
+    };
+    let probes = half_probe_bits();
+    let codes = (0u32..256)
+        .map(|c| (c as f32 / 255.0).to_bits())
+        .chain((0u32..1024).map(|c| (c as f32 / 1023.0).to_bits()))
+        .map(u64::from);
+    let values: Vec<u64> = probes.into_iter().chain(codes).collect();
+    let n = values.len();
+    // Lane `l` of case `i` is value `i + l · n / 3`, so each value takes each channel; alpha a probe
+    // too.
+    let cases: Vec<Case> = (0..n)
+        .map(|i| vec![(0..4).map(|l| values[(i + l * n / 3) % n]).collect()])
+        .collect();
+    for (bits, mode) in [
+        (8, HalfRounding::NearestEven),
+        (10, HalfRounding::TowardZeroSaturating),
+    ] {
+        check(
+            &format!("code_tile {bits}"),
+            &[v4],
+            v4,
+            &|fb, x| texel_round::code_tile(fb, x[0], bits),
+            &cases,
+            &|c| {
+                let lane = |l: usize| half_of(f32::from_bits(c[0][l] as u32), mode);
+                Some(vec![
+                    u64::from(lane(0)),
+                    u64::from(lane(1)),
+                    u64::from(lane(2)),
+                    u64::from(1.0f32.to_bits()),
+                ])
+            },
+            false,
+        );
+    }
+}

@@ -55,13 +55,25 @@
 //!   rounded to nearest even, each channel that step `/ 8192`; alpha is 1. A half float does not
 //!   hold every step (above `1/4`), so the image is `R32G32B32A32_SFLOAT`.
 //!
-//! **The module** (one per device and output). One `GLCompute` entry `main` with local size
+//! **Floats** ([`ycbcr_convert_floats_module`]): the same texels written as floats into an
+//! `Rgba32f` view, which a pass's loaded attachment of a 4:4:4 code format reads (its texture's
+//! render shadow, `R32G32B32A32_SFLOAT`, `metal::format::FormatEmulation::YCbCrRendered`): the
+//! codes ([`YCbCrOutput::Codes`]) as red `Cr`, green `Y` and blue `Cb`, each the float `code` over
+//! the float `2^b - 1` to the device's division (`OpFDiv`, within Vulkan's 2.5 ULP; correctly
+//! rounded on the CPU interpreter), and alpha 1; the converted and sRGB values as above. The
+//! pass's store of a code format (`bind::ycbcr_write`, `round(clamp(v, 0, 1) · (2^b - 1))`)
+//! returns each such float to its code, whatever the division's last bits. Metal loads these
+//! formats so (`code / (2^b - 1)`, an Apple M3 Max under macOS 27.0.1, probe `ycp`); the `half` its
+//! tile then holds, which only a fetch reads, is not measured
+//! (`PrecisionNote::UnmeasuredCodeFormatFetch`).
+//!
+//! **The module** (one per device, output and image). One `GLCompute` entry `main` with local size
 //! ([`YCbCrConvertModule::LOCAL_SIZE`], [`YCbCrConvertModule::LOCAL_SIZE`], 1), no push constants,
 //! and in set 0:
 //!
 //! | Binding | Resource |
 //! |---|---|
-//! | [`YCbCrConvertModule::IMAGE_BINDING`] | the texture's image, a 2D storage image, written: `Rgba16f` of the converted texels, `Rgba32f` of the sRGB ones, or `R32ui` of the codes packed as `A2B10G10R10_UNORM_PACK32` (10 bits) or `R8G8B8A8_UNORM` (8 bits) packs them (a view of that image) |
+//! | [`YCbCrConvertModule::IMAGE_BINDING`] | the texture's image, a 2D storage image, written: `Rgba16f` of the converted texels, `Rgba32f` of the sRGB ones, or `R32ui` of the codes packed as `A2B10G10R10_UNORM_PACK32` (10 bits) or `R8G8B8A8_UNORM` (8 bits) packs them (a view of that image); `Rgba32f` of any output's floats in the floats module (a view of the render shadow) |
 //! | [`YCbCrConvertModule::SHAPE_BINDING`] | the planes' shape ([`YCbCrConvertModule::shape`]), a storage buffer |
 //! | [`YCbCrConvertModule::BYTES_BINDING`] | the surface's bytes, 4 to a word, a storage buffer |
 //!
@@ -386,8 +398,8 @@ impl YCbCrConvertModule {
     /// Descriptor set of every binding.
     pub const SET: u32 = 0;
     /// The texture's image: a 2D storage image, written (`Rgba16f` of the converted texels,
-    /// `Rgba32f` of the sRGB ones, `R32ui` of the packed codes of either width; the module
-    /// docs).
+    /// `Rgba32f` of the sRGB ones, `R32ui` of the packed codes of either width; `Rgba32f` of any
+    /// output's floats in [`ycbcr_convert_floats_module`]; the module docs).
     pub const IMAGE_BINDING: u32 = 0;
     /// The planes' shape: a storage buffer of [`SHAPE_WORDS`](Self::SHAPE_WORDS) words.
     pub const SHAPE_BINDING: u32 = 1;
@@ -680,6 +692,13 @@ impl Cx {
 /// [`ycbcr_convert_module`] serializes, which the CPU interpreter runs. Its bindings are the
 /// symbols `IMAGE`, `SHAPE` and `BYTES` (the module docs).
 fn typed_module(output: YCbCrOutput) -> BResult<TypedModule> {
+    typed_module_of(output, false)
+}
+
+/// The module of `output` as a typed module, writing an `Rgba32f` image of floats if `floats`
+/// (the module docs' floats, [`ycbcr_convert_floats_module`]), else the image [`typed_module`]'s
+/// writes.
+fn typed_module_of(output: YCbCrOutput, floats: bool) -> BResult<TypedModule> {
     let mut b = ModuleBuilder::new();
     let u32_ = b.ty(Type::Int {
         width: 32,
@@ -689,6 +708,7 @@ fn typed_module(output: YCbCrOutput) -> BResult<TypedModule> {
     let uvec2 = b.ty(Type::Vector { elem: u32_, len: 2 })?;
     let uvec3 = b.ty(Type::Vector { elem: u32_, len: 3 })?;
     let (sampled_type, format) = match output {
+        _ if floats => (f32_, crate::spv::ImageFormat::Rgba32f),
         YCbCrOutput::Converted => (f32_, crate::spv::ImageFormat::Rgba16f),
         YCbCrOutput::Srgb => (f32_, crate::spv::ImageFormat::Rgba32f),
         YCbCrOutput::Codes => (u32_, crate::spv::ImageFormat::R32ui),
@@ -810,6 +830,17 @@ fn typed_module(output: YCbCrOutput) -> BResult<TypedModule> {
         }
         let coord = f.composite_construct(uvec2, &[x, y])?;
         let texel = match output {
+            YCbCrOutput::Codes if floats => {
+                // Red Cr, green Y and blue Cb, each `code / (2^b - 1)`, and alpha 1.
+                let top = f.convert(ConvOp::ConvertUToF, max, f32_)?;
+                let mut channels = Vec::with_capacity(4);
+                for code in [chroma[1], luma, chroma[0]] {
+                    let v = f.convert(ConvOp::ConvertUToF, code, f32_)?;
+                    channels.push(f.binary(BinOp::FDiv, v, top)?);
+                }
+                channels.push(scalar(f, f32_, u64::from(1.0f32.to_bits()))?);
+                f.composite_construct(texel_ty, &channels)?
+            }
             YCbCrOutput::Codes => {
                 // `A2B10G10R10_UNORM_PACK32`'s or `R8G8B8A8_UNORM`'s bits, `b` each: red Cr,
                 // green Y, blue Cb, and alpha every bit above (3 of 10-bit codes, 255 of 8-bit).
@@ -925,8 +956,24 @@ pub fn ycbcr_convert_module(
     device: &Device,
     output: YCbCrOutput,
 ) -> Result<YCbCrConvertModule, Error> {
+    built(device, typed_module(output)?)
+}
+
+/// The YCbCr conversion module of `device` writing the floats of `output`'s texels into an
+/// `Rgba32f` image (the module docs' floats): the codes ([`YCbCrOutput::Codes`]) as each
+/// `code / (2^b - 1)`, red `Cr`, green `Y` and blue `Cb`, alpha 1, which a loaded attachment of a
+/// 4:4:4 code format reads from its render shadow. Built, checked and numbered as
+/// [`ycbcr_convert_module`]'s.
+pub fn ycbcr_convert_floats_module(
+    device: &Device,
+    output: YCbCrOutput,
+) -> Result<YCbCrConvertModule, Error> {
+    built(device, typed_module_of(output, true)?)
+}
+
+/// `m` checked against `device`'s profile, serialized, and numbered with the fixed bindings.
+fn built(device: &Device, m: TypedModule) -> Result<YCbCrConvertModule, Error> {
     let profile = device.profile();
-    let m = typed_module(output)?;
     let mut meter = Meter::new(&Budget::default());
     crate::spirv::verify::verify(&m, profile, &mut meter)?;
     let r = crate::spirv::serialize::serialize(m)?;

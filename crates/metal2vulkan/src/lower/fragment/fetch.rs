@@ -69,7 +69,14 @@
 //!   to Metal's `(0, 0, 0, r)` and every one written to it holding Metal's alpha in red
 //!   ([`metal_order`], [`image_order`]), so a read, a merge of the channels a write mask keeps
 //!   (in Metal's channels, of which only alpha is stored) and the per-sample forms are Metal's
-//!   (probe `a8`'s uses on an M3 Max under macOS 27.0.1); an
+//!   (probe `a8`'s uses on an M3 Max under macOS 27.0.1); a 4:4:4 two-plane YCbCr code format
+//!   (`RGB8_444_2P`, `RGB10_444_2P`, `StorageView::codes`) through the image a pass renders it
+//!   into, the texture's render shadow, `R32G32B32A32_SFLOAT` of the pass's floats, written
+//!   unblended (or blended one and zero) under a mask of its red, green and blue or of none:
+//!   a write stores the output's floats, as a color attachment's write does there, and a read
+//!   takes red, green and blue to the `half` Metal's tile holds and alpha to 1, as the input
+//!   attachment's read does (`texel_round::code_tile`; not measured on a Mac,
+//!   `PrecisionNote::UnmeasuredCodeFormatFetch`); an
 //!   8-bit four-channel sRGB format
 //!   (`RGBA8Unorm_sRGB`, `BGRA8Unorm_sRGB`) through a view of the attachment in `R32_UINT`
 //!   (`StorageView::uint_view`), whose bytes the function converts by Metal's measured conversions
@@ -688,6 +695,12 @@ pub struct StorageView {
     /// `R8_UNORM`'s, a texel read from the image, `(r, 0, 0, 1)`, is Metal's `(0, 0, 0, r)`, and a
     /// texel written to it holds Metal's alpha in red ([`metal_order`], [`image_order`]).
     pub alpha_in_red: bool,
+    /// The code bits (8 or 10) of a 4:4:4 two-plane YCbCr code-format attachment
+    /// (`color_writes::ycbcr_code_fetched`), whose image is the texture's render shadow,
+    /// `R32G32B32A32_SFLOAT` of the pass's floats: a read takes red, green and blue to the `half`
+    /// Metal's tile holds and alpha to 1 (`texel_round::code_tile`), and a write stores the output's
+    /// floats. `None` for another format.
+    pub codes: Option<u32>,
 }
 
 impl StorageView {
@@ -988,11 +1001,20 @@ pub(crate) fn storage_form(
     let alpha_in_red = emulation == FormatEmulation::AlphaInRed
         && crate::metal::format::alpha_in_red(pf, p)
         && word.is_none();
+    // A 4:4:4 code-format attachment renders into its texture's render shadow, the pass's floats,
+    // which a read takes to Metal's tile of halves: its store is matched for writes of red, green
+    // and blue together (`metal::format::ycbcr_renders`), so not a merge of some of them.
+    let codes = crate::pipeline::color_writes::ycbcr_code_fetched(pf)
+        .filter(|_| emulation == FormatEmulation::YCbCrRendered);
     // An unblended write of every channel stores Metal's write of the output. A padded 10-bit
     // attachment's tile value and blends are not measured: no storage form.
     let not_modelled = inputs.amplified
         || extended.is_some_and(ExtendedRange::padded)
-        || (emulation != FormatEmulation::Direct && extended.is_none() && !alpha_in_red)
+        || (emulation != FormatEmulation::Direct
+            && extended.is_none()
+            && !alpha_in_red
+            && codes.is_none())
+        || (codes.is_some() && merged)
         || (extended.is_some()
             && stores
             && !shader_blends
@@ -1099,6 +1121,7 @@ pub(crate) fn storage_form(
             rgba_view,
             word,
             alpha_in_red,
+            codes,
         })),
         _ => {
             // A BGRA-order format no declaration reaches, whose RGBA-order twin lacks something
@@ -1634,6 +1657,16 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                         .alpha_in_red_colors
                         .insert(color);
                 }
+                // A code-format attachment's render shadow is read as Metal's tile of halves; the
+                // interface records the attachment and its bits, which link holds the pipeline's
+                // to (`color_writes::check`).
+                if let Some(bits) = view.codes {
+                    cx.families
+                        .stage_io
+                        .interface
+                        .ycbcr_code_fetches
+                        .insert(color, bits);
+                }
                 cx.facts.insert(RuntimeFact::InterlockedFramebufferFetch {
                     color,
                     format: view.format,
@@ -1770,6 +1803,11 @@ pub(super) fn select_read(cx: &mut SelectCx<'_>, c: ColorInput) -> Result<(), Er
     // An sRGB texel decodes through Metal's twelve-bit table.
     if sc.view.uint_view.is_some() {
         cx.families.arith.srgb.get_or_insert(PackDir::Unpack);
+    }
+    // No probe has read a code-format attachment through fetch on a Mac.
+    if sc.view.codes.is_some() {
+        cx.precision
+            .insert(PrecisionNote::UnmeasuredCodeFormatFetch);
     }
     plan_sample(cx)?;
     let coord = stage_io::frag_coord(cx);
@@ -2050,6 +2088,8 @@ pub(super) fn words(cx: &SelectCx<'_>, uses: u64, rets: u64) -> u64 {
         .count() as u64;
     // An alpha-in-red image's read moves its red to alpha, and its write alpha to red.
     let moved = fetch.values().filter(|sc| sc.view.alpha_in_red).count() as u64;
+    // A code-format attachment's read rounds three channels to `half` and sets alpha.
+    let coded = fetch.values().filter(|sc| sc.view.codes.is_some()).count() as u64;
     let read = match (
         fetch.values().any(|sc| sc.view.extended.is_some()),
         fetch.values().any(|sc| sc.view.uint_view.is_some()),
@@ -2059,7 +2099,8 @@ pub(super) fn words(cx: &SelectCx<'_>, uses: u64, rets: u64) -> u64 {
         (false, false) => READ,
     }
     .saturating_add(EXCHANGE.saturating_mul(exchanged))
-    .saturating_add(super::color::ALPHA_IN_RED_WORDS.saturating_mul(moved));
+    .saturating_add(super::color::ALPHA_IN_RED_WORDS.saturating_mul(moved))
+    .saturating_add(super::color::CODE_TILE_WORDS.saturating_mul(coded));
     // An sRGB attachment's write encodes four channels (three through Metal's thresholds),
     // reorders its bytes, and merges kept ones from the texel it reads first.
     let srgb_writes = fetch
@@ -2348,20 +2389,22 @@ pub(super) fn value(
         Some(held) => held,
         None => read_texel(cx, fb, c.color, &sc)?,
     };
-    let texel = match (sc.view.extended, sc.view.uint_view) {
-        (Some(_), _) if sc.shadowed => texel,
-        (Some(form), _) => {
+    let texel = match (sc.view.extended, sc.view.uint_view, sc.view.codes) {
+        (Some(_), _, _) if sc.shadowed => texel,
+        (Some(form), _, _) => {
             let table = crate::lower::texture::extended_table(cx, form)?;
             extended_range::tile_value(fb, form, texel, table)?
         }
-        (None, Some(_)) => {
+        (None, Some(_), _) => {
             let Some(table) = cx.decl.families.arith.srgb else {
                 return Err(cx.fail("an sRGB storage read without Metal's table"));
             };
             let word = fb.composite_extract(texel, &[0])?;
             srgb_decode(fb, sc.view.format, word, table)?
         }
-        (None, None) => as_held(fb, texel, sc.view.numeric)?,
+        // The render shadow's floats, as Metal's tile of halves holds them.
+        (None, None, Some(bits)) => crate::lower::arith::texel_round::code_tile(fb, texel, bits)?,
+        (None, None, None) => as_held(fb, texel, sc.view.numeric)?,
     };
     let x = match c.form.lanes {
         4 => texel,

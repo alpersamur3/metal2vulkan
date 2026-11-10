@@ -405,6 +405,21 @@ pub struct LoweringInputs {
     /// Empty for any other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub srgb_fetches: BTreeSet<u32>,
+    /// The color attachments the fragment function reads (`[[color(n)]]`) that its render
+    /// pipeline gives a 4:4:4 two-plane YCbCr code format (`RGB8_444_2P`, `RGB10_444_2P`), by
+    /// color index, with the format's code bits (8 or 10). A pass renders such an attachment into
+    /// the texture's render shadow, `R32G32B32A32_SFLOAT` of the function's floats
+    /// (`metal::format::FormatEmulation::YCbCrRendered`), where Metal's tile holds each channel
+    /// as a `half`: a read through the input attachment takes the texel's red, green and blue
+    /// each to a `half`, to nearest even at 8 bits and toward zero at 10 (the rounding of
+    /// Metal's pass store), and alpha 1, the format having none
+    /// (`lower::fragment::color`). The interlocked storage form reads the same rule from the
+    /// attachment's format itself and takes nothing from this. `Device::compile_render_pipeline`
+    /// sets it for a `Function` fragment stage from the pipeline's color attachments, and link
+    /// refuses a fragment compiled under another map than the pipeline's as
+    /// `NeedsInput(ColorWrites)`. Empty for any other function.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ycbcr_code_fetches: BTreeMap<u32, u32>,
     /// Color attachments of the pass the fragment function's render pipeline has no pixel
     /// format for, the pass's pixel format of each by color index
     /// (`VariantKey::zeroed_colors`): plain Metal stores zero bytes into each at every sample a

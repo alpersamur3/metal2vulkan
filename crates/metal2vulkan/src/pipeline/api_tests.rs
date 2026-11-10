@@ -395,6 +395,7 @@ mod serde_round_trips {
                     .expect("a word layout"),
             )]),
             srgb_fetches: BTreeSet::from([0, 2]),
+            ycbcr_code_fetches: BTreeMap::from([(1, 8), (3, 10)]),
             zeroed_colors: BTreeMap::from([(2, metal::PixelFormat::RGBA32Sint)]),
             dropped_colors: BTreeSet::from([3]),
             kept_imageblock_bytes: Some(12),

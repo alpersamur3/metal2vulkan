@@ -172,6 +172,7 @@ mod ycbcr_image;
 pub(crate) use attached_reads::feedback_candidate;
 pub use shared::SharedTextureHandle;
 pub use wrapped::{VkImageLayouts, WrappedImageProblem};
+pub(crate) use ycbcr_image::ycbcr_code_loaded;
 
 /// What a device's textures share: the format facts their images are planned from, and how an
 /// image is placed in a memory block, apart from linear resources (and, on a driver that needs

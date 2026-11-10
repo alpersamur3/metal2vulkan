@@ -5570,3 +5570,228 @@ fn a_snapshot_read_plans_its_variant_where_the_pipeline_can() {
     }
     assert!(planned >= 4, "the interlocked profiles");
 }
+
+/// A 4:4:4 two-plane YCbCr code-format attachment (`RGB8_444_2P`, `RGB10_444_2P`) read through
+/// an input attachment (`LoweringInputs::ycbcr_code_fetches`) on every committed profile that
+/// reads fetched colors so: the stage reads the render shadow's floats as Metal's tile of halves
+/// (`texel_round::code_tile`, whose rounding `lower::arith`'s interpreter tests check), records the
+/// attachment and its bits in its interface and the unmeasured note, keys apart from a plain read,
+/// and passes L3; the two widths round differently; an integer read of such an attachment is
+/// Metal's pipeline error; and the encoded artifact decodes to itself.
+#[test]
+fn a_code_format_input_attachment_reads_metals_tile_of_halves() {
+    let Some(bc) = fixture("fragment_fetch") else {
+        return;
+    };
+    let mut checked = 0;
+    for (stem, p) in committed_profiles().expect("profiles") {
+        if !p.fields().fragment.rasterization_order_color_access {
+            continue;
+        }
+        let plain = compile_with(&bc, "fetch_ordered", &p, &LoweringInputs::new())
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert!(plain.interface.io.ycbcr_code_fetches.is_empty(), "{stem}");
+        assert!(
+            !plain
+                .precision
+                .contains(&PrecisionNote::UnmeasuredCodeFormatFetch),
+            "{stem}"
+        );
+        let mut modules = Vec::new();
+        for bits in [8, 10] {
+            let mut inputs = LoweringInputs::new();
+            inputs.ycbcr_code_fetches = std::collections::BTreeMap::from([(0, bits)]);
+            let a = compile_with(&bc, "fetch_ordered", &p, &inputs)
+                .unwrap_or_else(|e| panic!("{stem} {bits}: {e}"));
+            link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem} {bits}: L3: {e}"));
+            assert_eq!(attachments(&a), [0], "{stem} {bits}");
+            assert_eq!(
+                a.interface.io.ycbcr_code_fetches,
+                std::collections::BTreeMap::from([(0, bits)]),
+                "{stem} {bits}"
+            );
+            assert!(
+                a.precision
+                    .contains(&PrecisionNote::UnmeasuredCodeFormatFetch),
+                "{stem} {bits}"
+            );
+            assert_ne!(a.key, plain.key, "{stem} {bits}: the inputs key the stage");
+            // `f32_to_half` of four lanes, the splat of 1 and the shuffle around the read.
+            assert!(
+                a.module.words.len() > plain.module.words.len() + 50,
+                "{stem} {bits}: {} words against {}",
+                a.module.words.len(),
+                plain.module.words.len()
+            );
+            modules.push(a.module.words.clone());
+        }
+        assert_ne!(modules[0], modules[1], "{stem}: 8 and 10 bits round alike");
+        // `fetch_blend` reads color 1 as `uint4`: of a code format, Metal's pipeline error.
+        let mut inputs = LoweringInputs::new();
+        inputs.ycbcr_code_fetches = std::collections::BTreeMap::from([(1, 8)]);
+        let integer = compile_with(&bc, "fetch_blend", &p, &inputs);
+        assert!(
+            matches!(
+                integer,
+                Err(Error::InvalidDescriptor(
+                    crate::error::DescriptorError::ColorAttachment { index: 1 }
+                ))
+            ),
+            "{stem}: {:?}",
+            integer.map(|_| ())
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no profile reads through input attachments");
+    // The encoding carries the attachment and the note.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../metal2vulkan-validation/profiles/lavapipe.json");
+    let text = std::fs::read_to_string(path).expect("profile");
+    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+    let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+    let fd = FunctionDescriptor::new(
+        Library::from_air(&bc)
+            .expect("library")
+            .function("fetch_ordered")
+            .expect("function"),
+    );
+    let mut inputs = LoweringInputs::new();
+    inputs.ycbcr_code_fetches = std::collections::BTreeMap::from([(0, 10)]);
+    let c = dev
+        .compile_function(&fd, &inputs, &Budget::standard())
+        .expect("compiled");
+    let back = crate::library::CompiledFunction::from_bytes(&c.to_bytes(), &dev).expect("decoded");
+    assert_eq!(back, c);
+    assert_eq!(
+        back.artifact().interface.io.ycbcr_code_fetches,
+        std::collections::BTreeMap::from([(0, 10)])
+    );
+    assert!(back
+        .artifact()
+        .precision
+        .contains(&PrecisionNote::UnmeasuredCodeFormatFetch));
+}
+
+/// The iOS 26 pipeline: color 0 `RGB8_444_2P` unblended under a full mask, color 1 `RG16Float`
+/// under no mask, color 2 `BGRA8Unorm`, a fragment reading `[[color(0)]]`. Made on `lavapipe`
+/// (input attachments) and on `moltenvk-m3` (the interlock's storage form), each with its 10-bit
+/// twin `RGB10_444_2P`: its fragment records the unmeasured note and rounds the read (more words
+/// than the same pipeline's over `RGBA32Float`). A converted 4:4:4 format's fetch stays refused
+/// (`NotImplemented`: `Format` at link, `FramebufferFetch` in the interlock, whose storage form
+/// does not model it), and a fragment compiled without the attachment in its inputs is
+/// refused for its color writes, as any stage compiled for another pipeline.
+#[test]
+fn the_ios26_code_format_fetching_pipeline_is_made_in_both_forms() {
+    let (Some(bc), Some(io)) = (fixture("fragment_fetch"), fixture("stage_io")) else {
+        return;
+    };
+    let device = |stem: &str| {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../metal2vulkan-validation/profiles")
+            .join(format!("{stem}.json"));
+        let text = std::fs::read_to_string(path).expect("profile");
+        let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+        Device::new(desc, DevicePolicy::default()).expect("device")
+    };
+    let function = |bc: &[u8], name: &str| {
+        FunctionDescriptor::new(
+            Library::from_air(bc)
+                .expect("library")
+                .function(name)
+                .expect("function"),
+        )
+    };
+    let descriptor = |pf: PixelFormat, fragment: StageSource| {
+        let mut d = RenderPipelineDescriptor::new(StageSource::Function(function(
+            &io,
+            "stage_io_vertex_position",
+        )));
+        d.fragment = Some(fragment);
+        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
+        let mut unwritten = ColorAttachmentDescriptor::new(PixelFormat::RG16Float);
+        unwritten.write_mask = crate::metal::ColorWriteMask::NONE;
+        d.color_attachments[1] = Some(unwritten);
+        d.color_attachments[2] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
+        d
+    };
+    let fragment_of = |a: &crate::pipeline::artifact::RenderPipeline| {
+        a.stages
+            .iter()
+            .find(|s| s.stage == vk::ShaderStage::FRAGMENT)
+            .map(|s| (s.spirv.len(), s.precision_notes.clone()))
+            .expect("a fragment stage")
+    };
+    for stem in ["lavapipe", "moltenvk-m3"] {
+        let dev = device(stem);
+        // `fetch_ordered` reads `float4 [[color(0)]]` (in a raster order group), as iOS 26's
+        // fragment reads its color 0; the link refuses `fetch_scalar`'s scalar read of a
+        // four-channel attachment (`InvalidDescriptor`).
+        {
+            let entry = "fetch_ordered";
+            let fetching = || StageSource::Function(function(&bc, entry));
+            let float = dev
+                .compile_render_pipeline(
+                    &descriptor(PixelFormat::RGBA32Float, fetching()),
+                    &Budget::standard(),
+                )
+                .unwrap_or_else(|e| panic!("{stem} {entry} RGBA32Float: {e}"));
+            let (float_words, float_notes) = fragment_of(&float);
+            assert!(
+                !float_notes.contains(&PrecisionNote::UnmeasuredCodeFormatFetch),
+                "{stem} {entry}"
+            );
+            for pf in [PixelFormat::RGB84442P, PixelFormat::RGB104442P] {
+                let a = dev
+                    .compile_render_pipeline(&descriptor(pf, fetching()), &Budget::standard())
+                    .unwrap_or_else(|e| panic!("{stem} {entry} {pf:?}: {e}"));
+                let (words, notes) = fragment_of(&a);
+                assert!(
+                    notes.contains(&PrecisionNote::UnmeasuredCodeFormatFetch),
+                    "{stem} {entry} {pf:?}: {notes:?}"
+                );
+                assert!(
+                    words > float_words + 50,
+                    "{stem} {entry} {pf:?}: {words} words against {float_words}"
+                );
+            }
+            // A converted format's input attachment is refused at link (`Format`); in the
+            // interlock its storage form is not modelled (`FramebufferFetch`).
+            let feature = match stem {
+                "lavapipe" => Feature::Format,
+                _ => Feature::FramebufferFetch,
+            };
+            for pf in [PixelFormat::YCBCR84442P, PixelFormat::YCBCR104442P] {
+                let refused =
+                    dev.compile_render_pipeline(&descriptor(pf, fetching()), &Budget::standard());
+                assert!(
+                    matches!(
+                        refused,
+                        Err(Error::Unsupported(ref u)) if u.feature == feature
+                    ),
+                    "{stem} {entry} {pf:?}: {:?}",
+                    refused.map(|_| ())
+                );
+            }
+        }
+        // A fragment compiled alone, without the attachment's bits in its inputs (through input
+        // attachments: the interlock's storage form needs the pipeline's state to compile at all,
+        // `NeedsInput(FramebufferFetch)`).
+        let alone = dev.compile_function(
+            &function(&bc, "fetch_ordered"),
+            &LoweringInputs::new(),
+            &Budget::standard(),
+        );
+        let alone = match (stem, alone) {
+            ("lavapipe", Ok(alone)) => alone,
+            ("moltenvk-m3", Err(Error::NeedsInput(RuntimeInput::FramebufferFetch))) => continue,
+            (_, other) => panic!("{stem}: the fragment alone: {:?}", other.map(|_| ())),
+        };
+        let d = descriptor(PixelFormat::RGB84442P, StageSource::Compiled(alone));
+        let refused = dev.compile_render_pipeline(&d, &Budget::standard());
+        assert!(
+            matches!(refused, Err(Error::NeedsInput(RuntimeInput::ColorWrites))),
+            "{stem}: {:?}",
+            refused.map(|_| ())
+        );
+    }
+}

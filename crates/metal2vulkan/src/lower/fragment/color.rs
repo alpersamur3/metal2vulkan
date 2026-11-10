@@ -58,6 +58,20 @@
 //! interface records the color (`StageIo::alpha_in_red_colors`), which link holds the pipeline's
 //! to.
 //!
+//! **A 4:4:4 two-plane YCbCr code-format attachment** (`RGB8_444_2P`, `RGB10_444_2P`,
+//! `LoweringInputs::ycbcr_code_fetches`) renders into the texture's render shadow, an
+//! `R32G32B32A32_SFLOAT` image of the floats the pass leaves in each texel (the function's output,
+//! a clear, or a loaded texel's `code / (2^b - 1)`), where Metal's tile holds each channel as a
+//! `half` (to nearest even at 8 bits, toward zero at 10: measured through the formats' pass
+//! stores on an Apple M3 Max under macOS 27.0.1, probe `ycp`; this tree's store, `bind::ycbcr_write`,
+//! still codes the float itself). Its input attachment reads the shadow's floats, and the read takes
+//! red, green and blue each to that `half` (`texel_round::code_tile`) and alpha to 1, the format
+//! having none; the storage form reads the same ([`fetch`](super::fetch)). The interface records the
+//! color and its bits (`StageIo::ycbcr_code_fetches`), which link holds the pipeline's to. No probe
+//! has read these formats through framebuffer fetch on a Mac, so the stage records
+//! `PrecisionNote::UnmeasuredCodeFormatFetch`. The converted YCbCr formats' fetch stays refused at
+//! link (`NotImplemented(Format)`).
+//!
 //! A color input in a raster order group is read like any other: the family runs the whole body
 //! inside the interlock, and the read's ordering against other fragments' color writes is still the
 //! ordering policy's (the interlock orders shader invocations, not the attachment writes that
@@ -73,10 +87,12 @@ use crate::air::ir::{ArgIdx, TypeId as AirTypeId, Value};
 use crate::device::requirements::VkFeature;
 use crate::error::{Attachment, Capability, DescriptorError, Error, Feature, Unsupported};
 use crate::lower::arith::legal::{form_on, refuse_int64_interface};
+use crate::lower::arith::texel_round;
 use crate::lower::arith::{extended_range, math, narrow, ops, srgb, Form, Held};
 use crate::lower::emit::EmitCx;
 use crate::lower::select::SelectCx;
 use crate::metal::format::ExtendedRange;
+use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
@@ -108,6 +124,11 @@ pub struct ColorInput {
     /// The attachment's image holds Metal's alpha in red (`LoweringInputs::alpha_in_red_colors`,
     /// `A8Unorm` in `R8_UNORM`): a read, `(r, 0, 0, 1)` from the image, is Metal's `(0, 0, 0, r)`.
     pub alpha_red: bool,
+    /// The code bits (8 or 10) of a 4:4:4 two-plane YCbCr code-format attachment
+    /// (`LoweringInputs::ycbcr_code_fetches`), whose render shadow holds the pass's floats: an
+    /// input attachment's read takes them to Metal's tile of halves (`texel_round::code_tile`). `None` for
+    /// another format.
+    pub codes: Option<u32>,
 }
 
 /// An upper estimate of the words one input attachment declares (type, variable, decorations).
@@ -172,6 +193,7 @@ pub(super) fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<Co
         extended: extended.map(|e| e.form),
         srgb: cx.inputs.srgb_fetches.contains(&color),
         alpha_red: cx.inputs.alpha_in_red_colors.contains(&color),
+        codes: cx.inputs.ycbcr_code_fetches.get(&color).copied(),
     };
     // The interlocked storage form `fetch::plan` chose.
     if super::fetch::is_storage(cx, color) {
@@ -250,6 +272,24 @@ pub(super) fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<Co
             .alpha_in_red_colors
             .insert(color);
     }
+    // A 4:4:4 code-format attachment's input reads its render shadow's floats, taken to Metal's
+    // tile of halves: a float (an integer read is Metal's pipeline error). The interface records
+    // the attachment, which link holds the pipeline's to (`color_writes::check`); no probe has
+    // read these formats through fetch, so the stage notes it.
+    if let Some(bits) = input.codes {
+        if !form.is_float() {
+            return Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+                index: color,
+            }));
+        }
+        cx.families
+            .stage_io
+            .interface
+            .ycbcr_code_fetches
+            .insert(color, bits);
+        cx.precision
+            .insert(PrecisionNote::UnmeasuredCodeFormatFetch);
+    }
     super::fetch::plan_sample(cx)?;
     Ok(input)
 }
@@ -321,6 +361,13 @@ pub(super) fn words(cx: &SelectCx<'_>, colors: &[ColorInput]) -> u64 {
     // An alpha-in-red attachment's read moves its red to alpha: a shuffle and its zero.
     let red: Vec<ColorInput> = colors.iter().filter(|c| c.alpha_red).copied().collect();
     let moves = self::uses(cx, &red);
+    // A code-format attachment's read rounds three channels to `half` and sets alpha.
+    let coded: Vec<ColorInput> = colors
+        .iter()
+        .filter(|c| c.codes.is_some())
+        .copied()
+        .collect();
+    let rounds = self::uses(cx, &coded);
     let mut attachments: Vec<u32> = colors.iter().map(|c| c.color).collect();
     attachments.sort_unstable();
     attachments.dedup();
@@ -330,6 +377,7 @@ pub(super) fn words(cx: &SelectCx<'_>, colors: &[ColorInput]) -> u64 {
         .saturating_add(u64::from(extended_range::DECODE_WORDS + 120).saturating_mul(decodes))
         .saturating_add(snap.saturating_mul(snaps))
         .saturating_add(ALPHA_IN_RED_WORDS.saturating_mul(moves))
+        .saturating_add(CODE_TILE_WORDS.saturating_mul(rounds))
 }
 
 /// An upper estimate of the words [`alpha_in_red`] adds: the shuffle, and the zero vector's
@@ -428,14 +476,16 @@ pub(super) fn value(
         return super::fetch::value(cx, fb, c);
     }
     let texel = input_texel(cx, fb, c.color)?;
-    let texel = match c.extended {
-        Some(form) => {
+    let texel = match (c.extended, c.codes) {
+        (Some(form), _) => {
             let table = crate::lower::texture::extended_table(cx, form)?;
             extended_range::tile_value(fb, form, texel, table)?
         }
+        // The render shadow's floats, as Metal's tile of halves holds them.
+        (None, Some(bits)) => texel_round::code_tile(fb, texel, bits)?,
         // The device's decode, snapped back to its byte by Metal's encode (every byte's exact
         // decode lies at least 4.9e-5 inside its code's encode interval), then Metal's decode.
-        None if c.srgb => {
+        (None, None) if c.srgb => {
             let Some(table) = cx.decl.families.arith.srgb else {
                 return Err(cx.fail("an sRGB input attachment read without Metal's table"));
             };
@@ -448,8 +498,8 @@ pub(super) fn value(
             math::unpack(fb, PackFormat::Unorm4x8Srgb, f4, byte, Some(table))?
         }
         // The image's red, Metal's alpha: `(0, 0, 0, r)`.
-        None if c.alpha_red => alpha_in_red(fb, texel)?,
-        None => texel,
+        (None, None) if c.alpha_red => alpha_in_red(fb, texel)?,
+        (None, None) => texel,
     };
     let x = match c.form.lanes {
         4 => texel,
@@ -474,6 +524,10 @@ pub(super) fn alpha_in_red(fb: &mut FunctionBuilder<'_>, texel: SValue) -> BResu
     let zero = fb.module().const_value(zero)?;
     fb.vector_shuffle(zero, texel, &[0, 1, 2, 4])
 }
+
+/// An upper estimate of the words `texel_round::code_tile` adds: `texel_round::f32_to_half` of
+/// four lanes (some fifty instructions and their constants), the splat of 1, and the shuffle.
+pub(super) const CODE_TILE_WORDS: u64 = 400;
 
 /// The texel of color `color`'s input attachment, as the image reads it: at the calling
 /// fragment's own texel, at the invocation's sample for a per-sample function.

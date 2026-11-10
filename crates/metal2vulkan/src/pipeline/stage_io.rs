@@ -232,6 +232,14 @@ pub struct StageIo {
     /// than the pipeline's (`NeedsInput(ColorWrites)`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub srgb_fetches: std::collections::BTreeSet<u32>,
+    /// The attachments of a 4:4:4 two-plane YCbCr code format the fragment function reads
+    /// (`[[color(n)]]`) through an input attachment (`LoweringInputs::ycbcr_code_fetches`), or
+    /// holds in the interlocked storage form, by color index with the format's code bits: each
+    /// read takes the render shadow's red, green and blue to the `half` Metal's tile holds (to
+    /// nearest even at 8 bits, toward zero at 10) and alpha 1. Link refuses a stage compiled for
+    /// another map than the pipeline's (`NeedsInput(ColorWrites)`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ycbcr_code_fetches: BTreeMap<u32, u32>,
     /// The attachments held with their channels rotated (`LoweringInputs::rotated_colors`) that
     /// the fragment function writes through an output variable of either dual-source index, by
     /// color index: each such output stores Metal's channels rotated

@@ -158,6 +158,9 @@ impl UlpTable {
 /// - `DeviceSampleLevel`: unbounded: another level or filter near a boundary reads other texels,
 ///   which differ from Metal's by up to the texture's range, and an LOD query answers the device's
 ///   level.
+/// - `UnmeasuredCodeFormatFetch`: unbounded until a Mac reads a 4:4:4 code format through
+///   framebuffer fetch: the read is the tile Metal was measured to hold (its `half`s), which no
+///   fetch has been measured to return.
 /// - `Fp8Value`: unbounded until a Metal device that implements 8-bit float conversions reads
 ///   them: Metal on Apple M3 returns the carrier byte's integer extension, which differs from the
 ///   format's value by any amount.
@@ -293,6 +296,7 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::UnmeasuredGroupSpeculation
         | N::NotMipmappedAnisotropicFilter
         | N::DeviceSampleLevel
+        | N::UnmeasuredCodeFormatFetch
         | N::Fp8Value
         | N::MultisamplePosition
         | N::RasterizationRateMap

@@ -1740,6 +1740,19 @@ pub enum PrecisionNote {
     /// another filter, than Metal's near a boundary, and the query answers the device's level.
     /// Validation derives no tolerance from it.
     DeviceSampleLevel,
+    /// A fragment function reads (`[[color(n)]]`) a color attachment of a 4:4:4 two-plane YCbCr
+    /// code format, `RGB8_444_2P` or `RGB10_444_2P`, through an input attachment or in the
+    /// interlocked storage form: a pass renders such an attachment into the texture's render
+    /// shadow, `R32G32B32A32_SFLOAT` of the function's floats, and the read takes each of the
+    /// texel's red, green and blue to a `half` (to nearest even at 8 bits, toward zero at 10, the
+    /// rounding Metal's pass store of these formats takes), and alpha 1, the format having none
+    /// (`lower::fragment::color`). That is the tile Metal's pass stores (an Apple M3 Max under macOS
+    /// 27.0.1: every byte of the code formats' draws, clears and loads), but no probe has read
+    /// one of these formats through framebuffer fetch on a Mac. **Residual:** a read may answer
+    /// another `half` than Metal's tile holds: the neighbouring one where Metal's tile rounds the
+    /// written `float` otherwise, and a loaded texel's `code / (2^b - 1)` rounded as a written
+    /// one. Nothing else in the stage changes. Validation derives no tolerance from it.
+    UnmeasuredCodeFormatFetch,
 }
 
 /// The math mode of an entry's module, which decides, on a device whose `float` functions are

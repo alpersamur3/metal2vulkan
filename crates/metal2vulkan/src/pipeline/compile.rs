@@ -1530,6 +1530,35 @@ pub(crate) fn attributes_read(
 }
 
 /// The color attachments the specialized fragment entry `spec` reads (`[[color(n)]]`) whose
+/// pixel format in `colors` is a 4:4:4 two-plane YCbCr code format, `RGB8_444_2P` or
+/// `RGB10_444_2P`, each with its code bits (`LoweringInputs::ycbcr_code_fetches`). Empty for any
+/// other stage.
+pub(crate) fn ycbcr_code_fetches(
+    spec: &air::Entry,
+    colors: &[Option<ColorAttachmentDescriptor>],
+) -> BTreeMap<u32, u32> {
+    if !matches!(spec.ep.stage, AbiStage::Fragment { .. }) {
+        return BTreeMap::new();
+    }
+    spec.ep
+        .params
+        .iter()
+        .filter_map(|b| match b.role {
+            ParamRole::ColorInput {
+                index: AbiInt::Const(color),
+                ..
+            } => Some(color),
+            _ => None,
+        })
+        .filter_map(|c| {
+            let a = colors.get(c as usize).copied().flatten()?;
+            let bits = crate::pipeline::color_writes::ycbcr_code_fetched(a.pixel_format)?;
+            Some((c, bits))
+        })
+        .collect()
+}
+
+/// The color attachments the specialized fragment entry `spec` reads (`[[color(n)]]`) whose
 /// pixel format in `colors` is `RGBA8Unorm_sRGB` or `BGRA8Unorm_sRGB`
 /// (`LoweringInputs::srgb_fetches`). Empty for any other stage.
 pub(crate) fn srgb_fetches(
@@ -1950,6 +1979,7 @@ fn lower_inputs(
                 unattached_colors_written(spec, d.color_attachments, d.alpha_to_coverage);
             out.framebuffer_fetch = fetch_inputs(spec, d, variant, p);
             out.srgb_fetches = srgb_fetches(spec, d.color_attachments);
+            out.ycbcr_code_fetches = ycbcr_code_fetches(spec, d.color_attachments);
             let read = raw_indices_read(spec);
             out.viewport_index_varying = written.viewport && read.viewport;
             out.render_target_array_index_varying = written.layer && read.layer;
