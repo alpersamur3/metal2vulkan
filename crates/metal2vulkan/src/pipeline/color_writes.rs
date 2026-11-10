@@ -363,10 +363,11 @@ fn metal_stored(c: &ColorAttachmentDescriptor) -> Option<[Option<ChannelWrite>; 
 /// has no attachment and is not color 0 under alpha to coverage, and the second outputs it writes
 /// for rotated attachments are the pipeline's ([`wanted_rotated_factors`]), and so are the forms of
 /// their blends ([`wanted_rotated_blends`]), and the attachments holding Metal's alpha in red it
-/// writes or reads are the pipeline's ([`wanted_alpha_in_red`]), and the pipeline takes the `half` outputs it computes
-/// at `float` precision as it compiled them ([`half_output_lanes_hold`]), and its texture writes
-/// that Metal's mode 2 stores otherwise compiled under the pipeline's `textureWriteRoundingMode`
-/// (`StageIo::texture_write_rounding`), else `NeedsInput(ColorWrites)`.
+/// writes or reads are the pipeline's ([`wanted_alpha_in_red`]), and so are the 4:4:4 code-format
+/// attachments it reads ([`wanted_ycbcr_code_fetches`]), and the pipeline takes the `half` outputs
+/// it computes at `float` precision as it compiled them ([`half_output_lanes_hold`]), and its
+/// texture writes that Metal's mode 2 stores otherwise compiled under the pipeline's
+/// `textureWriteRoundingMode` (`StageIo::texture_write_rounding`), else `NeedsInput(ColorWrites)`.
 pub(crate) fn check(
     fragment: Option<&FunctionArtifact>,
     colors: &[Option<ColorAttachmentDescriptor>],
@@ -384,6 +385,7 @@ pub(crate) fn check(
         && wanted_extended_range(fragment, colors, rounding) == io.extended_range_colors
         && wanted_word_colors(fragment, colors, alpha_to_coverage, p) == io.word_colors
         && wanted_srgb_fetches(fragment, colors) == io.srgb_fetches
+        && wanted_ycbcr_code_fetches(fragment, colors) == io.ycbcr_code_fetches
         && wanted_rotated(fragment, colors, p) == io.rotated_colors
         && wanted_alpha_in_red(fragment, colors, p) == io.alpha_in_red_colors
         && wanted_rotated_factors(fragment, colors, p) == io.rotated_factors
@@ -429,6 +431,49 @@ pub(crate) fn wanted_srgb_fetches(
                 .copied()
                 .flatten()
                 .is_some_and(|a| srgb_fetched(a.pixel_format))
+        })
+        .collect()
+}
+
+/// The bits of a fetched color attachment of `pf` read as Metal's tile of a 4:4:4 two-plane YCbCr
+/// code format (`LoweringInputs::ycbcr_code_fetches`): 8 for `RGB8_444_2P`, 10 for `RGB10_444_2P`,
+/// the code formats a pass renders through its render shadow
+/// (`metal::format::FormatEmulation::YCbCrRendered`), whose texels the shadow holds as the function's
+/// floats. `None` for every other format, the converted YCbCr formats among them, whose fetch is
+/// refused.
+pub fn ycbcr_code_fetched(pf: metal::PixelFormat) -> Option<u32> {
+    let f = metal::format::ycbcr_format(pf)?;
+    (metal::format::ycbcr_renders(pf)
+        && f.reads == metal::format::YCbCrReads::Codes
+        && f.subsampling == metal::format::ChromaSubsampling::Chroma444)
+        .then_some(f.bits)
+}
+
+/// The attachments `fragment` reads through an input attachment or in the interlocked storage
+/// form (`RuntimeFact::InterlockedFramebufferFetch`) whose pixel format in `colors` is a 4:4:4
+/// code format ([`ycbcr_code_fetched`]), by color index with its bits: the map the function must
+/// have compiled under (`StageIo::ycbcr_code_fetches`).
+pub(crate) fn wanted_ycbcr_code_fetches(
+    fragment: &FunctionArtifact,
+    colors: &[Option<ColorAttachmentDescriptor>],
+) -> BTreeMap<u32, u32> {
+    let inputs = fragment
+        .interface
+        .descriptors
+        .iter()
+        .filter_map(|d| match d.slot.kind {
+            crate::pipeline::sym::ResourceKind::InputAttachment(color) => Some(color),
+            _ => None,
+        });
+    let interlocked = fragment.facts.iter().filter_map(|f| match *f {
+        RuntimeFact::InterlockedFramebufferFetch { color, .. } => Some(color),
+        _ => None,
+    });
+    inputs
+        .chain(interlocked)
+        .filter_map(|c| {
+            let a = colors.get(c as usize).copied().flatten()?;
+            Some((c, ycbcr_code_fetched(a.pixel_format)?))
         })
         .collect()
 }

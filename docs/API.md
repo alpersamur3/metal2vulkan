@@ -2550,6 +2550,16 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   `Invariant`; Vulkan promises no more across pipelines of other fragment modules and attachments.
   Groups past the first may differ at discard or depth edges if the driver compiles the variants
   differently.
+- `metal2vulkan-degrade-unmeasured-code-format-fetch` (precision).
+  `PrecisionNote::UnmeasuredCodeFormatFetch`: A fragment function reads a color attachment of a
+  4:4:4 two-plane YCbCr code format (`RGB8_444_2P`, `RGB10_444_2P`) through framebuffer fetch, as
+  an input attachment or in the pixel interlock. The attachment renders into its texture's render
+  shadow, `R32G32B32A32_SFLOAT` of the pass's floats, and the read takes red, green and blue each
+  to the `half` Metal's tile holds (to nearest even at 8 bits, toward zero at 10, measured through
+  these formats' pass stores on an Apple M3 Max) and alpha to 1, the format having none; a texel
+  the pass loaded reads its code over `2^b - 1` rounded so. No probe has read these formats through
+  fetch on a Mac, so a read may differ from Metal's by the neighbouring `half` or by what Metal's
+  tile holds for a loaded code. Validation derives no tolerance for it.
 
 - `metal2vulkan-degrade-depth-twin-comparison` (retired). Replaced by
   metal2vulkan-degrade-device-depth-comparison and, on a device without

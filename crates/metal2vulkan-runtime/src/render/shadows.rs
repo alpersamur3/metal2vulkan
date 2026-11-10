@@ -58,7 +58,7 @@ use crate::render_pass::{ColorTarget, PassLayout, Target};
 use crate::render_target;
 use crate::render_values::{LoadAction, StoreAction};
 use crate::resource::ResourceKey;
-use crate::shadow::{self, ShadowCopy, ShadowTarget, ShadowUse, Within};
+use crate::shadow::{self, ShadowCopy, ShadowUse, Within};
 use crate::tracker::{Access, Use, UseRange};
 use crate::work_counts::{ColorTaken, Counters};
 use ash::vk;
@@ -447,8 +447,7 @@ fn attachment_shadows(
         let own = color.stand_in.as_ref().map(|s| &s.own);
         for target in std::iter::once(&color.target).chain(own) {
             if let Some(copies) = target.texture.shadow() {
-                let plain = matches!(copies.target(), Some(ShadowTarget::Image { .. }));
-                if untouched && plain && !copies.drops_writes {
+                if untouched && copies.left_untouched() {
                     continue;
                 }
                 let used = ShadowUse {
@@ -565,9 +564,8 @@ fn count_colors(
             continue;
         };
         let take = color_take(layout, index, color, reached, drawn);
-        let plain = matches!(copies.target(), Some(ShadowTarget::Image { .. }));
         let taken = match color.load {
-            _ if take.untouched && plain && !copies.drops_writes => ColorTaken::Untouched,
+            _ if take.untouched && copies.left_untouched() => ColorTaken::Untouched,
             _ if take.overwrites => ColorTaken::Cleared,
             LoadAction::Clear => ColorTaken::ClearedInPart,
             _ if take.area.is_some() => ColorTaken::LoadedWithin,

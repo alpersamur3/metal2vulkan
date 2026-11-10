@@ -126,7 +126,10 @@
 //!   again at their next use, and a command writing the planes two ways is refused, as no merge
 //!   serves the planes. A pass's color attachment of such a texture renders into its render shadow,
 //!   a texture whose shadow is one of these over floats: its copy back stores every texel's codes,
-//!   the marks not read.
+//!   the marks not read. A 4:4:4 code format's render shadow is copied in by a load instead of the
+//!   clear, every texel the floats of its planes' codes (`YCbCrWriteBack::loads`), which its copy
+//!   back stores as the same codes; a pass that loads it and reaches no tile takes no copy
+//!   ([`ShadowCopies::left_untouched`]).
 //! - **Two planes in a heap** (`texture/heap_two_planes.rs`): a heap's one-level 2D two-plane
 //!   extended-range texture is an image of its texels whose truth is its two planes in the heap's
 //!   bytes, as Metal lays them ([`ShadowTarget::Planes`]): its copies go through a staging buffer
@@ -556,6 +559,23 @@ impl ShadowCopies {
             self.source,
             ShadowSource::Converted { .. } | ShadowSource::YCbCrWrite { .. }
         )
+    }
+
+    /// Whether a render pass that loads the shadow's texture as an attachment, stores or leaves
+    /// it, and reaches no tile takes no use of the shadow, neither copy (`render/shadows.rs`): a
+    /// buffer's bytes in their own image ([`ShadowTarget::Image`]) whose writes reach the bytes,
+    /// whose load and store write back what they read; and a 4:4:4 code format's render shadow,
+    /// whose copy in loads the floats of the planes' codes and whose copy back stores the same
+    /// codes ([`YCbCrWriteBack::loads`]), Metal storing no tile of such a pass.
+    pub(super) fn left_untouched(&self) -> bool {
+        match &self.source {
+            ShadowSource::Bytes {
+                target: ShadowTarget::Image { .. },
+                ..
+            } => !self.drops_writes,
+            ShadowSource::YCbCrWrite { write_back, .. } => write_back.loads(),
+            _ => false,
+        }
     }
 
     /// The shadow of a buffer's bytes, or `None` for an image's and for converted texels'.
@@ -1042,7 +1062,12 @@ impl ShadowCopy {
                 self.copies.target(),
                 Some(ShadowTarget::Rotated { .. } | ShadowTarget::Planes { .. })
             );
-        let converted = matches!(self.copies.source, ShadowSource::Converted { .. });
+        let converted = match &self.copies.source {
+            ShadowSource::Converted { .. } => true,
+            // A code format's render shadow is loaded by a conversion too.
+            ShadowSource::YCbCrWrite { write_back, .. } => write_back.loads(),
+            _ => false,
+        };
         let encoded = matches!(self.copies.source, ShadowSource::YCbCrWrite { .. });
         match self.step {
             Step::Merge(_) => {
@@ -1086,6 +1111,10 @@ impl ShadowCopy {
         }
         if let ShadowSource::YCbCrWrite { write_back, .. } = &c.source {
             return match &self.step {
+                // A load of every texel from the planes' codes.
+                Step::Into if write_back.loads() => {
+                    write_back.load_uses(Use::reads(truth, c.tracked, range, read), c)
+                }
                 // A clear of every texel: nothing of the truth is read.
                 Step::Into => vec![Use::writes(
                     c.shadow_key,
@@ -1164,7 +1193,10 @@ impl ShadowCopy {
                 write_back,
                 ..
             } => {
-                if into_shadow {
+                if into_shadow && write_back.loads() {
+                    // SAFETY: the caller's contract, which the load's record takes.
+                    unsafe { write_back.record_load(device, command_buffer, buffer.raw()) };
+                } else if into_shadow {
                     let range = vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,

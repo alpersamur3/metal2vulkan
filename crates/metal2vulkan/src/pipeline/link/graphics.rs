@@ -544,10 +544,14 @@ pub fn graphics_state(
             // so: not modelled. (One holding Metal's alpha in red is read as Metal's alpha by a
             // stage compiled for it, `StageIo::alpha_in_red_colors`, which
             // `color_writes::check` holds to the pipeline's.)
-            // Nor is a two-plane YCbCr attachment's, whose texels Metal holds as halves and the
-            // attachment as the function's floats.
+            // Nor is a converted two-plane YCbCr attachment's, whose texels Metal holds as halves
+            // and the attachment as the function's floats. A 4:4:4 code format's is read as
+            // Metal's tile of halves by a stage compiled for it (`StageIo::ycbcr_code_fetches`,
+            // which `color_writes::check` holds to the pipeline's), not measured on a Mac
+            // (`PrecisionNote::UnmeasuredCodeFormatFetch`).
+            let code_fetched = color_writes::ycbcr_code_fetched(attachment.pixel_format).is_some();
             if metal::format::rotated_channels(attachment.pixel_format)
-                || metal::format::ycbcr_renders(attachment.pixel_format)
+                || (metal::format::ycbcr_renders(attachment.pixel_format) && !code_fetched)
                 || metal::format::ycbcr_pass_refused(attachment.pixel_format)
             {
                 let refused = Unsupported::not_implemented(Feature::Format);

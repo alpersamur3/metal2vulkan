@@ -1074,6 +1074,7 @@ codec_struct! {
         half_output_lanes, texture_write_rounding, uniform_outputs, uniform_inputs,
         instanced_attributes, selected_colors, half_blend_colors, half_fast_colors,
         float_blend_colors, zero_indices, color_group, word_colors, alpha_in_red_colors,
+        ycbcr_code_fetches,
     }
     ColorGroup { present, width, group }
     WordField { shift, bits }
@@ -1395,6 +1396,7 @@ codec_enum! {
         UnmeasuredGroupSpeculation,
         NotMipmappedAnisotropicFilter,
         DeviceSampleLevel,
+        UnmeasuredCodeFormatFetch,
     }
     BindingSource {
         Buffer(f0), Texture(f0), Sampler(f0), CombinedTextureSampler { texture, sampler },

@@ -2,8 +2,9 @@
 //! measured to follow and against Metal's own reads of our probes' surfaces.
 
 use super::{
-    srgb_step, typed_module, ycbcr_read, ycbcr_texel, YCbCrCodes, YCbCrConvertModule, YCbCrMatrix,
-    YCbCrOutput, YCbCrPlanes, YCbCrRange, BYTES, IMAGE, SHAPE, SRGB_KNOTS,
+    srgb_step, typed_module, typed_module_of, ycbcr_read, ycbcr_texel, YCbCrCodes,
+    YCbCrConvertModule, YCbCrMatrix, YCbCrOutput, YCbCrPlanes, YCbCrRange, BYTES, IMAGE, SHAPE,
+    SRGB_KNOTS,
 };
 use crate::metal::format::{ycbcr_format, ChromaSubsampling};
 use crate::metal::PixelFormat;
@@ -1260,4 +1261,99 @@ fn the_srgb_knots_are_the_curves() {
     assert_eq!(srgb_step(8), 0);
     assert_eq!(srgb_step(24), 2);
     assert_eq!(srgb_step(8192), 8192);
+}
+
+/// The floats module (`ycbcr_convert_floats_module`) of every output is valid on every committed
+/// profile.
+#[test]
+fn the_ycbcr_floats_kernels_are_valid_on_every_committed_profile() {
+    for (_, p) in committed_profiles().expect("profiles") {
+        for output in [
+            YCbCrOutput::Converted,
+            YCbCrOutput::Codes,
+            YCbCrOutput::Srgb,
+        ] {
+            assert_valid(typed_module_of(output, true).expect("module"), &p);
+        }
+    }
+}
+
+/// The floats module of the 4:4:4 code formats (`RGB8_444_2P`, `RGB10_444_2P`), which a loaded
+/// render shadow is filled with: every texel `[Cr, Y, Cb] / (2^b - 1)` and alpha 1, both
+/// invocation orders alike, and the pass's store (`round(clamp(v, 0, 1) · (2^b - 1))`) takes each
+/// float back to its code. Every code of each width appears as luma, Cb and Cr.
+#[test]
+fn the_floats_kernel_loads_each_code_over_its_maximum() {
+    for pf in [PixelFormat::RGB84442P, PixelFormat::RGB104442P] {
+        let codes = codes_of(pf);
+        assert_eq!(codes.output, YCbCrOutput::Codes);
+        let max = codes.max();
+        let n = max + 1;
+        // A row of `w` texels a code each, `h` rows covering every code.
+        let w = 64u32;
+        let h = n.div_ceil(w);
+        let code = |x: u32, y: u32, k: u32| ((y * w + x) * (2 * k + 1) + 7 * k) % n;
+        let rows = [
+            row_bytes(codes, w).next_multiple_of(16),
+            row_bytes(codes, 2 * w).next_multiple_of(16),
+        ];
+        let surface = Surface::new(
+            [w, h],
+            32,
+            rows,
+            (CONVERSIONS[1], codes),
+            &|x, y| code(x, y, 0) as u16,
+            &|x, y| [code(x, y, 1) as u16, code(x, y, 2) as u16],
+        );
+        let m = typed_module_of(YCbCrOutput::Codes, true).expect("module");
+        let groups = [w, h].map(|n| n.div_ceil(YCbCrConvertModule::LOCAL_SIZE));
+        let mut runs = Vec::new();
+        for order in [Order::Forward, Order::Reverse] {
+            let part = |slot, bytes: Vec<u8>| Buffer {
+                slot: Some(slot),
+                address: None,
+                bytes,
+            };
+            let shape = YCbCrConvertModule::shape(&surface.planes);
+            let res = Resources {
+                buffers: vec![
+                    part(SHAPE, shape.to_vec()),
+                    part(BYTES, surface.bytes.clone()),
+                ],
+                push: Vec::new(),
+                spec: Default::default(),
+            };
+            let cfg = Config {
+                order,
+                workgroups: [groups[0], groups[1], 1],
+                ..Config::default()
+            };
+            let image = Image::new(IMAGE, [w, h, 1], 1, 1, 1);
+            let (_, images) = run_with_images(&m, &cfg, res, vec![image]).expect("run");
+            runs.push(images[0].texels.clone());
+        }
+        assert_eq!(runs[0], runs[1], "order independent");
+        let mut seen = vec![[false; 3]; n as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let t = &runs[0][(y * w + x) as usize];
+                let want = [code(x, y, 2), code(x, y, 0), code(x, y, 1)];
+                for c in 0..3 {
+                    let v = f32::from_bits(t[c]);
+                    assert_eq!(
+                        v.to_bits(),
+                        (want[c] as f32 / max as f32).to_bits(),
+                        "{pf:?} ({x}, {y}) channel {c}"
+                    );
+                    assert_eq!((v.clamp(0.0, 1.0) * max as f32).round() as u32, want[c]);
+                    seen[want[c] as usize][c] = true;
+                }
+                assert_eq!(f32::from_bits(t[3]), 1.0, "alpha 1");
+            }
+        }
+        assert!(
+            seen.iter().all(|s| s.iter().all(|&b| b)),
+            "{pf:?} every code"
+        );
+    }
 }

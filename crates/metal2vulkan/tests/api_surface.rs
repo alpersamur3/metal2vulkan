@@ -679,6 +679,7 @@ surface! {
         struct TiledTexelsModule N;
         struct TiledLevelMove N;
         fn ycbcr_convert_module;
+        fn ycbcr_convert_floats_module;
         fn ycbcr_texel;
         fn ycbcr_read;
         struct YCbCrConvertModule N;

@@ -235,6 +235,11 @@ pub fn function_key(
             .bytes(format!("{:?}", inputs.srgb_fetches).as_bytes());
     }
     // Appended only when set, as `storage_view_slots`.
+    if !inputs.ycbcr_code_fetches.is_empty() {
+        h.bytes(b"ycbcr-code-fetches")
+            .bytes(format!("{:?}", inputs.ycbcr_code_fetches).as_bytes());
+    }
+    // Appended only when set, as `storage_view_slots`.
     if !inputs.rotated_colors.is_empty() {
         h.bytes(b"rotated-colors")
             .bytes(format!("{:?}", inputs.rotated_colors).as_bytes());

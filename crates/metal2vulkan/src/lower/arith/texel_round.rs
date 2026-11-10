@@ -18,6 +18,9 @@
 //! - [`f32_to_half_by`]: [`f32_to_half`] in a mode two run-time `bool`s choose.
 //! - [`f32_to_half_from_even`]: toward zero saturating or ties away, derived from an exact
 //!   rounding to nearest even.
+//! - [`code_tile`]: a 4:4:4 two-plane YCbCr code-format attachment's tile value from its render
+//!   shadow's floats, red, green and blue each rounded to `half` by [`f32_to_half`] and alpha 1,
+//!   which framebuffer fetch reads (`lower::fragment::color`, `lower::fragment::fetch`).
 //! - [`ones_ratio_to_half`]: `m / (2^b - 1)` correctly rounded to `half` by one multiplication,
 //!   for the 16-bit normalized grids.
 //! - [`grid_step`] and [`grid_value`]: a normalized texel's step on its format's grid, and a
@@ -106,6 +109,28 @@ pub fn f32_to_half(
     mode: HalfRounding,
 ) -> BResult<Value> {
     to_half(fb, f, x, Rule::Fixed(mode))
+}
+
+/// Metal's tile value of a 4:4:4 two-plane YCbCr code-format attachment of `bits`-bit codes
+/// (`RGB8_444_2P` 8, `RGB10_444_2P` 10) from its render shadow's `texel` (a `vec4` of the floats
+/// a pass left there): red, green and blue each the `half` Metal's tile holds, to nearest even at
+/// 8 bits and toward zero at 10 (measured through the formats' pass stores on an Apple M3 Max under
+/// macOS 27.0.1, probe `ycp`), by [`f32_to_half`] (integer arithmetic, the same on every device);
+/// alpha 1, the format having none. A NaN and an infinity stay as they are; a finite value past
+/// the largest `half` is that `half` toward zero, and the infinity to nearest even. Not measured
+/// on a Mac (`PrecisionNote::UnmeasuredCodeFormatFetch`).
+pub fn code_tile(fb: &mut FunctionBuilder<'_>, texel: Value, bits: u32) -> BResult<Value> {
+    let f4 = Form {
+        held: Held::Float(FloatFmt::F32),
+        lanes: 4,
+    };
+    let mode = match bits {
+        10 => HalfRounding::TowardZeroSaturating,
+        _ => HalfRounding::NearestEven,
+    };
+    let rounded = f32_to_half(fb, f4, texel, mode)?;
+    let one = splat(fb, f4, f4.const_bits(1.0))?;
+    fb.vector_shuffle(rounded, one, &[0, 1, 2, 7])
 }
 
 /// [`f32_to_half`] in a mode chosen at run time by two `bool` scalars: toward zero saturating

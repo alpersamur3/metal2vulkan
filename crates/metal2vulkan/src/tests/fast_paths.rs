@@ -208,6 +208,7 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             UnmeasuredGroupSpeculation,
             NotMipmappedAnisotropicFilter,
             DeviceSampleLevel,
+            UnmeasuredCodeFormatFetch,
         ],
     }
 }
