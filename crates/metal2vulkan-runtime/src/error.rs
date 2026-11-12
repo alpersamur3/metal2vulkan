@@ -1425,10 +1425,12 @@ pub enum RuntimeGap {
     TextureBufferLevels,
     /// A texture of `TextureDescriptor::write_swizzle_enabled` whose swizzle is not the default,
     /// with `ShaderWrite` or `RenderTarget` usage, from the device's, a heap's or a buffer's
-    /// creator. Metal makes it (an M4 under macOS 27.0.1 and an M3 Max under 26.7), and its
-    /// writes go through the swizzle (the M4); the runtime's swizzles are its sampled views'
-    /// alone. The heap size query answers
-    /// its size.
+    /// creator: of a color format, or of a depth or stencil format whose usage writes it in
+    /// shaders (`ShaderWrite`, `BlockWritesOnly`, `Unknown`). Metal makes it (an M4 under macOS
+    /// 27.0.1 and an M3 Max under 26.7), and a color texture's writes go through the swizzle (the
+    /// M4); the runtime's swizzles are its sampled views' alone. A depth or stencil texture
+    /// written as a render target alone is made, its attachments' writes being no color channels
+    /// (not measured on Metal). The heap size query answers its size.
     WriteSwizzle,
     /// `Texture::replace_region` or `get_bytes` of a texture whose bytes (a no-copy buffer's or
     /// heap's) are detached (`detach_backing`). Metal's CPU access reaches the pages the texture

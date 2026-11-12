@@ -60,7 +60,7 @@ use crate::image_plan::plan_image;
 use crate::linear_plan::{BufferLayout, LINEAR_ALIGNMENT};
 use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
 use crate::shadow_merge::ScratchSpares;
-use crate::texture_descriptor::{texture_usage, TextureDescriptor, TextureLayout};
+use crate::texture_descriptor::{TextureDescriptor, TextureLayout};
 use crate::tracker::UseRange;
 use crate::view_plan::ViewRecord;
 use crate::ycbcr::IoSurfaceYCbCr;
@@ -198,7 +198,7 @@ impl Device {
             .shared()
             .textures
             .facts(self.compile_device().profile());
-        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
+        let usage = descriptor.made_usage();
         let plan = plan_image(layout, usage, false, &facts)
             .map_err(|refusal| image_error(call, refusal))?;
         let plan = self.with_undeclared_usage(plan, layout, usage, false, &facts)?;

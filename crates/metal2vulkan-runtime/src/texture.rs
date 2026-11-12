@@ -103,7 +103,7 @@ use super::sparse::SparsePageSize;
 use super::sparse::SparseProblem;
 use super::storage_placeholder::Placeholders;
 use super::texture_descriptor::{
-    memoryless_two_plane_cube, texture_usage, TextureDescriptor, TextureLayout, TextureProblem,
+    memoryless_two_plane_cube, TextureDescriptor, TextureLayout, TextureProblem,
     TextureSwizzleChannels,
 };
 use super::tracker::{Access, Use, UseRange};
@@ -1494,8 +1494,8 @@ impl Device {
     /// for a memoryless texture, a format the device cannot render to); what Metal makes and the
     /// runtime does not build yet, a texture buffer of more than one level
     /// (`NotImplemented(TextureBufferLevels)`) and a swizzle that writes under
-    /// `write_swizzle_enabled` (`NotImplemented(WriteSwizzle)`), as a heap's creator refuses them
-    /// too.
+    /// `write_swizzle_enabled` (`NotImplemented(WriteSwizzle)`) but a depth or stencil render
+    /// target's, which is made (the property's docs), as a heap's creator refuses them too.
     ///
     /// The descriptor's `placement` gives the texture's resource ID (`resource_ids.rs`); an ID
     /// of 16381 or more is refused `Invalid` (`Problem::ResourceId`), and one no set-1 array of
@@ -2060,7 +2060,7 @@ impl Device {
             .facts(self.compile_device().profile());
         // The buffer's rows lay the texels out, whatever `allowGPUOptimizedContents` says: the
         // image is planned for the texture's own usage.
-        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
+        let usage = descriptor.made_usage();
         let plan = plan_image(layout, usage, false, &facts)
             .map_err(|refusal| image_error(call, refusal))?;
         // The usage the texture lacks, as for a texture of its own: plain Metal writes a texture
@@ -3007,7 +3007,7 @@ impl Device {
         let (Some(pattern), Some(shape)) = (heap_tiled::fresh_pattern(pf), shape) else {
             return Ok(None);
         };
-        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
+        let usage = descriptor.made_usage();
         let colour = !is_depth_stencil(pf);
         let optimized = descriptor.allow_gpu_optimized_contents;
         let levels = heap_tiled::pattern_levels(colour, usage, optimized, shape, layout.levels);
@@ -4480,7 +4480,9 @@ impl Texture {
 
     /// `usage`: a texture made with `Unknown` usage reports `ShaderRead | ShaderWrite |
     /// RenderTarget | PixelFormatView`, as Metal does; a swizzled view keeps only `ShaderRead`
-    /// and `PixelFormatView` of its texture's.
+    /// and `PixelFormatView` of its texture's. A texture made with
+    /// [`TextureDescriptor::write_swizzle_enabled`] reports its descriptor's usage whole, swizzled
+    /// or not, and so do its views made without a swizzle of their own.
     ///
     /// Bits Metal's texture drops from its descriptor's (`TextureUsage::DROPPED`: 0x8) are not
     /// reported: a texture made with 0x8 alone reports no usage, one of 0x9 `ShaderRead`, as

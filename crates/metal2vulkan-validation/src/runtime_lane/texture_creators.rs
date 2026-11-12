@@ -15,8 +15,12 @@
 //!   stops it, and the heap size query answers its first level's size (256 bytes at 16 for 64
 //!   `RGBA8Unorm` texels).
 //! - A swizzle with writes under `writeSwizzleEnabled` is made by Metal's device, heap and
-//!   buffer creators (the runtime's gap, `NotImplemented(WriteSwizzle)`) and stopped by the
-//!   shared creator; the heap size query answers. Without the property every creator stops it.
+//!   buffer creators (the runtime's gap, `NotImplemented(WriteSwizzle)`, for a color texture) and
+//!   stopped by the shared creator; the heap size query answers. Without the property every
+//!   creator stops it. A depth texture of it written as a render target alone the runtime makes
+//!   from the device's and a heap's creators (its rule: Metal's is measured for color alone), and
+//!   a buffer's stops it as any depth texture (`BufferTextureProblem::NotLinear`); shader writes
+//!   keep it the gap.
 
 use super::{validated_device, Messages, ScratchCache};
 use crate::gpu::TEST_DEVICE;
@@ -203,6 +207,43 @@ fn each_creator_answers_as_metals() {
         assert_eq!(heaped, Some(invalid("new_texture", stop)));
         assert_eq!(shared, Some(invalid("new_shared_texture", stop)));
         assert_eq!(sized, Some(invalid("heap_texture_size_and_align", stop)));
+
+        // A depth texture of it written as a render target alone (Apple's OpenGL ES's depth
+        // buffer): made, but by the shared creator and over a buffer; written by shaders, the gap.
+        let rrr1 = TextureSwizzleChannels::new(
+            TextureSwizzle::Red,
+            TextureSwizzle::Red,
+            TextureSwizzle::Red,
+            TextureSwizzle::One,
+        );
+        let mut depth = TextureDescriptor::texture_2d(PixelFormat::Depth32Float, 16, 16, false);
+        depth.usage = TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET;
+        depth.swizzle = rrr1;
+        depth.write_swizzle_enabled = true;
+        let depth = private(depth);
+        let [made, heaped, shared, sized] = answers(&device, &heap, &depth);
+        assert_eq!((made, heaped, sized), (None, None, None));
+        assert_eq!(shared, Some(invalid("new_shared_texture", stop)));
+        let made = device.new_texture(&depth).unwrap();
+        assert_eq!((made.usage(), made.swizzle()), (depth.usage, rrr1));
+        let mut over = depth;
+        over.resource_options = ResourceOptions::shared();
+        let not_linear = BufferTextureProblem::NotLinear {
+            pixel_format: PixelFormat::Depth32Float,
+        };
+        assert_eq!(
+            buffer.new_texture(&over, 0, 64).err(),
+            Some(Error::Invalid(Invalid::new(
+                "new_texture",
+                Problem::BufferTexture(not_linear)
+            )))
+        );
+        let mut written = depth;
+        written.usage = TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET;
+        let [made, heaped, shared, sized] = answers(&device, &heap, &written);
+        assert_eq!((made, heaped), (gap.clone(), gap));
+        assert_eq!(shared, Some(invalid("new_shared_texture", stop)));
+        assert_eq!(sized, None);
     }
     let messages = messages.take();
     assert!(

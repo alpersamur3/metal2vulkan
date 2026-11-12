@@ -152,6 +152,7 @@ impl Texture {
                 );
                 descriptor.usage = record.usage;
                 descriptor.swizzle = record.swizzle;
+                descriptor.write_swizzle_enabled = record.writes_through_swizzle();
                 descriptor.resource_options = texels.options();
                 let layout = descriptor
                     .check(self.device().properties().texture_rules())

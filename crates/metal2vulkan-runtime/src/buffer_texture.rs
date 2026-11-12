@@ -284,9 +284,11 @@ impl Buffer {
     /// row pitch, bytes past the buffer); a format with no exact Vulkan format (a 4:2:2 one among
     /// them, which plain Metal makes over a buffer), and an image the device lacks (`Unsupported`);
     /// a 2D texture of a format the device cannot copy (`NotImplemented`); a swizzle that writes
-    /// under `write_swizzle_enabled`, which Metal makes (`NotImplemented(WriteSwizzle)`). A texture
-    /// buffer of more than one level is stopped (`BufferTextureProblem::MipmapLevelCount`), as
-    /// Metal's validation stops it here.
+    /// under `write_swizzle_enabled`, which Metal makes (`NotImplemented(WriteSwizzle)`; but a
+    /// depth or stencil one written as a render target alone, which is stopped as without the
+    /// swizzle, `BufferTextureProblem::NotLinear`, and made over a plane of a surface with planes).
+    /// A texture buffer of more than one level is stopped
+    /// (`BufferTextureProblem::MipmapLevelCount`), as Metal's validation stops it here.
     pub fn new_texture(
         &self,
         descriptor: &TextureDescriptor,

@@ -510,6 +510,57 @@ fn swizzled_views_keep_the_private_usage_bits_metal_keeps() {
     }
 }
 
+/// A depth/stencil texture made under `writeSwizzleEnabled` and written as a render target alone
+/// (`TextureDescriptor::write_swizzle_enabled`): its record holds its whole usage beside its
+/// swizzle, its stencil view made without a swizzle keeps both, and a view made with a swizzle
+/// keeps what any swizzled view keeps. The runtime's rule: Metal's views of such a texture are not
+/// measured. A read-only swizzled texture, or a view of no swizzle, writes through none.
+#[test]
+fn a_write_swizzled_depth_textures_views_keep_its_usage_and_swizzle() {
+    let (_, device) = lavapipe();
+    let p = device.profile();
+    let usage =
+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET | TextureUsage::PIXEL_FORMAT_VIEW;
+    let desc = TextureDescriptor {
+        pixel_format: PixelFormat::Depth32FloatStencil8,
+        width: 8,
+        height: 8,
+        usage,
+        swizzle: swizzle("RRR1"),
+        write_swizzle_enabled: true,
+        ..TextureDescriptor::default()
+    };
+    let layout = desc.check(APPLE).expect("a texture the runtime makes");
+    let t = ViewRecord::of_descriptor(&layout, &desc);
+    assert_eq!((t.usage, t.swizzle), (usage, swizzle("RRR1")));
+    assert!(t.writes_through_swizzle());
+    let stencil = ViewRequest::of_format(&t, PixelFormat::X32Stencil8);
+    let stencil = check_view(&t, &stencil, p).unwrap();
+    assert_eq!((stencil.usage, stencil.swizzle), (usage, swizzle("RRR1")));
+    assert!(stencil.writes_through_swizzle());
+    let swizzled = ViewRequest {
+        swizzle: Some(swizzle("R001")),
+        ..ViewRequest::of_format(&t, PixelFormat::Depth32FloatStencil8)
+    };
+    let v = check_view(&t, &swizzled, p).unwrap();
+    let read = TextureUsage::SHADER_READ | TextureUsage::PIXEL_FORMAT_VIEW;
+    assert_eq!((v.usage, v.swizzle), (read, swizzle("R001")));
+    assert!(!v.writes_through_swizzle());
+    let identity = ViewRequest {
+        swizzle: Some(swizzle("RGBA")),
+        ..ViewRequest::of_format(&t, PixelFormat::Depth32FloatStencil8)
+    };
+    let v = check_view(&t, &identity, p).unwrap();
+    assert_eq!(v.usage, usage);
+    assert!(!v.writes_through_swizzle());
+    let read_only = TextureDescriptor {
+        usage: TextureUsage::SHADER_READ,
+        ..desc
+    };
+    let layout = read_only.check(APPLE).unwrap();
+    assert!(!ViewRecord::of_descriptor(&layout, &read_only).writes_through_swizzle());
+}
+
 /// Bit 0x8, which Metal's descriptor keeps and its texture drops (an Apple M4):
 /// a texture of 0x8 alone answers no usage, as its views without a swizzle do, and Metal asserts
 /// on its swizzled view; one of 0x9 answers `ShaderRead`, its swizzled view too. A swizzled view

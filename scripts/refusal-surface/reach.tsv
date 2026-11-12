@@ -172,7 +172,7 @@ gap	RebindTextures	none	a runtime extension's rebind with a live texture
 gap	DetachTextures	none	a runtime extension's detach with a texture no stand-in presents exactly
 gap	DetachedTexelAccess	none	CPU texel access while a runtime extension detached the bytes
 gap	TextureBufferLevels	rare	a texture buffer of more than one level (public, unusual)
-gap	WriteSwizzle	none	Apple-private writeSwizzleEnabled with a swizzle that writes
+gap	WriteSwizzle	none	Apple-private writeSwizzleEnabled with a swizzle written through: a color texture, or shader writes to a depth or stencil one
 gap	PvrtcBlockOrder	rare	PVRTC regions off whole levels
 gap	DecodedHeapTexture	app	an ASTC texture in a heap on a device without ASTC
 gap	VertexFetchPast4GiB	rare	vertex fetch past 4 GiB of a bind offset

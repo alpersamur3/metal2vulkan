@@ -34,7 +34,7 @@ use super::super::image_plan::{plan_image, ImagePlan};
 use super::super::key_hash::KeyMap;
 use super::super::resource::{Identity, ResourceKey};
 use super::super::sharing::Sharing;
-use super::super::texture_descriptor::{texture_usage, TextureDescriptor};
+use super::super::texture_descriptor::TextureDescriptor;
 use super::super::tracker::{Access, Use, UseRange};
 use super::super::values::StorageMode;
 use super::super::view_plan::ViewRecord;
@@ -567,7 +567,7 @@ impl Device {
             .shared()
             .textures
             .facts(self.compile_device().profile());
-        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
+        let usage = descriptor.made_usage();
         let plan = plan_image(&layout, usage, false, &facts)
             .map_err(|refusal| image_error(CALL, refusal))?;
         let families: &[u32] = if info.sharing_mode == vk::SharingMode::CONCURRENT

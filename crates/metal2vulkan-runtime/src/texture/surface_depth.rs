@@ -30,7 +30,7 @@ use super::super::error::{internal, Error, RuntimeGap};
 use super::super::image_plan::{plan_image, ImagePlan};
 use super::super::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
 use super::super::shadow_merge::ScratchSpares;
-use super::super::texture_descriptor::{texture_usage, TextureDescriptor, TextureLayout};
+use super::super::texture_descriptor::{TextureDescriptor, TextureLayout};
 use super::super::tracker::UseRange;
 use super::super::values::ResourceOptions;
 use super::super::view_plan::ViewRecord;
@@ -206,7 +206,7 @@ impl Texture {
             .shared()
             .textures
             .facts(device.compile_device().profile());
-        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
+        let usage = descriptor.made_usage();
         let plan = plan_image(&layout, usage, false, &facts)
             .map_err(|refusal| image_error(CALL, refusal))?;
         let plan = device.with_undeclared_usage(plan, &layout, usage, false, &facts)?;

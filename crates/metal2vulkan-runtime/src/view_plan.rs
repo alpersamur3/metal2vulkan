@@ -45,7 +45,9 @@
 //!   applies a swizzle to the channels the view's format gives, border texels included.
 //! - **Usage.** A view has the viewed texture's usage, except that a view made with a swizzle other
 //!   than the default keeps only `ShaderRead` and `PixelFormatView` of it (a texture of `Unknown`
-//!   usage has Metal's `effective_usage`). Metal's validation stops a write binding of such a view
+//!   usage has Metal's `effective_usage`; one made under `writeSwizzleEnabled` its whole usage
+//!   beside its swizzle, `TextureDescriptor::made_usage`, which its views made without a swizzle
+//!   keep, unmeasured on Metal). Metal's validation stops a write binding of such a view
 //!   of a texture with `ShaderWrite`; plain Metal reads it swizzled and writes through it with the
 //!   swizzle undone (Metal probe cases `rw.view.read` and `rw.view.write`, the M3 Max and the M4).
 //!   A Vulkan storage view takes no swizzle, so at a storage slot the function applies it to its
@@ -155,13 +157,16 @@ impl ViewRecord {
     }
 
     /// The texture `descriptor` makes, of `layout`: [`of_texture`](Self::of_texture) of its usage
-    /// and swizzle, with its alpha, its address-mode map and its presentation properties (a
-    /// rotation past `u8`, which `TextureDescriptor::check` refuses, is none).
+    /// and swizzle, its usage the texture's (`TextureDescriptor::made_usage`: under
+    /// `write_swizzle_enabled`, its whole usage with its swizzle), with its alpha, its address-mode
+    /// map and its presentation properties (a rotation past `u8`, which `TextureDescriptor::check`
+    /// refuses, is none).
     pub(super) fn of_descriptor(
         layout: &TextureLayout,
         descriptor: &TextureDescriptor,
     ) -> ViewRecord {
         ViewRecord {
+            usage: descriptor.made_usage(),
             alpha_reads_one: descriptor.alpha_reads_one,
             address_mode_map: descriptor.address_mode_map,
             presented: Presented {
@@ -201,6 +206,18 @@ impl ViewRecord {
         };
         let s = self.swizzle;
         TextureSwizzleChannels::new(one(s.red), one(s.green), one(s.blue), one(s.alpha))
+    }
+
+    /// Whether this holds `ShaderWrite` or `RenderTarget` usage with a swizzle other than the
+    /// default: a texture made under `writeSwizzleEnabled` alone does
+    /// (`TextureDescriptor::made_usage`), and its views made without a swizzle of their own. A
+    /// descriptor made again of the record (a view's over a buffer's bytes, a rotated texture's
+    /// frame) states `write_swizzle_enabled` where this holds, as the texture's did.
+    pub(super) fn writes_through_swizzle(&self) -> bool {
+        !self.swizzle.is_default()
+            && self
+                .usage
+                .intersects(TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET)
     }
 
     /// The extent of the first level this presents (Metal's `width`, `height` and `depth`).

@@ -43,7 +43,7 @@ use super::super::degradation::Degradation;
 use super::super::error::{internal, Error, RuntimeGap};
 use super::super::image_plan::plan_image;
 use super::super::rotated;
-use super::super::texture_descriptor::{texture_usage, TextureDescriptor, TextureLayout};
+use super::super::texture_descriptor::{TextureDescriptor, TextureLayout};
 use super::super::values::ResourceOptions;
 use super::super::view_plan::{ViewRecord, ViewRequest};
 use super::super::Device;
@@ -172,6 +172,7 @@ impl Texture {
         let descriptor = TextureDescriptor {
             usage: record.usage,
             swizzle: record.swizzle,
+            write_swizzle_enabled: record.writes_through_swizzle(),
             resource_options: texels.options(),
             ..TextureDescriptor::texture_2d(
                 record.pixel_format,
@@ -311,7 +312,7 @@ impl Device {
             .shared()
             .textures
             .facts(self.compile_device().profile());
-        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
+        let usage = descriptor.made_usage();
         let plan = plan_image(layout, usage, false, &facts)
             .map_err(|refusal| image_error(call, refusal))?;
         let plan = self.with_undeclared_usage(plan, layout, usage, false, &facts)?;

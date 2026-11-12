@@ -17,9 +17,12 @@
 //!   `RenderTarget` usage with a swizzle other than the default at creation, validation on or
 //!   off), but for one of Apple's private `writeSwizzleEnabled`
 //!   ([`TextureDescriptor::write_swizzle_enabled`]), which Metal makes from the device's, a
-//!   heap's and a buffer's creators, and whose writes go through the swizzle; the shared creator
-//!   still stops it. The runtime does not build one yet (`NotImplemented(WriteSwizzle)`); the heap
-//!   size query answers for it.
+//!   heap's and a buffer's creators, and whose writes go through the swizzle (a color texture's,
+//!   measured); the shared creator still stops it. The runtime builds one of a depth, stencil or
+//!   depth/stencil format written as a render target alone, whose swizzle its reads alone take
+//!   (not measured on Metal: `write_swizzle_read_alone`); the others are its gap
+//!   (`NotImplemented(WriteSwizzle)`: a color format's, and one shaders write). The heap size
+//!   query answers for every one.
 //! - The texture types a pixel format takes (probe 5, every format in each 1D, 1D array, 2D, 2D
 //!   array, cube, cube array and 3D texture): a depth or stencil format no 1D or 3D type; a
 //!   compressed format no 1D type, and an ETC2, EAC or PVRTC one no 3D type either; a 4:2:2
@@ -179,9 +182,30 @@ pub struct TextureDescriptor {
     /// stores `(0.75, 0.5, 0.25, 1)`). Plain Metal makes such a texture from the device's, a
     /// heap's and a buffer's creators, and its validation stops it from
     /// `newSharedTextureWithDescriptor:` (an M4 under macOS 27.0.1 and an M3 Max under 26.7). The
-    /// runtime does not build it yet: those creators refuse it `NotImplemented(WriteSwizzle)`, and
+    /// texture reports its descriptor's usage, swizzled or not, as Metal's does (a color one's,
+    /// measured). Without a swizzle, or without writes, it changes nothing.
+    ///
+    /// The runtime builds such a texture of a depth, stencil or depth/stencil format written as a
+    /// render target alone (`ShaderRead | RenderTarget` of `Depth32Float` and a swizzle of
+    /// `(Red, Red, Red, One)`, as Apple's OpenGL ES asks for its depth buffers): its attachments'
+    /// writes are depth and stencil values, which no swizzle of color channels permutes, so its
+    /// render passes render through a view of the identity mapping, its copies and CPU access move
+    /// its bytes as they do any texture's, and its swizzle is its sampled views' alone, as a
+    /// swizzled texture's of no writes is. That reasoning is the runtime's: Metal's write swizzle
+    /// of a depth or stencil render target is not measured, only a color texture's is. Its views
+    /// follow a texture's rules: one made without a swizzle keeps its swizzle and its usage,
+    /// `RenderTarget` among it; one made with a swizzle keeps of its usage what a swizzled view
+    /// keeps (no `RenderTarget`; it still renders, as such a view of any render target does). The
+    /// device's, a heap's and a buffer's creators (and one over an IOSurface plane) refuse the
+    /// rest `NotImplemented(WriteSwizzle)`: a color format's (its writes would need the swizzle
+    /// applied to every fragment's output and every shader write), and a depth or stencil
+    /// format's of a usage that writes in shaders (`ShaderWrite`, Apple's private
+    /// `BlockWritesOnly`, or `Unknown`, which holds `ShaderWrite`). A buffer's creator stops a
+    /// depth or stencil texture as Metal's does (`BufferTextureProblem::NotLinear`), but over a
+    /// plane of a surface with planes, where it is made (`surface_depth.rs`, its pass's twin
+    /// rendered as any of its attachments is).
     /// [`Device::heap_texture_size_and_align`](crate::Device::heap_texture_size_and_align)
-    /// answers its size. Without a swizzle, or without writes, it changes nothing.
+    /// answers the size of each.
     pub write_swizzle_enabled: bool,
     /// Whether shaders read the texture's alpha as 1 (a runtime extension; Metal has no such
     /// property): its reads, samples and gathers, border texels included, read each channel whose
@@ -330,6 +354,20 @@ impl TextureDescriptor {
         }
     }
 
+    /// The usage the texture this descriptor makes has, and reports (without the bits Metal's
+    /// texture drops, `Texture::usage`): [`texture_usage`] of its usage and swizzle, of which a
+    /// swizzled texture keeps `ShaderRead` and `PixelFormatView` alone; under
+    /// `write_swizzle_enabled`, its [`effective_usage`] whole, swizzled or not, as Metal's texture
+    /// reports it (a color one's measured). Its views are checked against it, and its image is
+    /// made for it ([`own_image_usage`](Self::own_image_usage)).
+    pub(super) fn made_usage(&self) -> TextureUsage {
+        if self.write_swizzle_enabled {
+            effective_usage(self.usage)
+        } else {
+            texture_usage(self.usage, self.swizzle)
+        }
+    }
+
     /// The usage the runtime makes the image of a device's own texture of this descriptor for
     /// (`Device::new_texture`): [`image_usage`](Self::image_usage) without the `PixelFormatView`
     /// that `allowGPUOptimizedContents` off adds. The property changes the texture's layout alone,
@@ -341,13 +379,10 @@ impl TextureDescriptor {
     /// (ANV). A heap's texture takes `image_usage`: the heap's size answer and its aliasing show
     /// the layout. So does a device's own texture where the device's copies of the compressed
     /// image would rewrite texels Metal keeps (`Device::copy_exact_usage`, MoltenVK's
-    /// `RG11B10Float` and `RGB9E5Float` images): there the compression shows in its blits.
+    /// `RG11B10Float` and `RGB9E5Float` images): there the compression shows in its blits. It is
+    /// the texture's own usage ([`made_usage`](Self::made_usage)).
     pub(super) fn own_image_usage(&self) -> TextureUsage {
-        if self.write_swizzle_enabled {
-            effective_usage(self.usage)
-        } else {
-            texture_usage(self.usage, self.swizzle)
-        }
+        self.made_usage()
     }
 
     /// The texture this descriptor makes from the device's or a heap's creator on a device of
@@ -533,8 +568,9 @@ impl TextureDescriptor {
         }
         // What Metal makes and the runtime does not build yet, once every rule Metal stops or
         // answers nil for passed: a texture buffer of more than one level from the creators
-        // that make one (a buffer's stops it, `linear_plan`), and a swizzle that writes. The
-        // heap size query answers for both, as Metal's does.
+        // that make one (a buffer's stops it, `linear_plan`), and a swizzle written through but
+        // for a depth or stencil render target's (`write_swizzle_read_alone`). The heap size
+        // query answers for both, as Metal's does.
         let made_here = matches!(creator, Creator::Device | Creator::Shared);
         if ty == T::TextureBuffer && levels > 1 && made_here {
             return Err(Refused::NotYet(RuntimeGap::TextureBufferLevels));
@@ -542,6 +578,7 @@ impl TextureDescriptor {
         if swizzled
             && write_swizzle_taken
             && effective_usage(self.usage).intersects(writes)
+            && !write_swizzle_read_alone(pf, self.usage)
             && creator != Creator::SizeQuery
         {
             return Err(Refused::NotYet(RuntimeGap::WriteSwizzle));
@@ -589,7 +626,8 @@ pub(super) fn effective_usage(usage: TextureUsage) -> TextureUsage {
 /// texture with a swizzle other than the default keeps only `ShaderRead` and `PixelFormatView`,
 /// as Metal reports it (a swizzled descriptor of `Unknown` usage reports `0x11`; measured on an
 /// Apple M3 Max and M4). [`TextureDescriptor::check`] refuses a swizzled descriptor asking for
-/// more. The bits Metal's texture drops stay ([`effective_usage`]).
+/// more, but under `write_swizzle_enabled`, whose texture keeps its usage whole
+/// ([`TextureDescriptor::made_usage`]). The bits Metal's texture drops stay ([`effective_usage`]).
 pub(super) fn texture_usage(usage: TextureUsage, swizzle: TextureSwizzleChannels) -> TextureUsage {
     let usage = effective_usage(usage);
     if swizzle.is_default() {
@@ -598,6 +636,21 @@ pub(super) fn texture_usage(usage: TextureUsage, swizzle: TextureSwizzleChannels
         let dropped = usage.difference(usage.without_dropped());
         usage.intersection(TextureUsage::SHADER_READ | TextureUsage::PIXEL_FORMAT_VIEW | dropped)
     }
+}
+
+/// Whether a texture of `pf` and Metal `usage` made under `writeSwizzleEnabled` with a swizzle
+/// other than the default writes nothing through its swizzle, so the runtime builds it with its
+/// swizzle in its sampled views alone ([`TextureDescriptor::write_swizzle_enabled`]): a depth,
+/// stencil or depth/stencil format (`Depth16Unorm`, `Depth32Float`, `Stencil8`,
+/// `Depth32Float_Stencil8`, `X32_Stencil8`) whose usage writes it as a render target alone,
+/// holding neither `ShaderWrite` nor Apple's private `BlockWritesOnly`, which
+/// Metal writes through as through `ShaderWrite` (`Unknown` holds `ShaderWrite`; `ShaderAtomic`
+/// Metal stops on such a format). A depth or stencil attachment's writes are depth and stencil
+/// values, no color channels a swizzle could move. The runtime's reasoning, not measured on
+/// Metal, whose write swizzle is measured for color textures alone.
+pub(super) fn write_swizzle_read_alone(pf: PixelFormat, usage: TextureUsage) -> bool {
+    let shader_writes = TextureUsage::SHADER_WRITE | TextureUsage::BLOCK_WRITES_ONLY;
+    is_depth_stencil(pf) && !effective_usage(usage).intersects(shader_writes)
 }
 
 /// The number of levels of a full chain for an extent whose largest axis is the largest of `axes`:

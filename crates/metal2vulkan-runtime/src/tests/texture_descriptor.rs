@@ -3,8 +3,9 @@
 use super::super::error::RuntimeGap;
 use super::super::texture::heap::{no_texture_alignment, texture_buffer_size_and_align};
 use super::super::texture_descriptor::{
-    full_chain, no_texture_alone, texture_usage, Creator, Refused, TextureDescriptor,
-    TextureLayout, TextureProblem, TextureRules, TextureSwizzleChannels, APPLE_SAMPLE_COUNTS,
+    full_chain, no_texture_alone, texture_usage, write_swizzle_read_alone, Creator, Refused,
+    TextureDescriptor, TextureLayout, TextureProblem, TextureRules, TextureSwizzleChannels,
+    APPLE_SAMPLE_COUNTS,
 };
 use super::super::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMode};
 use crate::MetalLevel;
@@ -522,6 +523,126 @@ fn a_write_swizzle_is_the_runtimes_gap() {
     let read = of_usage(TextureUsage::SHADER_READ, bgra, true);
     assert!(read.check(counts).is_ok());
     assert_eq!(read.image_usage(), TextureUsage::SHADER_READ);
+    assert_eq!(read.made_usage(), TextureUsage::SHADER_READ);
+    // A color render target alone stays the gap too.
+    let rendered_alone = of_usage(TextureUsage::RENDER_TARGET, rrr1(), true);
+    assert_eq!(rendered_alone.check(counts), gap);
+}
+
+/// `(Red, Red, Red, One)`: the swizzle Apple's OpenGL ES gives its depth textures.
+fn rrr1() -> TextureSwizzleChannels {
+    TextureSwizzleChannels::new(
+        TextureSwizzle::Red,
+        TextureSwizzle::Red,
+        TextureSwizzle::Red,
+        TextureSwizzle::One,
+    )
+}
+
+/// The depth, stencil and depth/stencil formats a texture is made in (Metal describes no
+/// `Depth24Unorm_Stencil8` on an Apple GPU, `MetalLevel::describes`).
+const DEPTH_STENCIL: [PixelFormat; 5] = [
+    PixelFormat::Depth16Unorm,
+    PixelFormat::Depth32Float,
+    PixelFormat::Stencil8,
+    PixelFormat::Depth32FloatStencil8,
+    PixelFormat::X32Stencil8,
+];
+
+/// Under `write_swizzle_enabled` a depth, stencil or depth/stencil texture written as a render
+/// target alone is made from the device's, a heap's and a buffer's creators (whose own rules come
+/// after: `linear_plan` stops it over a buffer), with its usage whole (Apple's OpenGL ES's depth
+/// buffer: `Depth32Float`, `ShaderRead | RenderTarget`, `(Red, Red, Red, One)`), multisampled
+/// too; the shared creator still stops it, and the heap size query answers it. One whose usage
+/// writes in shaders (`ShaderWrite`, `BlockWritesOnly`, `Unknown`) stays the runtime's gap, as
+/// a color one does. The runtime's rule: Metal's write swizzle of a depth render target is not
+/// measured.
+#[test]
+fn a_depth_or_stencil_write_swizzle_rendered_alone_is_made() {
+    let counts = APPLE;
+    let gap = Err(Refused::NotYet(RuntimeGap::WriteSwizzle));
+    let stop = Err(Refused::Stops(TextureProblem::SwizzleWithWrites));
+    let of = |pf, usage: TextureUsage| TextureDescriptor {
+        usage,
+        swizzle: rrr1(),
+        write_swizzle_enabled: true,
+        resource_options: ResourceOptions::private(),
+        ..TextureDescriptor::texture_2d(pf, 1704, 786, false)
+    };
+    let rendered = [
+        TextureUsage::RENDER_TARGET,
+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET | TextureUsage::PIXEL_FORMAT_VIEW,
+    ];
+    for pf in DEPTH_STENCIL {
+        for usage in rendered {
+            let d = of(pf, usage);
+            let what = format!("{pf:?} {usage:?}");
+            assert!(write_swizzle_read_alone(pf, usage));
+            let layout = d.check(counts).expect(&what);
+            assert_eq!(
+                (layout.extent, layout.samples),
+                ([1704, 786, 1], 1),
+                "{what}"
+            );
+            assert!(d.check_made(Creator::Buffer, counts).is_ok(), "{what}");
+            assert!(d.check_made(Creator::SizeQuery, counts).is_ok(), "{what}");
+            assert_eq!(d.check_shared(counts), stop, "{what}");
+            assert_eq!(d.made_usage(), usage, "{what}");
+            assert_eq!(d.image_usage(), usage, "{what}");
+            // Without the property every creator stops it.
+            let off = TextureDescriptor {
+                write_swizzle_enabled: false,
+                ..d
+            };
+            assert_eq!(off.check(counts), stop, "{what}");
+            let kept = TextureUsage::SHADER_READ | TextureUsage::PIXEL_FORMAT_VIEW;
+            assert_eq!(off.made_usage(), usage.intersection(kept), "{what}");
+        }
+        // A usage that writes in shaders stays the gap; the size query answers it, and the shared
+        // creator as without the property (whose stop reads the bits set: `Unknown` passes it).
+        for usage in [
+            TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE,
+            TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET,
+            TextureUsage::RENDER_TARGET | TextureUsage::BLOCK_WRITES_ONLY,
+            TextureUsage::empty(),
+        ] {
+            let d = of(pf, usage);
+            let what = format!("{pf:?} {usage:?}");
+            assert!(!write_swizzle_read_alone(pf, usage));
+            assert_eq!(d.check(counts), gap, "{what}");
+            assert_eq!(d.check_made(Creator::Buffer, counts), gap, "{what}");
+            assert!(d.check_made(Creator::SizeQuery, counts).is_ok(), "{what}");
+            let off = TextureDescriptor {
+                write_swizzle_enabled: false,
+                ..d
+            };
+            assert_eq!(d.check_shared(counts), off.check(counts), "{what}");
+            if !usage.is_empty() {
+                assert_eq!(d.check_shared(counts), stop, "{what}");
+            }
+        }
+        // `ShaderAtomic` Metal stops on a depth or stencil format, swizzled or not.
+        let atomic = of(pf, TextureUsage::SHADER_READ | TextureUsage::SHADER_ATOMIC);
+        assert_eq!(
+            atomic.check(counts),
+            Err(Refused::Stops(TextureProblem::UsageForFormat)),
+            "{pf:?}"
+        );
+    }
+    // Multisampled, as its resolve source.
+    let ms = TextureDescriptor {
+        texture_type: TextureType::Type2DMultisample,
+        sample_count: 4,
+        ..of(PixelFormat::Depth32Float, TextureUsage::RENDER_TARGET)
+    };
+    assert_eq!(ms.check(counts).map(|l| l.samples), Ok(4));
+    // Every color format stays the gap.
+    for pf in [PixelFormat::R32Float, PixelFormat::RGBA8Unorm] {
+        assert!(!write_swizzle_read_alone(pf, TextureUsage::RENDER_TARGET));
+        let rendered = of(pf, TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET);
+        assert_eq!(rendered.check(counts), gap, "{pf:?}");
+    }
 }
 
 fn gbar() -> TextureSwizzleChannels {
