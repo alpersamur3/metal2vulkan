@@ -45,9 +45,9 @@ const WAIT: Duration = Duration::from_secs(60);
 /// The textures' side.
 const SIDE: u64 = 4;
 
-/// The triangle over the whole target, `(x, y, z, w)` in clip space: its depth `0.2 + 0.1 (x + 1)
-/// + 0.15 (y + 1)`, from 0.2625 to 0.6375 over the target's texel centres, each row and column
-/// its own.
+/// The triangle over the whole target, `(x, y, z, w)` in clip space: its depth is
+/// `0.2 + 0.1 (x + 1) + 0.15 (y + 1)`, from 0.2625 to 0.6375 over the target's texel centres,
+/// each row and column its own.
 const PLANE: [[f32; 4]; 3] = [
     [-1.0, -1.0, 0.2, 1.0],
     [3.0, -1.0, 0.6, 1.0],
