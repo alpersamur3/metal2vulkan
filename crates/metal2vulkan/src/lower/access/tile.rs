@@ -68,6 +68,21 @@
 //! converts between the pixel and the cell in a way not read yet:
 //! `Unsupported{TileShading, NotImplemented}`.
 //!
+//! **Extended-range formats**. An attachment of an extended-range ten-bit or two-plane format
+//! (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10` and their `_sRGB` twins, [`extended`]) is staged
+//! as the tile Metal holds it through a render pass: `half` (see `lower::fragment::fetch`'s `half`
+//! shadow). The cell holds each pixel's four `half`s, 8 bytes, which an implicit access reads and
+//! writes as a `half4` like any 16-bit float attachment's; the staging converts them where it
+//! moves them. Its image is the attachment's codes in their raw format
+//! (`ExtendedRange::raw_format`, [`staging_format`]: `R32_UINT`, `R16G16B16A16_UINT`,
+//! `R32G32_UINT`); a load reads a pixel's codes and takes Metal's tile value
+//! (`extended_range::tile_value`, as a fetch reads them), and a store writes the encode of the
+//! cell's `half`s (`extended_range::encode`, as a kernel's write stores them, an `_sRGB` form's
+//! through Metal's table). A member that is not 8 bytes, or an access of another type than
+//! `half4`, is `Unsupported{TileShading, NotImplemented}`. No probe has read these cells through a
+//! tile function on a Mac: `PrecisionNote::UnmeasuredTileExtendedRange`. The padded and bfloat
+//! forms have no measured tile and stay refused.
+//!
 //! **Tile threadgroup memory**. A tile function's `[[threadgroup(n)]]` arguments are its tile's
 //! threadgroup memory, which Metal keeps for the tile across the render pass's tile dispatches (MSL
 //! §4.4; measured on an M4 and an M3 Max: a dispatch reads what an earlier one over the same tile
@@ -122,7 +137,7 @@ use crate::error::{
     Attachment, Capability, DescriptorError, Error, Feature, RuntimeInput, Unsupported,
 };
 use crate::lower::arith::nan::NanTest;
-use crate::lower::arith::{math, ops, srgb, texel_round, FloatFmt, Form, Held};
+use crate::lower::arith::{extended_range, math, ops, srgb, texel_round, FloatFmt, Form, Held};
 use crate::lower::dispatch::KernelBuiltin;
 use crate::lower::emit::EmitCx;
 use crate::lower::select::SelectCx;
@@ -130,8 +145,9 @@ use crate::lower::sync::barrier::{memory_model, semantics};
 use crate::lower::texture::{held_texel, to_image, ImageDecl, TexelClass, TexelConv, TexelForm};
 use crate::memory::arena::ArenaMem;
 use crate::memory::leaf::{self, Leaf, Path, WordMem, WordOps};
-use crate::metal::format::FormatEmulation;
+use crate::metal::format::{ExtendedRange, FormatEmulation};
 use crate::metal::PixelFormat;
+use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::sym::{
     PushField, ResourceKind, ResourceSlot, SpecKey, Stage, SyntheticBinding,
@@ -208,6 +224,12 @@ pub struct TileSlot {
     /// Where the attachment is normalized: the cell holds its texel's bits
     /// ([`TileSlot::bits`]), which an implicit access converts to and from its lanes.
     pub norm: Option<Norm>,
+    /// Where the attachment is of an extended-range format ([`extended`]): the cell holds the
+    /// tile's `half`s, the image the codes, which the staging converts.
+    pub xr: Option<ExtendedRange>,
+    /// The lanes of the staging image's texel (those of [`TileSlot::bits`] unless the attachment
+    /// is extended-range, whose cell holds four `half`s of its codes' one to four lanes).
+    pub image_lanes: u8,
     /// The bytes of the layout member that holds the attachment: its texel's
     /// ([`TileSlot::leaf`]'s), or a normalized attachment's lanes (four bytes a `float` lane, two
     /// a `half` one, of its channels or four), which an implicit access's type fills.
@@ -371,7 +393,16 @@ impl TilePlan {
         let per: u64 = pass
             + self
                 .staged()
-                .map(|s| 96 + 4 * u64::from(s.leaf.cost()))
+                .map(|s| {
+                    // An extended-range slot's load decodes the codes, its store encodes them.
+                    let convert = match s.xr {
+                        Some(_) => {
+                            u64::from(extended_range::DECODE_WORDS + extended_range::ENCODE_WORDS)
+                        }
+                        None => 0,
+                    };
+                    96 + 4 * u64::from(s.leaf.cost()) + convert
+                })
                 .sum::<u64>();
         if per == 0 {
             0
@@ -424,6 +455,13 @@ fn texel_of(pf: PixelFormat) -> Option<(Held, u8, TexelClass)> {
     })
 }
 
+/// The extended-range form of an attachment of pixel format `pf` whose tile the staging converts:
+/// the ten-bit and two-plane forms, whose tile Metal holds as `half`. The padded and bfloat
+/// forms are `None`: no tile of theirs is measured.
+pub fn extended(pf: PixelFormat) -> Option<ExtendedRange> {
+    ExtendedRange::of(pf).filter(|f| !f.padded() && !f.bfloat())
+}
+
 /// The format the staging views an attachment of pixel format `pf` through: its own for an integer
 /// format, and for a float one the unsigned-integer format of the same channels and widths, which
 /// is in the same compatibility class, so the staging moves the texel's bits. A float view would
@@ -432,6 +470,13 @@ pub fn staging_format(pf: PixelFormat) -> PixelFormat {
     use PixelFormat as P;
     if let Some((_, staging)) = normalized(pf) {
         return staging;
+    }
+    // An extended-range attachment's codes, in the raw format its image holds.
+    match extended(pf) {
+        Some(ExtendedRange::Bgr10 { .. }) => return P::R32Uint,
+        Some(ExtendedRange::Bgra10 { .. }) => return P::RGBA16Uint,
+        Some(ExtendedRange::Planes { .. }) => return P::RG32Uint,
+        _ => {}
     }
     match pf {
         P::R16Float => P::R16Uint,
@@ -613,10 +658,19 @@ fn slot(
     } = at;
     let (raw, raw_lanes, class) =
         texel_of(staging_format(pixel_format)).ok_or_else(not_implemented)?;
+    // An extended-range attachment's cell holds its tile's four `half`s, whatever its image's
+    // codes are, and its member is that `half4`.
+    let xr = extended(pixel_format);
     // The cell holds a normalized texel's bits, whose member is `float` or `half` lanes of
     // the format's channels or four, as an access's type tells; an aliased layout's member of it is
     // not read yet.
     let (norm, form, bytes, member) = match normalized(pixel_format) {
+        None if xr.is_some() => {
+            let held =
+                crate::lower::arith::legal::held_on(cx.profile, Held::Float(FloatFmt::Half))?;
+            let form = Form { held, lanes: 4 };
+            (None, form, 8, 8)
+        }
         Some((n, _)) => {
             if aliased {
                 return Err(not_implemented());
@@ -655,13 +709,16 @@ fn slot(
     } else {
         Path::Bytes
     };
-    let bits = Leaf {
-        form: Form {
-            held: raw,
-            lanes: raw_lanes,
+    let bits = match xr {
+        Some(_) => Leaf { form, bytes, path },
+        None => Leaf {
+            form: Form {
+                held: raw,
+                lanes: raw_lanes,
+            },
+            bytes,
+            path,
         },
-        bytes,
-        path,
     };
     Ok(TileSlot {
         color,
@@ -675,6 +732,8 @@ fn slot(
         staged: false,
         stored: false,
         norm,
+        xr,
+        image_lanes: raw_lanes,
         member,
     })
 }
@@ -803,7 +862,20 @@ pub(super) fn use_cells(cx: &mut SelectCx<'_>, stored: bool) -> Result<u32, Erro
         cells.staged = true;
         cells.stored |= stored;
     }
-    Ok(p.cell_bytes)
+    let cell_bytes = p.cell_bytes;
+    let forms: Vec<ExtendedRange> = p.slots.iter().filter_map(|s| s.xr).collect();
+    for form in forms {
+        extended_staged(cx, form);
+    }
+    Ok(cell_bytes)
+}
+
+/// Record that the staging converts an extended-range attachment of `form`: Metal's table where
+/// it is `_sRGB`, and the note that no probe has read the cell through a tile function.
+fn extended_staged(cx: &mut SelectCx<'_>, form: ExtendedRange) {
+    cx.families.arith.converts(form);
+    cx.precision
+        .insert(PrecisionNote::UnmeasuredTileExtendedRange);
 }
 
 /// The tile plan's cell bytes, for an extent query.
@@ -887,7 +959,10 @@ pub(super) fn select_texel(
     };
     slot.staged = true;
     slot.stored |= store;
-    let (offset, leaf) = (slot.offset, slot.leaf);
+    let (offset, leaf, xr) = (slot.offset, slot.leaf, slot.xr);
+    if let Some(form) = xr {
+        extended_staged(cx, form);
+    }
     // Metal's sRGB table, which the conversion of an sRGB attachment reads.
     if norm.is_some_and(|n| n.norm.format == PackFormat::Unorm4x8Srgb) {
         let dir = if store {
@@ -1281,20 +1356,39 @@ fn cells_pass<'c>(
                 let off = field(fb, cell, s.offset)?;
                 let form = TexelForm {
                     conv: s.conv,
-                    lanes: s.bits.form.lanes,
+                    lanes: s.image_lanes,
                 };
                 match pass {
                     Pass::Load => {
                         let mem = crate::lower::sync::memory_model::coherence(cx.plan).texel(fb)?;
                         let texel = fb.read(img, pixel, &ImageOperands::default(), mem)?;
-                        let texel = lanes(fb, texel, s.bits.form.lanes)?;
-                        let held = held_texel(fb, s.class, form, texel)?;
+                        // An extended-range attachment's codes, as the tile Metal holds them
+                        // (a fetch's read): four `half`s, each held widened in a `float`.
+                        let held = match s.xr {
+                            Some(xr) => {
+                                let table = crate::lower::texture::extended_table(cx, xr)?;
+                                extended_range::tile_value(fb, xr, texel, table)?
+                            }
+                            None => {
+                                let texel = lanes(fb, texel, s.image_lanes)?;
+                                held_texel(fb, s.class, form, texel)?
+                            }
+                        };
                         cell_access(cx, fb, s.bits, off, Some(held))?;
                     }
                     Pass::Store => {
                         let Some(held) = cell_access(cx, fb, s.bits, off, None)? else {
                             return Err(cx.fail("a tile cell load without a value"));
                         };
+                        if let Some(xr) = s.xr {
+                            // The codes a kernel's write of the cell's `half`s stores.
+                            let table = crate::lower::texture::extended_table(cx, xr)?;
+                            let texel = extended_range::encode(fb, xr, held, table)?;
+                            let mem =
+                                crate::lower::sync::memory_model::coherence(cx.plan).texel(fb)?;
+                            fb.write(img, pixel, texel, &ImageOperands::default(), mem)?;
+                            continue;
+                        }
                         let held = widen(fb, held, s)?;
                         let texel = to_image(
                             fb,

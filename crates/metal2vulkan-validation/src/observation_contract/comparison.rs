@@ -161,6 +161,9 @@ impl UlpTable {
 /// - `UnmeasuredCodeFormatFetch`: unbounded until a Mac reads a 4:4:4 code format through
 ///   framebuffer fetch: the read is the tile Metal was measured to hold (its `half`s), which no
 ///   fetch has been measured to return.
+/// - `UnmeasuredTileExtendedRange`: unbounded until a Mac reads an extended-range attachment's
+///   cell in a tile function: the cell is the tile Metal was measured to hold through fetch (its
+///   `half`s), which no tile function has been measured to read.
 /// - `Fp8Value`: unbounded until a Metal device that implements 8-bit float conversions reads
 ///   them: Metal on Apple M3 returns the carrier byte's integer extension, which differs from the
 ///   format's value by any amount.
@@ -297,6 +300,7 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::NotMipmappedAnisotropicFilter
         | N::DeviceSampleLevel
         | N::UnmeasuredCodeFormatFetch
+        | N::UnmeasuredTileExtendedRange
         | N::Fp8Value
         | N::MultisamplePosition
         | N::RasterizationRateMap

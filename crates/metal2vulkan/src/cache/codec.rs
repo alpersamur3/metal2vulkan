@@ -1397,6 +1397,7 @@ codec_enum! {
         NotMipmappedAnisotropicFilter,
         DeviceSampleLevel,
         UnmeasuredCodeFormatFetch,
+        UnmeasuredTileExtendedRange,
     }
     BindingSource {
         Buffer(f0), Texture(f0), Sampler(f0), CombinedTextureSampler { texture, sampler },

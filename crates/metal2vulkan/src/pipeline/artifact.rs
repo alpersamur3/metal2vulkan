@@ -1753,6 +1753,18 @@ pub enum PrecisionNote {
     /// written `float` otherwise, and a loaded texel's `code / (2^b - 1)` rounded as a written
     /// one. Nothing else in the stage changes. Validation derives no tolerance from it.
     UnmeasuredCodeFormatFetch,
+    /// A tile function reads or writes (`air.load.implicit_imageblock`, a cell pointer) a color
+    /// attachment of an extended-range two-plane or ten-bit format (`RGB10A8_2P_XR10`,
+    /// `BGRA10_XR`, `BGR10_XR` and their `_sRGB` twins) that its tile pipeline's descriptor
+    /// names. Metal's tile memory holds such an attachment as `half` through a render pass
+    /// (measured through fetch and blends), and the function's cell holds each pixel's `half`s as
+    /// the fetch reads them, its stores encoding them to the codes as a kernel's write does; no
+    /// probe has read these cells through a tile function on a Mac, so the member's size and
+    /// type, and the value a read gives, are those of the fetch's tile. **Residual:** a read may
+    /// answer another `half` than Metal's cell holds (a code of 1023, which the tile holds as
+    /// 1022's value), and a pixel the function stores back may keep another code than Metal's.
+    /// Nothing else in the stage changes. Validation derives no tolerance from it.
+    UnmeasuredTileExtendedRange,
 }
 
 /// The math mode of an entry's module, which decides, on a device whose `float` functions are

@@ -25,6 +25,10 @@
 //!   bits, each access converting them as Metal's pack functions do: every format's reads, stores
 //!   and a read after the function's own write, against the probes's model; and through `half`
 //!   members, against probe 12's.
+//! - `cfb_tile_norm`'s `half4` entries over an extended-range attachment (`RGB10A8_2P_XR10`,
+//!   `BGRA10_XR`, `BGR10_XR` and their `_sRGB` twins), whose cell holds the tile's `half`s: a
+//!   read answers Metal's tile value of each code, a write stores the codes a kernel's write of
+//!   the `half`s stores, and the attachment is bound in its raw format.
 //! - The refusals are typed: no tile inputs, a converting format, an attachment without a format,
 //!   a multisampled pass, a threadgroup variable in a tile function; the binder specializes the
 //!   render area, refuses an empty one, and binds the attachments in their staging formats, and
@@ -43,8 +47,10 @@ use crate::device::profile::DeviceProfile;
 use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::{BindError, DescriptorError, Error, Feature, Needs, RuntimeInput};
 use crate::library::Library;
+use crate::lower::arith::extended_range::tests::{alpha_byte, code, raw, tile_model};
 use crate::lower::select::{LowerInputs, Plan};
 use crate::lower::texture::TexelClass;
+use crate::metal::format::ExtendedRange;
 use crate::metal::PixelFormat;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
@@ -2290,6 +2296,262 @@ fn a_normalized_attachment_is_bound_through_its_bits() {
             assert!(
                 not_implemented(dev.compile_tile_pipeline(&d, &b)),
                 "{stem} {entry} {pf:?}"
+            );
+        }
+    }
+    assert!(planned > 0);
+}
+
+/// The extended-range attachments a tile function stages: each pixel format with its form.
+const XR_ATTACHMENTS: [(PixelFormat, ExtendedRange); 6] = [
+    (PixelFormat::BGR10XR, ExtendedRange::Bgr10 { srgb: false }),
+    (
+        PixelFormat::BGR10XRSRGB,
+        ExtendedRange::Bgr10 { srgb: true },
+    ),
+    (PixelFormat::BGRA10XR, ExtendedRange::Bgra10 { srgb: false }),
+    (
+        PixelFormat::BGRA10XRSRGB,
+        ExtendedRange::Bgra10 { srgb: true },
+    ),
+    (
+        PixelFormat::RGB10A82PXR10,
+        ExtendedRange::Planes { srgb: false },
+    ),
+    (
+        PixelFormat::RGB10A82PXR10SRGB,
+        ExtendedRange::Planes { srgb: true },
+    ),
+];
+
+/// The codes a raw texel of `form` holds, red first (a two-plane texel's alpha its byte, a
+/// `BGR10_XR` texel's alpha 0), without the bits Metal does not read.
+fn xr_codes(form: ExtendedRange, t: [u32; 4]) -> [u32; 4] {
+    match form {
+        ExtendedRange::Bgr10 { .. } => [t[0] >> 20 & 0x3FF, t[0] >> 10 & 0x3FF, t[0] & 0x3FF, 0],
+        ExtendedRange::Planes { .. } => [
+            t[0] >> 20 & 0x3FF,
+            t[0] >> 10 & 0x3FF,
+            t[0] & 0x3FF,
+            t[1] & 0xFF,
+        ],
+        _ => [t[2] >> 6, t[1] >> 6, t[0] >> 6, t[3] >> 6],
+    }
+}
+
+/// Run `entry` of `cfb_tile_norm` over an attachment of `pf` whose raw texels are `texels` (rows
+/// of one tile's width, a whole number of tiles), with `buffer` at buffer 0, on each of
+/// [`NORM_PROFILES`] that compiles it: each profile's plan, buffer and texels after.
+fn xr_runs(
+    bc: &[u8],
+    entry: &str,
+    pf: PixelFormat,
+    buffer: &[u8],
+    texels: &[[u32; 4]],
+) -> Vec<(String, Plan, Vec<u8>, Vec<[u32; 4]>)> {
+    let height = (texels.len() as u32).div_ceil(16);
+    let inputs = tile_inputs(&[pf]);
+    let mut out = Vec::new();
+    for (stem, p) in committed_profiles().expect("profiles") {
+        if !NORM_PROFILES.contains(&stem.as_str()) {
+            continue;
+        }
+        let Some((plan, m)) = module(bc, entry, &stem, &p, &inputs) else {
+            continue;
+        };
+        let mut img = Image::new(attachment(0), [16, height, 1], 1, 1, 1);
+        img.texels.copy_from_slice(texels);
+        let d = Tiles {
+            area: [16, height],
+            tile: [16, 16],
+            threads: [16, 16],
+            buffer: buffer.to_vec(),
+            attachments: &[],
+            nominal: None,
+        };
+        let (buf, images) = run_images(&plan, &m, &d, vec![img]);
+        out.push((stem, plan, buf, images.into_iter().next().expect("image")));
+    }
+    out
+}
+
+/// A tile function's implicit imageblock over an extended-range attachment reads Metal's tile
+/// value of each code, as a framebuffer fetch does (`extended_range::tile_value`): a `half4`
+/// member holds each pixel's four `half`s, whatever the bits Metal does not read hold, and the
+/// attachment's codes stay as they were where the function writes nothing. The texels cover every
+/// code of each channel (1024 pixels, four tiles).
+#[test]
+fn an_extended_range_attachment_reads_metals_tile_value() {
+    let Some(bc) = assemble("cfb_tile_norm") else {
+        return;
+    };
+    let cells = 4 * NORM_CELLS;
+    let mut ran = 0;
+    for (pf, form) in XR_ATTACHMENTS {
+        let alpha = |c: u32| match form {
+            ExtendedRange::Planes { .. } => c % 256,
+            _ => c,
+        };
+        let rgba = |c: u32| [c, 1023 - c, (c * 7) % 1024, alpha(c)];
+        let texels: Vec<[u32; 4]> = (0..cells as u32)
+            .map(|c| raw(form, rgba(c), c * 13))
+            .collect();
+        for (stem, plan, buf, after) in
+            xr_runs(&bc, "cfb_tn_hread4", pf, &vec![0xAB; cells * 16], &texels)
+        {
+            assert!(
+                plan.precision
+                    .contains(&crate::pipeline::PrecisionNote::UnmeasuredTileExtendedRange),
+                "{stem} {pf:?}"
+            );
+            let got = floats(&buf);
+            for c in 0..cells {
+                let want = tile_model(form, rgba(c as u32)).map(f32::to_bits);
+                let have: Vec<u32> = got[4 * c..4 * c + 4].iter().map(|x| x.to_bits()).collect();
+                assert_eq!(have, want, "{stem} {pf:?} code {c}");
+            }
+            assert_eq!(after, texels, "{stem} {pf:?} keeps");
+            ran += 1;
+        }
+    }
+    assert!(ran > 0);
+}
+
+/// A tile function's implicit imageblock over an extended-range attachment stores the codes a
+/// kernel's write of the cell's `half`s stores (`extended_range::encode`): each color channel
+/// rounded to its code (an `_sRGB` form's through Metal's table, a value past the range
+/// saturating), alpha to its code or byte. The values are Metal's tile value of every code and
+/// the specials a write may hold.
+#[test]
+fn an_extended_range_attachment_stores_metals_codes() {
+    let Some(bc) = assemble("cfb_tile_norm") else {
+        return;
+    };
+    let specials = [
+        0.0f32, -0.0, 0.25, 1.25, -0.75, 1.5, -1.5, 2.0, -2.0, 0.5, -0.5, 1.0, 65504.0, -65504.0,
+    ];
+    let mut ran = 0;
+    for (pf, form) in XR_ATTACHMENTS {
+        let mut xs: Vec<f32> = specials.to_vec();
+        for c in 0..1024u32 {
+            // Every code's tile value is an exact `half`, in each channel.
+            xs.extend(tile_model(form, [c, c, c, c % 256]));
+        }
+        let cells = xs.len().div_ceil(3).div_ceil(NORM_CELLS) * NORM_CELLS;
+        let lane = |i: usize, k: usize| xs[(3 * i + k) % xs.len()];
+        let mut values = Vec::with_capacity(cells * 8);
+        for i in 0..cells {
+            for k in 0..4 {
+                values.extend(f32_to_half_bits(lane(i, k).to_bits()).to_le_bytes());
+            }
+        }
+        let cleared = vec![raw(form, [0; 4], 0xFFFF_FFFF); cells];
+        for (stem, _, _, after) in xr_runs(&bc, "cfb_tn_hwrite4", pf, &values, &cleared) {
+            let srgb = form.srgb();
+            for (i, &t) in after.iter().enumerate() {
+                let (r, g, b, a) = (lane(i, 0), lane(i, 1), lane(i, 2), lane(i, 3));
+                let alpha = match form {
+                    ExtendedRange::Bgr10 { .. } => 0,
+                    ExtendedRange::Planes { .. } => alpha_byte(a),
+                    _ => code(a, srgb, true),
+                };
+                let want = [
+                    code(r, srgb, false),
+                    code(g, srgb, false),
+                    code(b, srgb, false),
+                    alpha,
+                ];
+                assert_eq!(
+                    xr_codes(form, t),
+                    want,
+                    "{stem} {pf:?} cell {i}: {:?}",
+                    [r, g, b, a]
+                );
+            }
+            ran += 1;
+        }
+    }
+    assert!(ran > 0);
+}
+
+/// A tile function's extended-range attachment is bound in its raw format (the codes the render
+/// pass stores), whatever the format's `half` cell: `R32_UINT` for `BGR10_XR`,
+/// `R16G16B16A16_UINT` for `BGRA10_XR`, `R32G32_UINT` for `RGB10A8_2P_XR10`. A member or an
+/// access of another size than the `half4` is refused as not implemented, as are the padded and
+/// bfloat forms, whose tile Metal has not been read for.
+#[test]
+fn an_extended_range_attachment_is_bound_through_its_codes() {
+    let Some(bc) = assemble("cfb_tile_norm") else {
+        return;
+    };
+    let not_implemented = |r: Result<ComputePipeline, Error>| match r {
+        Err(Error::Unsupported(u)) => {
+            u.feature == Feature::TileShading && u.needs == Needs::NotImplemented
+        }
+        _ => false,
+    };
+    let view_of = |form: ExtendedRange| match form {
+        ExtendedRange::Bgr10 { .. } => vk::Format::R32_UINT,
+        ExtendedRange::Bgra10 { .. } => vk::Format::R16G16B16A16_UINT,
+        _ => vk::Format::R32G32_UINT,
+    };
+    let mut planned = 0;
+    for stem in ["moltenvk-m3", "lavapipe", "amd-rdna2-apu-radv"] {
+        let dev = device(stem);
+        let b = Budget::standard();
+        let mut s = BindState::default();
+        s.stages.insert(Stage::Kernel, StageTable::default());
+        s.imageblock_size = ImageblockSize::new(16, 16);
+        s.render_area = [16, 16];
+        for (pf, form) in XR_ATTACHMENTS {
+            for entry in ["cfb_tn_hread4", "cfb_tn_hwrite4"] {
+                let pipe = match dev.compile_tile_pipeline(&descriptor(&bc, entry, &[Some(pf)]), &b)
+                {
+                    Ok(p) => p,
+                    // A profile without the extended storage formats refuses the views.
+                    Err(Error::Unsupported(u)) if u.feature == Feature::Format => continue,
+                    Err(e) => panic!("{stem} {entry} {pf:?}: {e}"),
+                };
+                assert!(
+                    pipe.dependencies.iter().any(|d| d.fact
+                        == RuntimeFact::TileAttachmentFormat {
+                            color: 0,
+                            format: pf
+                        }),
+                    "{stem} {entry} {pf:?}"
+                );
+                let plan = pipe.plan(&dev, &s.shape()).expect("plan");
+                assert!(
+                    plan.descriptors.iter().any(|w| w.source
+                        == WriteSource::TileAttachment {
+                            color_index: 0,
+                            format: view_of(form),
+                            view: StorageAttachmentView::Attachment,
+                            view_alias: None,
+                        }),
+                    "{stem} {entry} {pf:?}: {:?}",
+                    plan.descriptors
+                );
+                planned += 1;
+            }
+            // A member of `float` lanes, or of fewer `half`s, does not fill the cell's `half4`.
+            for entry in ["cfb_tn_read4", "cfb_tn_hread1", "cfb_tn_hread2"] {
+                let d = descriptor(&bc, entry, &[Some(pf)]);
+                assert!(
+                    not_implemented(dev.compile_tile_pipeline(&d, &b)),
+                    "{stem} {entry} {pf:?}"
+                );
+            }
+        }
+        for pf in [
+            PixelFormat::R10UnormX6,
+            PixelFormat::RG10UnormX12SRGB,
+            PixelFormat::RGBA16Bfloat,
+        ] {
+            let d = descriptor(&bc, "cfb_tn_hread4", &[Some(pf)]);
+            assert!(
+                not_implemented(dev.compile_tile_pipeline(&d, &b)),
+                "{stem} {pf:?}"
             );
         }
     }

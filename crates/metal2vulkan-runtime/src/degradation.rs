@@ -2044,6 +2044,12 @@ degradations! {
         /// alpha 1, which no probe has read through fetch on a Mac; a loaded texel reads its code
         /// over `2^b - 1` rounded so.
         UnmeasuredCodeFormatFetch = "unmeasured-code-format-fetch";
+        /// A tile function reads or writes a color attachment of an extended-range format
+        /// (`RGB10A8_2P_XR10`, `BGRA10_XR`, `BGR10_XR` and their `_sRGB` twins) through its
+        /// imageblock: the cell holds the `half`s a framebuffer fetch reads (Metal's tile memory,
+        /// measured through fetch) and a store encodes them to the codes as a kernel's write does;
+        /// no probe has read these cells through a tile function on a Mac.
+        UnmeasuredTileExtendedRange = "unmeasured-tile-extended-range";
     }
 }
 

@@ -2559,6 +2559,14 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   the pass loaded reads its code over `2^b - 1` rounded so. No probe has read these formats through
   fetch on a Mac, so a read may differ from Metal's by the neighbouring `half` or by what Metal's
   tile holds for a loaded code. Validation derives no tolerance for it.
+- `metal2vulkan-degrade-unmeasured-tile-extended-range` (precision).
+  `PrecisionNote::UnmeasuredTileExtendedRange`: A tile function reads or writes a color attachment
+  of an extended-range format (`RGB10A8_2P_XR10`, `BGRA10_XR`, `BGR10_XR` and their `_sRGB` twins)
+  through its imageblock. The function's cell holds each pixel's `half`s as a framebuffer fetch
+  reads them (Metal's tile memory, measured through fetch and blends), and its stores encode them
+  to the codes as a kernel's write does. No probe has read these cells through a tile function on
+  a Mac, so a read may differ from Metal's by the `half` Metal's cell holds for a code of 1023, and
+  a stored pixel may keep another code. Validation derives no tolerance for it.
 
 - `metal2vulkan-degrade-depth-twin-comparison` (retired). Replaced by
   metal2vulkan-degrade-device-depth-comparison and, on a device without

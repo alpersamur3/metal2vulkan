@@ -386,7 +386,7 @@ fn round_even(x: f64) -> f64 {
 }
 
 /// The code Metal writes for color value `v` (alpha where `alpha`).
-fn code(v: f32, srgb: bool, alpha: bool) -> u32 {
+pub(crate) fn code(v: f32, srgb: bool, alpha: bool) -> u32 {
     let v = if v.is_nan() { 0.0 } else { v };
     let v = if alpha { v.clamp(0.0, 1.0) } else { v };
     let neg = v < 0.0;
@@ -1233,7 +1233,7 @@ fn arithmetic_holds(
 }
 
 /// The code a write of alpha value `v` stores in a two-plane texel's alpha byte.
-fn alpha_byte(v: f32) -> u32 {
+pub(crate) fn alpha_byte(v: f32) -> u32 {
     let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
     round_even(f64::from(v) * 255.0) as u32
 }
