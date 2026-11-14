@@ -1,0 +1,226 @@
+//! The staging buffer `Texture::get_bytes` reads an image back through (`texture.rs`'s
+//! `read_region`), kept by the device between calls instead of made and freed per call, and, on a
+//! device with no host-cached coherent memory, placed in host-cached memory that is not coherent.
+//!
+//! - **Why.** reims shows the guest's screen by reading its frame target back once per frame
+//!   (24 MB at 1179 x 2556 with 8-byte texels). A buffer per frame costs a `vkAllocateMemory`
+//!   and a bind that pins thousands of pages on `mali_kbase`, and where the only host-visible
+//!   coherent memory is uncached (ARM Mali, PowerVR) the host's copy out of it ran at 92 MB/s:
+//!   250 ms a frame.
+//! - **Memory.** [`MemoryClass::Readback`]: `Shared`'s type where the device has one the host
+//!   caches and keeps coherent, as before; else a type the host caches without coherence, whose
+//!   range this module invalidates ([`Memory::invalidate`]) after the GPU's copy completed and
+//!   before the host reads, as Vulkan requires. Only this buffer takes such a type: images and
+//!   every other buffer keep `Shared`'s rule (`memory.rs`, [`host_cached`](crate::memory)).
+//! - **Kept.** The device keeps one idle buffer of up to [`KEPT_MAX`] bytes. A read takes it out
+//!   where it is large enough, and gives it back as it ends; a read that finds none (another
+//!   thread has it) or one too small makes a buffer of its own. Of two buffers given back the
+//!   larger is kept, so the buffer grows to the largest frame read and no more. A buffer whose
+//!   submission failed is released, not kept: its work may still be pending. The device releases
+//!   its idle buffer as it is destroyed.
+//! - **Stale state.** None: every byte a read returns the GPU's copy wrote just before, and the
+//!   buffer is host memory of this process outside the Metal address space, so a suspend and a
+//!   resume of the guest's GPU state (a quick save and its load) leave nothing in it that matters.
+
+use super::device::lock;
+use super::error::{vulkan, Error, MemoryKind};
+use super::exit_guard;
+use super::memory::{allocate, readback_requirements, Memory, MemoryClass, Placement};
+use super::mipmap_scratch::{Spare, Take};
+use super::Device;
+use crate::release;
+use ash::vk;
+
+/// The most bytes of an idle buffer the device keeps: a frame of a 4K display with 8-byte texels
+/// is 66 MB, so a larger read (a guest's own `getBytes` of a big texture) is made, used and
+/// released as before, and holds no memory afterwards.
+pub(super) const KEPT_MAX: u64 = 96 << 20;
+
+/// A buffer and the memory it is bound to.
+#[derive(Debug)]
+pub(super) struct Block {
+    raw: vk::Buffer,
+    placement: Placement,
+    /// The bytes the buffer holds.
+    len: u64,
+    /// The device's `nonCoherentAtomSize` where the memory is not coherent, so that the host's
+    /// reads follow an invalidation; `None` where it is.
+    invalidate: Option<u64>,
+}
+
+impl Block {
+    /// A buffer of `len` bytes.
+    fn make(device: &Device, len: u64) -> Result<Block, Error> {
+        let shared = device.shared();
+        let raw_device = shared.vk();
+        let info = shared.sharing().buffer(
+            vk::BufferCreateInfo::default()
+                .size(len)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
+        );
+        // SAFETY: the device is live and `info` valid.
+        let raw = unsafe { raw_device.create_buffer(&info, None) }.map_err(vulkan)?;
+        // SAFETY: `raw` is a live buffer of this device.
+        let requirements = unsafe { raw_device.get_buffer_memory_requirements(raw) };
+        let atom = lock(&shared.memory).atom();
+        let requirements = readback_requirements(&requirements, atom);
+        let placement = match allocate(
+            &shared.memory,
+            raw_device,
+            &requirements,
+            MemoryClass::Readback,
+        ) {
+            Ok(placement) => placement,
+            Err(error) => {
+                // SAFETY: the buffer is unused.
+                unsafe { release::object(raw_device, raw) };
+                return Err(error);
+            }
+        };
+        let free = |raw, placement: &Placement| {
+            // SAFETY: nothing used the buffer.
+            unsafe { release::object(raw_device, raw) };
+            lock(&shared.memory).free(raw_device, placement);
+        };
+        if placement.mapped.is_none() {
+            free(raw, &placement);
+            return Err(Error::OutOfMemory(MemoryKind::Host));
+        }
+        // SAFETY: the placement meets the buffer's requirements and is not bound elsewhere.
+        if let Err(error) =
+            unsafe { raw_device.bind_buffer_memory(raw, placement.memory, placement.offset) }
+        {
+            free(raw, &placement);
+            return Err(vulkan(error));
+        }
+        let invalidate = lock(&shared.memory).incoherent(&placement).then_some(atom);
+        Ok(Block {
+            raw,
+            placement,
+            len,
+            invalidate,
+        })
+    }
+
+    /// Release the buffer and its memory.
+    ///
+    /// # Safety
+    ///
+    /// No command that uses the buffer is pending.
+    unsafe fn release(self, device: &ash::Device, memory: &mut Memory) {
+        // SAFETY: the caller's.
+        unsafe { release::object(device, self.raw) };
+        memory.free(device, &self.placement);
+    }
+}
+
+/// The device's idle buffer ([`DeviceShared::readback`](super::device::DeviceShared)), with the
+/// bytes it holds: the spare-block rule of `generate_mipmaps`' scratch (`mipmap_scratch.rs`).
+pub(super) type Kept = Spare<Block>;
+
+/// Whether the device keeps an idle buffer of `len` bytes ([`KEPT_MAX`]).
+pub(super) fn keeps(len: u64) -> bool {
+    len <= KEPT_MAX
+}
+
+impl Spare<Block> {
+    /// Release the idle buffer as the device is destroyed.
+    pub(super) fn destroy(&mut self, device: &ash::Device, memory: &mut Memory) {
+        if let Some(block) = self.drain() {
+            // SAFETY: the device is idle, so no command uses the buffer.
+            unsafe { block.release(device, memory) };
+        }
+    }
+}
+
+/// A buffer of `len` bytes for one read, given back to its device as it drops (the module docs).
+pub(super) struct ReadStaging<'a> {
+    device: &'a Device,
+    block: Option<Block>,
+    len: usize,
+    /// The GPU's copy into it completed ([`ReadStaging::copied`]): only then may it be kept.
+    done: bool,
+}
+
+impl<'a> ReadStaging<'a> {
+    /// A buffer of `len` bytes: the device's idle one where it is large enough, else a new one.
+    pub(super) fn new(device: &'a Device, len: u64) -> Result<ReadStaging<'a>, Error> {
+        let size = usize::try_from(len).map_err(|_| Error::OutOfMemory(MemoryKind::Host))?;
+        let shared = device.shared();
+        let taken = lock(&shared.readback).take(len);
+        let block = match taken {
+            Take::Reuse(block, _) => block,
+            Take::Make(stale) => {
+                if let Some(stale) = stale {
+                    // SAFETY: an idle buffer's last read completed.
+                    unsafe { stale.release(shared.vk(), &mut lock(&shared.memory)) };
+                }
+                Block::make(device, len)?
+            }
+        };
+        Ok(ReadStaging {
+            device,
+            block: Some(block),
+            len: size,
+            done: false,
+        })
+    }
+
+    /// The buffer.
+    pub(super) fn raw(&self) -> vk::Buffer {
+        self.block.as_ref().map_or(vk::Buffer::null(), |b| b.raw)
+    }
+
+    /// The submission that copied into the buffer completed: make its bytes visible to the host
+    /// where the memory is not coherent, and let the buffer be kept.
+    pub(super) fn copied(&mut self) -> Result<(), Error> {
+        self.done = true;
+        let Some(block) = &self.block else {
+            return Ok(());
+        };
+        match block.invalidate {
+            Some(atom) => Memory::invalidate(
+                self.device.shared().vk(),
+                &block.placement,
+                self.len as u64,
+                atom,
+            ),
+            None => Ok(()),
+        }
+    }
+
+    /// The bytes, through the mapping, after [`copied`](Self::copied).
+    pub(super) fn bytes(&mut self) -> &mut [u8] {
+        let Some(mapped) = self.block.as_ref().and_then(|b| b.placement.mapped) else {
+            unreachable!("checked when the buffer was made");
+        };
+        // SAFETY: the mapping covers the buffer's `len` bytes at least, which only this read uses
+        // (an idle buffer is leased to one read at a time); the submission that wrote them
+        // completed, and the range was invalidated where the memory is not coherent.
+        unsafe { std::slice::from_raw_parts_mut(mapped.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for ReadStaging<'_> {
+    fn drop(&mut self) {
+        let Some(block) = self.block.take() else {
+            return;
+        };
+        // Once the process is exiting, the buffer is left to its end (`exit_guard`).
+        let Some(_busy) = exit_guard::enter() else {
+            return;
+        };
+        let shared = self.device.shared();
+        let released = if self.done && keeps(block.len) {
+            let len = block.len;
+            lock(&shared.readback).give(block, len)
+        } else {
+            Some(block)
+        };
+        if let Some(block) = released {
+            // SAFETY: every submission that used the buffer completed, or failed: a buffer whose
+            // submission failed is released as the per-read buffer always was.
+            unsafe { block.release(shared.vk(), &mut lock(&shared.memory)) };
+        }
+    }
+}

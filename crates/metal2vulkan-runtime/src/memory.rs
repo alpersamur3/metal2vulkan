@@ -104,6 +104,11 @@ pub(super) enum MemoryClass {
     /// Device-local and lazily allocated where the device has such memory (`Memoryless`
     /// storage: a transient attachment's image), else as `Private`.
     Memoryless,
+    /// A buffer the host reads what the GPU wrote into, and nothing else uses (`readback.rs`):
+    /// exactly `Shared`'s types where the device has one the host caches and keeps coherent; else
+    /// first a type the host caches without coherence, whose reader invalidates its range
+    /// ([`invalidation_range`]), then `Shared`'s ([`readback_candidates`]).
+    Readback,
 }
 
 /// What a block of the runtime's holds: buffers (a heap's bytes and every buffer of addresses
@@ -248,6 +253,9 @@ pub(super) fn candidates(
     unified: bool,
 ) -> Vec<u32> {
     use vk::MemoryPropertyFlags as P;
+    if class == MemoryClass::Readback {
+        return readback_candidates(types, allowed, unified);
+    }
     let usable = |index: usize| allowed & (1 << index) != 0;
     // The flags required; those preferred, the first outweighing the second; those avoided,
     // weighed as the first preference.
@@ -273,6 +281,8 @@ pub(super) fn candidates(
             [P::HOST_CACHED, P::empty()],
             P::empty(),
         ),
+        // Answered above.
+        MemoryClass::Readback => unreachable!("answered by `readback_candidates`"),
     };
     let lacks = |flags: P, wanted: P| u8::from(!wanted.is_empty() && !flags.contains(wanted));
     let mut ranked: Vec<((u8, u8), u32)> = types
@@ -295,6 +305,70 @@ pub(super) fn candidates(
     // Vulkan lists memory types best first within equal properties; the sort is stable.
     ranked.sort_by_key(|&(rank, _)| rank);
     ranked.into_iter().map(|(_, index)| index).collect()
+}
+
+/// The memory types a [`MemoryClass::Readback`] buffer may use among `types` (the bits of
+/// `allowed`), best first. Where `Shared` memory has a type the host caches and keeps coherent
+/// (`HOST_VISIBLE | HOST_COHERENT | HOST_CACHED`: Turnip's, RADV's, ANV's, NVIDIA's) that is
+/// `Shared`'s list unchanged. Where it has none (ARM Mali and PowerVR list a coherent type the
+/// host does not cache, and a cached one that is not coherent), the host-cached types without
+/// coherence go first, then `Shared`'s: the host reads uncached memory at 92 MB/s on a
+/// Mali-G1-Ultra, 250 ms for a 1179 x 2556 frame. A reader of one of them invalidates the range
+/// it reads, after the GPU's copy completed ([`invalidation_range`]); [`Memory::incoherent`]
+/// says which. Images never take such a type ([`host_cached`]): their reads are the driver's.
+pub(super) fn readback_candidates(
+    types: &[vk::MemoryType],
+    allowed: u32,
+    unified: bool,
+) -> Vec<u32> {
+    use vk::MemoryPropertyFlags as P;
+    let shared = candidates(types, allowed, MemoryClass::Shared, unified);
+    let coherent_cached = P::HOST_VISIBLE | P::HOST_COHERENT | P::HOST_CACHED;
+    if (shared.iter()).any(|&index| {
+        types[index as usize]
+            .property_flags
+            .contains(coherent_cached)
+    }) {
+        return shared;
+    }
+    let mut list: Vec<u32> = (types.iter().enumerate())
+        .filter(|&(index, ty)| {
+            let flags = ty.property_flags;
+            allowed & (1 << index) != 0
+                && allocatable(flags)
+                && flags.contains(P::HOST_VISIBLE | P::HOST_CACHED)
+                && !flags.intersects(P::HOST_COHERENT | P::LAZILY_ALLOCATED)
+        })
+        .map(|(index, _)| index as u32)
+        .collect();
+    list.extend(shared);
+    list
+}
+
+/// The range `vkInvalidateMappedMemoryRanges` takes for the `len` bytes at `offset` of a block
+/// whose device has a `non_coherent_atom_size` of `atom` (a power of two): `(offset, size)` with
+/// the offset rounded down and the end rounded up to a multiple of it. A placement made at an
+/// alignment and size of `atom` ([`readback_requirements`]) needs no rounding and lies inside its
+/// block, so the rounded end does too.
+pub(super) fn invalidation_range(offset: u64, len: u64, atom: u64) -> (u64, u64) {
+    let atom = atom.max(1);
+    let start = offset - offset % atom;
+    let end = (offset + len).div_ceil(atom) * atom;
+    (start, end - start)
+}
+
+/// `requirements` of a readback buffer made to meet the device's `atom`: its size and alignment
+/// raised to multiples of it, so that its placement's range is whole atoms ([`invalidation_range`]).
+pub(super) fn readback_requirements(
+    requirements: &vk::MemoryRequirements,
+    atom: u64,
+) -> vk::MemoryRequirements {
+    let atom = atom.max(1);
+    vk::MemoryRequirements {
+        size: requirements.size.div_ceil(atom) * atom,
+        alignment: requirements.alignment.max(atom).div_ceil(atom) * atom,
+        ..*requirements
+    }
 }
 
 /// The block bookkeeping of one memory type: pure, so the CPU tests cover it. `T` is what the
@@ -806,6 +880,9 @@ pub(super) struct Memory {
     /// ([`binds_wait`]), so an image bound while such work may be queued takes a block of its own
     /// ([`allocate_image_while_queued`]).
     binds_wait: bool,
+    /// The device's `nonCoherentAtomSize`: what a range invalidated through a mapping is a
+    /// multiple of ([`Memory::invalidate`]); 1 until [`Memory::set_atom`].
+    atom: u64,
 }
 
 impl Memory {
@@ -840,6 +917,7 @@ impl Memory {
             parked_count: 0,
             log: None,
             binds_wait: binds_wait(driver),
+            atom: 1,
         }
     }
 
@@ -904,6 +982,45 @@ impl Memory {
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(super) fn park_by(&mut self, parking: Arc<Parking>) {
         self.parking = Some(parking);
+    }
+
+    /// The device's `nonCoherentAtomSize` is `atom` bytes.
+    pub(super) fn set_atom(&mut self, atom: u64) {
+        self.atom = atom.max(1);
+    }
+
+    /// The device's `nonCoherentAtomSize`.
+    pub(super) fn atom(&self) -> u64 {
+        self.atom
+    }
+
+    /// Whether the host's reads of `placement` need its range invalidated after the GPU wrote it:
+    /// its memory type is host-visible without `HOST_COHERENT`.
+    pub(super) fn incoherent(&self, placement: &Placement) -> bool {
+        let flags = self.types[placement.type_index as usize].property_flags;
+        flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            && !flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+    }
+
+    /// Make what the GPU wrote into the first `len` bytes of `placement` (host-visible, mapped,
+    /// of a type [`incoherent`](Self::incoherent)) visible to the host's reads through its mapping:
+    /// `vkInvalidateMappedMemoryRanges` of the range [`invalidation_range`] gives. After the
+    /// submission that wrote it completed, before the host reads.
+    /// Takes the device's [`atom`](Self::atom) as a value, so that no lock is held across the call.
+    pub(super) fn invalidate(
+        device: &ash::Device,
+        placement: &Placement,
+        len: u64,
+        atom: u64,
+    ) -> Result<(), Error> {
+        let (offset, size) = invalidation_range(placement.offset, len, atom);
+        let range = vk::MappedMemoryRange::default()
+            .memory(placement.memory)
+            .offset(offset)
+            .size(size);
+        // SAFETY: the memory is mapped whole (`BlockMaker::make`), the range lies in the placement
+        // (its size and offset are whole atoms, `readback_requirements`), and the device is live.
+        unsafe { device.invalidate_mapped_memory_ranges(&[range]) }.map_err(vulkan)
     }
 
     /// The bytes of `VkDeviceMemory` allocated so far for blocks of the runtime's own memory,

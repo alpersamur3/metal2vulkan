@@ -1,6 +1,7 @@
 use crate::memory::{
-    candidates, host_cached, host_cached_placement, host_incoherent, MemoryClass, Pool,
-    KEPT_EMPTY_BLOCKS, KEPT_EMPTY_FOR,
+    candidates, host_cached, host_cached_placement, host_incoherent, invalidation_range,
+    readback_candidates, readback_requirements, MemoryClass, Pool, KEPT_EMPTY_BLOCKS,
+    KEPT_EMPTY_FOR,
 };
 use ash::vk;
 use std::time::Instant;
@@ -424,4 +425,210 @@ fn short_buffers_are_placed_without_gaps() {
         assert_eq!((at, offset), (block, end), "{length} bytes");
         end = offset + requirements.size;
     }
+}
+
+/// Memory types as a GPU check's report lists them (`memory type N: flags 0x..`).
+fn listed(raw: &[u32]) -> Vec<vk::MemoryType> {
+    raw.iter()
+        .map(|&flags| ty(vk::MemoryPropertyFlags::from_raw(flags)))
+        .collect()
+}
+
+/// Where the device has a memory type the host caches and keeps coherent, a read-back buffer takes
+/// exactly the types `Shared` memory does, in the same order, whatever types its buffer allows
+/// and with or without unified memory: nothing changes on those devices.
+#[test]
+fn readback_memory_is_shared_memory_where_a_cached_coherent_type_exists() {
+    let want = vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT
+        | vk::MemoryPropertyFlags::HOST_CACHED;
+    let devices: [(&str, Vec<vk::MemoryType>); 10] = [
+        // Turnip on an Adreno 830 (Galaxy S25 Ultra, GPU check report of issue 15).
+        ("Adreno 830", listed(&[0x7, 0xf, 0xb, 0x11])),
+        // Turnip on an Adreno 825 (Poco F7, issue 4); 750 and 740 list the same shape.
+        (
+            "Adreno 825",
+            listed(&[0x1, 0x1, 0x1, 0xb, 0x7, 0x7, 0xf, 0x21, 0x11]),
+        ),
+        // Samsung's driver on an Xclipse 550 (issue 62): two copies of the same four types.
+        (
+            "Xclipse 550",
+            listed(&[0x7, 0xf, 0x1, 0x21, 0x7, 0xf, 0x1, 0x21]),
+        ),
+        // RADV on a Radeon 780M, with the AMD device-coherent types 14 to 16.
+        (
+            "RADV 780M",
+            listed(&[
+                0x1, 0x1, 0x6, 0x7, 0x7, 0xe, 0xe, 0x21, 0x21, 0x21, 0x21, 0x20, 0x20, 0xc1, 0xc6,
+                0xc7, 0xce,
+            ]),
+        ),
+        // ANV on an Iris Xe: every type device-local.
+        ("ANV Iris Xe", listed(&[0x1, 0x7, 0xf])),
+        // NVIDIA on an RTX 3090.
+        ("RTX 3090", listed(&[0x0, 0x1, 0x1, 0x6, 0xe, 0x7])),
+        ("MoltenVK", listed(&[0x1, 0xf, 0x11])),
+        ("lavapipe", listed(&[0xf])),
+        // A cached coherent type beside an incoherent one.
+        ("cached both ways", listed(&[0x7, 0xb, 0xf])),
+        ("cached coherent last", listed(&[0x1, 0x6, 0xb, 0xe])),
+    ];
+    for (name, types) in &devices {
+        for allowed in 0..1u32 << types.len() {
+            for unified in [false, true] {
+                let shared = candidates(types, allowed, MemoryClass::Shared, unified);
+                let got = candidates(types, allowed, MemoryClass::Readback, unified);
+                let cached_coherent = shared
+                    .iter()
+                    .any(|&index| types[index as usize].property_flags.contains(want));
+                if cached_coherent {
+                    assert_eq!(got, shared, "{name} allowed {allowed:#b} unified {unified}");
+                } else {
+                    // Only incoherent cached types may come first; the rest is Shared's.
+                    assert!(got.ends_with(&shared), "{name} allowed {allowed:#b}");
+                }
+            }
+        }
+    }
+    // On the devices that list a cached coherent type among all their types, the first pick is the
+    // one `Shared` makes today.
+    for (name, first) in [
+        ("Adreno 830", 1),
+        ("Xclipse 550", 1),
+        ("ANV Iris Xe", 2),
+        ("RTX 3090", 4),
+    ] {
+        let types = &devices.iter().find(|(n, _)| *n == name).unwrap().1;
+        let all = (1 << types.len()) - 1;
+        let got = candidates(types, all, MemoryClass::Readback, true);
+        assert_eq!(got[0], first, "{name}");
+        assert_eq!(got, candidates(types, all, MemoryClass::Shared, true));
+    }
+}
+
+/// Where the only host-cached type is not coherent (ARM Mali, PowerVR: types 0x7 uncached and 0xb
+/// cached, from the GPU check reports of issues 51, 52 and 64), a read-back buffer takes the
+/// cached type first and `Shared`'s after it, so that its allocation can still fall back.
+#[test]
+fn readback_memory_takes_a_cached_incoherent_type_first_where_there_is_no_cached_coherent_one() {
+    // Mali-G720 MC7 (MT6899, issue 51): 0x11 is lazily allocated, 0x21 protected.
+    let g720 = listed(&[0x7, 0xb, 0x11, 0x21]);
+    assert_eq!(candidates(&g720, 0b1111, MemoryClass::Shared, true), [0]);
+    assert_eq!(
+        candidates(&g720, 0b1111, MemoryClass::Readback, true),
+        [1, 0]
+    );
+    // Mali-G57 (UMS9230H, issue 52).
+    let g57 = listed(&[0x7, 0xb, 0x11]);
+    for unified in [false, true] {
+        assert_eq!(candidates(&g57, 0b111, MemoryClass::Shared, unified), [0]);
+        assert_eq!(
+            candidates(&g57, 0b111, MemoryClass::Readback, unified),
+            [1, 0]
+        );
+    }
+    // PowerVR BXM-8-256 (MT6855, issue 64): the cached type is the last.
+    let powervr = listed(&[0x1, 0x11, 0x7, 0xb]);
+    assert_eq!(candidates(&powervr, 0b1111, MemoryClass::Shared, true), [2]);
+    assert_eq!(
+        candidates(&powervr, 0b1111, MemoryClass::Readback, true),
+        [3, 2]
+    );
+    // A buffer that may not lie in the cached type takes what Shared does.
+    assert_eq!(candidates(&g720, 0b0001, MemoryClass::Readback, true), [0]);
+    assert_eq!(candidates(&g720, 0b1101, MemoryClass::Readback, true), [0]);
+    // ANV on Arrow Lake-S's Xe-LPG lists the same shape (0x7, 0xb, protected 0x21, 0x7): its
+    // buffer is the one case outside the Mali and PowerVR lists that now takes the cached type.
+    let arl = listed(&[0x7, 0xb, 0x21, 0x7]);
+    assert_eq!(
+        candidates(&arl, 0b1111, MemoryClass::Readback, true),
+        [1, 0, 3]
+    );
+    // Never taken: a lazily allocated or AMD device-coherent type with the cached bits, nor a
+    // type the host cannot see.
+    let cached = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED;
+    let odd = [
+        ty(vk::MemoryPropertyFlags::DEVICE_LOCAL
+            | vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT),
+        ty(cached | vk::MemoryPropertyFlags::LAZILY_ALLOCATED),
+        ty(cached | vk::MemoryPropertyFlags::DEVICE_COHERENT_AMD),
+        ty(vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_CACHED),
+    ];
+    assert_eq!(candidates(&odd, 0b1111, MemoryClass::Readback, true), [0]);
+    // No coherent type at all: the cached one alone, where Shared has none.
+    let alone = listed(&[0xa]);
+    assert_eq!(readback_candidates(&alone, 1, true), [0]);
+    assert!(candidates(&alone, 1, MemoryClass::Shared, true).is_empty());
+    // No host-visible type: none, as for Shared.
+    assert!(candidates(&listed(&[0x1]), 1, MemoryClass::Readback, true).is_empty());
+}
+
+/// Images and every other class keep their rule: the cached incoherent type is no image's
+/// (`host_cached`, `host_incoherent`), and no other class takes it.
+#[test]
+fn only_a_readback_buffer_takes_a_cached_incoherent_type() {
+    let g720 = listed(&[0x7, 0xb, 0x11, 0x21]);
+    assert_eq!(host_cached(&g720), 0);
+    assert_eq!(host_incoherent(&g720), 0b0010);
+    // The classes that require coherent memory never take it. `Private` and `Memoryless` need
+    // device-local memory and only rank host-visible types last, as before: their code is not
+    // touched.
+    for class in [
+        MemoryClass::Shared,
+        MemoryClass::WriteCombined,
+        MemoryClass::Managed,
+    ] {
+        for unified in [false, true] {
+            assert!(
+                !candidates(&g720, 0b1111, class, unified).contains(&1),
+                "{class:?}"
+            );
+        }
+    }
+}
+
+/// An invalidated range is whole atoms, covering the bytes read; a read-back buffer's placement,
+/// asked at a multiple of the atom, needs no rounding.
+#[test]
+fn an_invalidated_range_is_whole_atoms_covering_the_bytes() {
+    // The device's `nonCoherentAtomSize` is 64 on Mali, Adreno and RADV, 256 on some others.
+    assert_eq!(invalidation_range(0, 100, 64), (0, 128));
+    assert_eq!(invalidation_range(192, 64, 64), (192, 64));
+    assert_eq!(invalidation_range(200, 100, 64), (192, 128));
+    assert_eq!(invalidation_range(7, 5, 1), (7, 5));
+    assert_eq!(invalidation_range(7, 5, 0), (7, 5));
+    assert_eq!(invalidation_range(1 << 20, 1, 256), (1 << 20, 256));
+    for atom in [1u64, 4, 64, 128, 256] {
+        for offset in [0u64, 1, 63, 64, 65, 4096, 4097] {
+            for len in [1u64, 63, 64, 65, 1000, 24_110_592] {
+                let (start, size) = invalidation_range(offset, len, atom);
+                assert_eq!(start % atom, 0);
+                assert_eq!(size % atom, 0);
+                assert!(start <= offset && start + size >= offset + len);
+                assert!(start + size < offset + len + atom && offset - start < atom);
+            }
+        }
+    }
+    // A placement at the aligned size and alignment lies in whole atoms.
+    let wanted = vk::MemoryRequirements {
+        size: 24_110_100,
+        alignment: 16,
+        memory_type_bits: 0b11,
+    };
+    let aligned = readback_requirements(&wanted, 64);
+    assert_eq!(aligned.size % 64, 0);
+    assert!(aligned.size >= wanted.size && aligned.size < wanted.size + 64);
+    assert_eq!(aligned.alignment, 64);
+    assert_eq!(aligned.memory_type_bits, 0b11);
+    let wide = vk::MemoryRequirements {
+        alignment: 128,
+        ..wanted
+    };
+    assert_eq!(readback_requirements(&wide, 64).alignment, 128);
+    assert_eq!(readback_requirements(&wide, 256).alignment, 256);
+    assert_eq!(readback_requirements(&wanted, 0).size, wanted.size);
+    // At any offset the placement aligns to, the range is the placement's own.
+    let at = invalidation_range(aligned.alignment * 3, wanted.size, 64);
+    assert_eq!(at, (192, aligned.size));
 }

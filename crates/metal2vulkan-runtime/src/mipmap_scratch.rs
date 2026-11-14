@@ -80,6 +80,13 @@ impl<T> Spare<T> {
     }
 }
 
+impl<T> Spare<T> {
+    /// The spare, to release as the device is destroyed (`readback.rs`).
+    pub(super) fn drain(&mut self) -> Option<T> {
+        self.idle.take().map(|(block, _)| block)
+    }
+}
+
 /// A block: its buffer and the memory it is bound to.
 #[derive(Debug)]
 pub(super) struct Block {

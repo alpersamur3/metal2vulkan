@@ -64,6 +64,7 @@ use super::loader_word::LoaderWord;
 use super::memory::Memory;
 use super::memory_log::MemoryLog;
 use super::mipmap_scratch::MipmapScratch;
+use super::readback::Kept as ReadbackSpare;
 use super::owned_kernel::OwnedKernels;
 use super::render_state::{depth_bias_command, DepthBiasCommand, DepthRanges};
 use super::render_target::KeptRenderPasses;
@@ -332,6 +333,8 @@ pub(super) struct DeviceShared {
     pub(super) owned_kernels: Mutex<OwnedKernels>,
     /// The spare scratch block of `generate_mipmaps`' filter chains (`mipmap_scratch.rs`).
     pub(super) mipmap_scratch: Mutex<MipmapScratch>,
+    /// The idle staging buffer `get_bytes` reads images back through (`readback.rs`).
+    pub(super) readback: Mutex<ReadbackSpare>,
     /// The sample planes' copy kernels and merge pipelines, made on first use
     /// (`sample_planes.rs`).
     pub(super) planes: Mutex<PlanesObjects>,
@@ -653,6 +656,7 @@ impl Drop for DeviceShared {
         lock(&self.heaps).destroy(self.vk(), &mut lock(&self.memory));
         lock(&self.owned_kernels).destroy(self.vk());
         lock(&self.mipmap_scratch).destroy(self.vk(), &mut lock(&self.memory));
+        lock(&self.readback).destroy(self.vk(), &mut lock(&self.memory));
         self.gpu_pools.destroy(self.vk(), &mut lock(&self.memory));
         lock(&self.planes).destroy(self.vk());
         lock(&self.interleave).destroy(self.vk());
@@ -1382,6 +1386,8 @@ impl Device {
         // SAFETY: as above.
         let physical_properties = unsafe { instance.raw.get_physical_device_properties(physical) };
         let limits = physical_properties.limits;
+        // What a range the host invalidates is a multiple of (`readback.rs`).
+        memory.set_atom(limits.non_coherent_atom_size);
         let upload_alignment = [
             16,
             limits.min_storage_buffer_offset_alignment,
@@ -1637,6 +1643,7 @@ impl Device {
             sparse_image_made: AtomicBool::new(false),
             owned_kernels: Mutex::new(OwnedKernels::default()),
             mipmap_scratch: Mutex::default(),
+            readback: Mutex::default(),
             planes: Mutex::new(PlanesObjects::default()),
             interleave: Mutex::default(),
             kept: Mutex::default(),

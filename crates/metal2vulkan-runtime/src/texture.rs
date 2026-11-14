@@ -92,6 +92,7 @@ use super::neutral::Neutrals;
 use super::pvrtc::{
     cpu_order_of_rows, holds_blocks, image_block_extent, image_region, is_pvrtc, rows_of_cpu_order,
 };
+use super::readback::ReadStaging;
 use super::resource::{Identity, ObjectId, ResourceKey};
 use super::resource_ids::{Holder, IdHold, IdPlacement, IdSpace, ResourceId, ResourceIds};
 use super::shadow::ShadowCopies;
@@ -5348,9 +5349,11 @@ impl Texture {
                 return Ok(());
             }
         }
+        // The device's kept read-back buffer, in host-cached memory where the device has some
+        // (`readback.rs`).
         let device = self.device();
-        let mut staging = Staging::new(device, host.packed_len())?;
-        let (buffer, image) = (staging.raw, truth.raw.get());
+        let mut staging = ReadStaging::new(device, host.packed_len())?;
+        let (buffer, image) = (staging.raw(), truth.raw.get());
         truth.submit_copy(|raw, command_buffer| {
             transfer_barrier(raw, command_buffer, true);
             // SAFETY: the internal command buffer is recording; the staging buffer and the image
@@ -5366,6 +5369,9 @@ impl Texture {
             }
             transfer_barrier(raw, command_buffer, false);
         })?;
+        // The submission was waited for: the host's reads follow an invalidation where the
+        // memory is not coherent.
+        staging.copied()?;
         host.unpack(staging.bytes(), bytes);
         Ok(())
     }

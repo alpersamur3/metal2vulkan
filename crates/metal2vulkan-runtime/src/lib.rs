@@ -158,6 +158,7 @@ mod queue;
 mod range;
 mod rate_map;
 mod rate_mapped_pass;
+mod readback;
 mod reader_sizes;
 mod rebind;
 mod recorder;

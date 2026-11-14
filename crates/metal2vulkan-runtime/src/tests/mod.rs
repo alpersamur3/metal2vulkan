@@ -129,6 +129,7 @@ mod private_properties;
 mod queue;
 mod range;
 mod rate_map;
+mod readback;
 mod reader_sizes;
 mod render;
 mod replays;
