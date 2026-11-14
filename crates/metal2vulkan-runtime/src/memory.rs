@@ -345,6 +345,33 @@ pub(super) fn readback_candidates(
     list
 }
 
+/// Whether a read of an image placed in memory type `image_type` of `types` goes through the
+/// kept read-back buffer ([`MemoryClass::Readback`]) in place of a copy on the host: exactly
+/// when (a) the image's type lacks `HOST_CACHED`, so the host would read it at tens of MB/s, and
+/// (b) the first type a read-back buffer may take on this device (`readback_candidates` over all
+/// types) is host-visible and `HOST_CACHED`. An image already in cached memory, and a device with
+/// no cached type at all (no gain from a buffer), keep the host copy.
+pub(super) fn read_through_buffer(
+    types: &[vk::MemoryType],
+    unified: bool,
+    image_type: u32,
+) -> bool {
+    use vk::MemoryPropertyFlags as P;
+    let Some(image) = types.get(image_type as usize) else {
+        return false;
+    };
+    if image.property_flags.contains(P::HOST_CACHED) {
+        return false;
+    }
+    readback_candidates(types, u32::MAX, unified)
+        .first()
+        .is_some_and(|&index| {
+            types[index as usize]
+                .property_flags
+                .contains(P::HOST_VISIBLE | P::HOST_CACHED)
+        })
+}
+
 /// The range `vkInvalidateMappedMemoryRanges` takes for the `len` bytes at `offset` of a block
 /// whose device has a `non_coherent_atom_size` of `atom` (a power of two): `(offset, size)` with
 /// the offset rounded down and the end rounded up to a multiple of it. A placement made at an
@@ -1567,6 +1594,12 @@ impl Memory {
         self.types
             .get(index as usize)
             .map(|memory_type| memory_type.property_flags)
+    }
+
+    /// Whether a read of an image placed in memory type `image_type` goes through the kept
+    /// read-back buffer ([`read_through_buffer`]).
+    pub(super) fn reads_through_buffer(&self, image_type: u32) -> bool {
+        read_through_buffer(&self.types, self.unified, image_type)
     }
 
     /// Whether `placement` lies in device-local memory.

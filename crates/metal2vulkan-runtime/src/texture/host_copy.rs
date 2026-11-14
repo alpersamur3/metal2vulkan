@@ -26,9 +26,14 @@
 //!   system memory, where its GPU uses the image as fast as in device-local memory or faster, and a
 //!   1080p `get_bytes` takes 2.6 ms where it took 108 ms from RADV's uncached device-local type);
 //!   else the class's memory as before, counted (`WorkCounts::uncached_host_images`): the copies
-//!   stay on the host there too, slowly, since a copy through a submission on the device's first
-//!   queue would wait behind the program's work, and forever behind a command buffer waiting on an
-//!   event only a later command of the calling thread signals. Where the device reserved a staging
+//!   stay on the host there too, slowly, for writes, since a copy through a submission on the
+//!   device's first queue would wait behind the program's work, and forever behind a command
+//!   buffer waiting on an event only a later command of the calling thread signals. A `get_bytes`
+//!   from such an image (its type lacks `HOST_CACHED`) goes through the device's kept read-back
+//!   buffer in host-cached memory where the device has a cached type for it (Mali, PowerVR:
+//!   `memory::read_through_buffer`, `readback.rs`): the host reads uncached memory at tens of
+//!   MB/s, and the cost is that read being a waited submission on the first queue again, as on a
+//!   device without host image copy. Where the device reserved a staging
 //!   queue on a copy engine (`device/staging.rs`; NVIDIA), a color texture copies on the host only
 //!   from host-cached memory, and else on that queue (`texture/staging_copy.rs`).
 //! - **Made.** The making moves the image to `GENERAL` and writes zeros over every texel on the

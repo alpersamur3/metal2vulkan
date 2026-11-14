@@ -12,6 +12,15 @@
 //!   range this module invalidates ([`Memory::invalidate`]) after the GPU's copy completed and
 //!   before the host reads, as Vulkan requires. Only this buffer takes such a type: images and
 //!   every other buffer keep `Shared`'s rule (`memory.rs`, [`host_cached`](crate::memory)).
+//! - **Which reads.** A read of an image that takes host copies (`texture/host_copy.rs`) goes
+//!   through this buffer, not a copy on the host, when the image's memory type lacks
+//!   `HOST_CACHED` and the device has a cached type for the buffer
+//!   ([`read_through_buffer`](super::memory::read_through_buffer): Mali and PowerVR, whose
+//!   host-transfer images stay in uncached memory). Why: the host reads uncached memory at tens of
+//!   MB/s. The cost: that read is a waited submission on the device's first queue, as on a device
+//!   without host image copy. Elsewhere the host copy stays (images in cached memory; devices with
+//!   no cached type). Each distinct (path, memory type) says so once ([`host_copy_line`], and the
+//!   buffer's own line).
 //! - **Kept.** The device keeps one idle buffer of up to [`KEPT_MAX`] bytes. A read takes it out
 //!   where it is large enough, and gives it back as it ends; a read that finds none (another
 //!   thread has it) or one too small makes a buffer of its own. Of two buffers given back the
@@ -30,7 +39,7 @@ use super::mipmap_scratch::{Spare, Take};
 use super::Device;
 use crate::release;
 use ash::vk;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// The most bytes of an idle buffer the device keeps: a frame of a 4K display with 8-byte texels
 /// is 66 MB, so a larger read (a guest's own `getBytes` of a big texture) is made, used and
@@ -41,15 +50,91 @@ pub(super) const KEPT_MAX: u64 = 96 << 20;
 /// landed on ([`read_back_buffer_line`]).
 pub(super) const READ_BACK_BUFFER: &str = "metal2vulkan-read-back-buffer";
 
-/// The (memory type index, coherent) pair last announced in this process, packed as
-/// `index << 1 | coherent`; `u64::MAX` before the first.
-static ANNOUNCED: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The id name of the informational message that says a read of an image took a copy on the host
+/// ([`host_copy_line`]).
+pub(super) const READ_BACK_HOST_COPY: &str = "metal2vulkan-read-back-host-copy";
 
-/// Whether a buffer on memory type `index` (`coherent` or not) is to be announced: where the pair
-/// differs from the last one announced in this process, which it then records.
-fn announce(index: u32, coherent: bool) -> bool {
-    let key = (u64::from(index) << 1) | u64::from(coherent);
-    ANNOUNCED.swap(key, Ordering::Relaxed) != key
+/// How a read of an image is answered, for [`announce`].
+#[derive(Clone, Copy)]
+pub(super) enum ReadPath {
+    /// Through the kept buffer.
+    Buffer = 0,
+    /// A copy on the host out of the image's memory.
+    HostCopy = 1,
+}
+
+/// The (path, memory type index, flag) triples announced in this process, packed as
+/// `path << 33 | index << 1 | flag` (the flag: coherent for the buffer, cached for a host copy).
+static ANNOUNCED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Whether a read by `path` on memory type `index` with `flag` is to be announced: the first time
+/// the triple occurs in this process, which it then records.
+pub(super) fn announce(path: ReadPath, index: u32, flag: bool) -> bool {
+    let key = ((path as u64) << 33) | (u64::from(index) << 1) | u64::from(flag);
+    let mut seen = ANNOUNCED.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&key) {
+        return false;
+    }
+    seen.push(key);
+    true
+}
+
+/// The names of the memory property `flags` set, in a fixed order, joined by " | ".
+fn flag_words(flags: vk::MemoryPropertyFlags) -> String {
+    const NAMES: [(vk::MemoryPropertyFlags, &str); 6] = [
+        (vk::MemoryPropertyFlags::HOST_VISIBLE, "HOST_VISIBLE"),
+        (vk::MemoryPropertyFlags::HOST_COHERENT, "HOST_COHERENT"),
+        (vk::MemoryPropertyFlags::HOST_CACHED, "HOST_CACHED"),
+        (vk::MemoryPropertyFlags::DEVICE_LOCAL, "DEVICE_LOCAL"),
+        (
+            vk::MemoryPropertyFlags::LAZILY_ALLOCATED,
+            "LAZILY_ALLOCATED",
+        ),
+        (vk::MemoryPropertyFlags::PROTECTED, "PROTECTED"),
+    ];
+    let words: Vec<&str> = (NAMES.iter())
+        .filter(|(flag, _)| flags.contains(*flag))
+        .map(|(_, name)| *name)
+        .collect();
+    if words.is_empty() {
+        "no known flag".to_owned()
+    } else {
+        words.join(" | ")
+    }
+}
+
+/// The line that says a read of an image took a copy on the host out of memory type `index` of
+/// property `flags`; `, uncached` is appended where the type lacks `HOST_CACHED`, so a slow host
+/// copy that was not rerouted is visible. Prefix `m2v: read-back: host image copy`.
+pub(super) fn host_copy_line(index: u32, flags: vk::MemoryPropertyFlags) -> String {
+    let uncached = match flags.contains(vk::MemoryPropertyFlags::HOST_CACHED) {
+        true => "",
+        false => ", uncached",
+    };
+    format!(
+        "m2v: read-back: host image copy from memory type {index} ({}){uncached}",
+        flag_words(flags)
+    )
+}
+
+impl Device {
+    /// Whether a read of an image placed in memory type `image_type` goes through the kept buffer
+    /// ([`memory::read_through_buffer`](super::memory::read_through_buffer)).
+    pub(super) fn reads_through_buffer(&self, image_type: u32) -> bool {
+        lock(&self.shared().memory).reads_through_buffer(image_type)
+    }
+
+    /// Say once per distinct memory type that a read of an image took a host copy out of type
+    /// `image_type`.
+    pub(super) fn say_host_copy_read(&self, image_type: u32) {
+        let flags = lock(&self.shared().memory)
+            .type_flags(image_type)
+            .unwrap_or_default();
+        let cached = flags.contains(vk::MemoryPropertyFlags::HOST_CACHED);
+        if announce(ReadPath::HostCopy, image_type, cached) {
+            self.inform(READ_BACK_HOST_COPY, host_copy_line(image_type, flags));
+        }
+    }
 }
 
 /// The line that says where a read-back buffer of `len` bytes is: its memory type `index` with the
@@ -61,23 +146,7 @@ pub(super) fn read_back_buffer_line(
     flags: vk::MemoryPropertyFlags,
     coherent: bool,
 ) -> String {
-    const NAMES: [(vk::MemoryPropertyFlags, &str); 6] = [
-        (vk::MemoryPropertyFlags::HOST_VISIBLE, "HOST_VISIBLE"),
-        (vk::MemoryPropertyFlags::HOST_COHERENT, "HOST_COHERENT"),
-        (vk::MemoryPropertyFlags::HOST_CACHED, "HOST_CACHED"),
-        (vk::MemoryPropertyFlags::DEVICE_LOCAL, "DEVICE_LOCAL"),
-        (vk::MemoryPropertyFlags::LAZILY_ALLOCATED, "LAZILY_ALLOCATED"),
-        (vk::MemoryPropertyFlags::PROTECTED, "PROTECTED"),
-    ];
-    let words: Vec<&str> = (NAMES.iter())
-        .filter(|(flag, _)| flags.contains(*flag))
-        .map(|(_, name)| *name)
-        .collect();
-    let words = if words.is_empty() {
-        "no known flag".to_owned()
-    } else {
-        words.join(" | ")
-    };
+    let words = flag_words(flags);
     let after = if coherent {
         "coherent"
     } else {
@@ -151,7 +220,11 @@ impl Block {
             )
         };
         let flags = flags.unwrap_or_default();
-        if announce(placement.type_index(), invalidate.is_none()) {
+        if announce(
+            ReadPath::Buffer,
+            placement.type_index(),
+            invalidate.is_none(),
+        ) {
             device.inform(
                 READ_BACK_BUFFER,
                 read_back_buffer_line(len, placement.type_index(), flags, invalidate.is_none()),

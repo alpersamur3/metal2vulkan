@@ -5336,10 +5336,22 @@ impl Texture {
         let truth = view_shadow::truth(image);
         let copy = buffer_image_copy(image_region);
         if truth.takes_host_copies() {
-            let mut packed = vec![0; host.packed_len() as usize];
-            if truth.host_read(copy, &mut packed)? {
-                host.unpack(&packed, bytes);
-                return Ok(());
+            // An image in memory the host does not cache is read through the kept buffer, in
+            // memory it does, where the device has such a type (`readback.rs`); a host copy
+            // reads it at tens of MB/s. The copy to a buffer needs `TRANSFER_SRC`.
+            let image_type = truth.owner.releases().1.map(Placement::type_index);
+            let device = self.device();
+            let rerouted = image_type.is_some_and(|index| device.reads_through_buffer(index))
+                && truth.plan().usage.contains(ImageUsageFlags::TRANSFER_SRC);
+            if !rerouted {
+                let mut packed = vec![0; host.packed_len() as usize];
+                if truth.host_read(copy, &mut packed)? {
+                    if let Some(index) = image_type {
+                        device.say_host_copy_read(index);
+                    }
+                    host.unpack(&packed, bytes);
+                    return Ok(());
+                }
             }
         }
         if truth.takes_staging_copies() {

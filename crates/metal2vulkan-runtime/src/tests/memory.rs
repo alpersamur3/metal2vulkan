@@ -632,3 +632,37 @@ fn an_invalidated_range_is_whole_atoms_covering_the_bytes() {
     let at = invalidation_range(aligned.alignment * 3, wanted.size, 64);
     assert_eq!(at, (192, aligned.size));
 }
+
+/// A read of an image takes the kept buffer instead of a host copy exactly where the image's type
+/// lacks `HOST_CACHED` and the buffer would have a cached type (flags: 0x1 DL, 0x7 DL|HV|COH,
+/// 0xb DL|HV|CACHED, 0xf DL|HV|COH|CACHED, 0x11 DL|LAZY, 0x21 DL|PROTECTED).
+#[test]
+fn an_image_read_takes_the_buffer_only_from_uncached_memory_with_a_cached_type_for_it() {
+    use crate::memory::read_through_buffer as through;
+    // Mali-G720 (issue 51), image in type 0; Mali-G57 (issue 52), image in type 0.
+    let g720 = listed(&[0x7, 0xb, 0x11, 0x21]);
+    let g57 = listed(&[0x7, 0xb, 0x11]);
+    // PowerVR BXM-8-256 (issue 64), image in type 2.
+    let powervr = listed(&[0x1, 0x11, 0x7, 0xb]);
+    for unified in [false, true] {
+        assert!(through(&g720, unified, 0));
+        assert!(through(&g57, unified, 0));
+        assert!(through(&powervr, unified, 2));
+    }
+    // Adreno 830 (issue 15), image in type 1 or 0; Adreno 825 (issue 4), image in type 6.
+    let a830 = listed(&[0x7, 0xf, 0xb, 0x11]);
+    let a825 = listed(&[0x1, 0x1, 0x1, 0xb, 0x7, 0x7, 0xf, 0x21, 0x11]);
+    for unified in [false, true] {
+        assert!(!through(&a830, unified, 1));
+        assert!(!through(&a825, unified, 6));
+        // An image in a cached type keeps its host copy wherever the list has it.
+        assert!(!through(&a830, unified, 2));
+        assert!(!through(&g720, unified, 1));
+    }
+    // A device whose only host-visible types are uncached: no gain from a buffer.
+    let uncached = listed(&[0x1, 0x7, 0x7]);
+    assert!(!through(&uncached, false, 1));
+    assert!(!through(&uncached, true, 2));
+    // A type the device does not have.
+    assert!(!through(&g720, true, 9));
+}

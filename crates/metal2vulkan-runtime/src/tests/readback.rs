@@ -2,7 +2,9 @@
 //! spare-block rule of `generate_mipmaps`' scratch (`mipmap_scratch.rs`).
 
 use super::super::mipmap_scratch::{Spare, Take};
-use super::super::readback::{keeps, read_back_buffer_line, KEPT_MAX};
+use super::super::readback::{
+    announce, host_copy_line, keeps, read_back_buffer_line, ReadPath, KEPT_MAX,
+};
 use ash::vk::MemoryPropertyFlags as F;
 
 #[test]
@@ -107,4 +109,35 @@ fn a_buffer_larger_than_the_bound_is_not_kept() {
     assert!(keeps(KEPT_MAX));
     assert!(!keeps(KEPT_MAX + 1));
     assert!(!keeps(512 << 20));
+}
+
+#[test]
+fn the_host_copy_line_names_a_cached_type() {
+    let flags = F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED | F::DEVICE_LOCAL;
+    assert_eq!(
+        host_copy_line(1, flags),
+        "m2v: read-back: host image copy from memory type 1 \
+         (HOST_VISIBLE | HOST_COHERENT | HOST_CACHED | DEVICE_LOCAL)"
+    );
+}
+
+#[test]
+fn the_host_copy_line_marks_an_uncached_type() {
+    let flags = F::HOST_VISIBLE | F::HOST_COHERENT | F::DEVICE_LOCAL;
+    assert_eq!(
+        host_copy_line(0, flags),
+        "m2v: read-back: host image copy from memory type 0 \
+         (HOST_VISIBLE | HOST_COHERENT | DEVICE_LOCAL), uncached"
+    );
+}
+
+#[test]
+fn each_path_and_type_is_announced_once() {
+    // Types no other test uses: the record is process-wide.
+    assert!(announce(ReadPath::HostCopy, 200, true));
+    assert!(!announce(ReadPath::HostCopy, 200, true));
+    assert!(announce(ReadPath::Buffer, 200, true));
+    assert!(announce(ReadPath::HostCopy, 200, false));
+    assert!(announce(ReadPath::HostCopy, 201, true));
+    assert!(!announce(ReadPath::Buffer, 200, true));
 }
