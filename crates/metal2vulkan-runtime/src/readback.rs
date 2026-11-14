@@ -30,11 +30,61 @@ use super::mipmap_scratch::{Spare, Take};
 use super::Device;
 use crate::release;
 use ash::vk;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The most bytes of an idle buffer the device keeps: a frame of a 4K display with 8-byte texels
 /// is 66 MB, so a larger read (a guest's own `getBytes` of a big texture) is made, used and
 /// released as before, and holds no memory afterwards.
 pub(super) const KEPT_MAX: u64 = 96 << 20;
+
+/// The id name of the informational message that says which memory type the read-back buffer
+/// landed on ([`read_back_buffer_line`]).
+pub(super) const READ_BACK_BUFFER: &str = "metal2vulkan-read-back-buffer";
+
+/// The (memory type index, coherent) pair last announced in this process, packed as
+/// `index << 1 | coherent`; `u64::MAX` before the first.
+static ANNOUNCED: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Whether a buffer on memory type `index` (`coherent` or not) is to be announced: where the pair
+/// differs from the last one announced in this process, which it then records.
+fn announce(index: u32, coherent: bool) -> bool {
+    let key = (u64::from(index) << 1) | u64::from(coherent);
+    ANNOUNCED.swap(key, Ordering::Relaxed) != key
+}
+
+/// The line that says where a read-back buffer of `len` bytes is: its memory type `index` with the
+/// type's property `flags` in words, and whether the host's reads follow an invalidation after
+/// each copy (`coherent` false) or not. Plain ASCII, one line, prefix `m2v: read-back buffer:`.
+pub(super) fn read_back_buffer_line(
+    len: u64,
+    index: u32,
+    flags: vk::MemoryPropertyFlags,
+    coherent: bool,
+) -> String {
+    const NAMES: [(vk::MemoryPropertyFlags, &str); 6] = [
+        (vk::MemoryPropertyFlags::HOST_VISIBLE, "HOST_VISIBLE"),
+        (vk::MemoryPropertyFlags::HOST_COHERENT, "HOST_COHERENT"),
+        (vk::MemoryPropertyFlags::HOST_CACHED, "HOST_CACHED"),
+        (vk::MemoryPropertyFlags::DEVICE_LOCAL, "DEVICE_LOCAL"),
+        (vk::MemoryPropertyFlags::LAZILY_ALLOCATED, "LAZILY_ALLOCATED"),
+        (vk::MemoryPropertyFlags::PROTECTED, "PROTECTED"),
+    ];
+    let words: Vec<&str> = (NAMES.iter())
+        .filter(|(flag, _)| flags.contains(*flag))
+        .map(|(_, name)| *name)
+        .collect();
+    let words = if words.is_empty() {
+        "no known flag".to_owned()
+    } else {
+        words.join(" | ")
+    };
+    let after = if coherent {
+        "coherent"
+    } else {
+        "invalidated after each copy"
+    };
+    format!("m2v: read-back buffer: {len} bytes on memory type {index} ({words}), {after}")
+}
 
 /// A buffer and the memory it is bound to.
 #[derive(Debug)]
@@ -93,7 +143,20 @@ impl Block {
             free(raw, &placement);
             return Err(vulkan(error));
         }
-        let invalidate = lock(&shared.memory).incoherent(&placement).then_some(atom);
+        let (invalidate, flags) = {
+            let memory = lock(&shared.memory);
+            (
+                memory.incoherent(&placement).then_some(atom),
+                memory.type_flags(placement.type_index()),
+            )
+        };
+        let flags = flags.unwrap_or_default();
+        if announce(placement.type_index(), invalidate.is_none()) {
+            device.inform(
+                READ_BACK_BUFFER,
+                read_back_buffer_line(len, placement.type_index(), flags, invalidate.is_none()),
+            );
+        }
         Ok(Block {
             raw,
             placement,

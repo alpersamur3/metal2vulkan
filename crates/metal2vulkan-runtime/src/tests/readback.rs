@@ -2,7 +2,49 @@
 //! spare-block rule of `generate_mipmaps`' scratch (`mipmap_scratch.rs`).
 
 use super::super::mipmap_scratch::{Spare, Take};
-use super::super::readback::{keeps, KEPT_MAX};
+use super::super::readback::{keeps, read_back_buffer_line, KEPT_MAX};
+use ash::vk::MemoryPropertyFlags as F;
+
+#[test]
+fn the_line_names_a_coherent_cached_type() {
+    let flags = F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED;
+    assert_eq!(
+        read_back_buffer_line(12052800, 1, flags, true),
+        "m2v: read-back buffer: 12052800 bytes on memory type 1 \
+         (HOST_VISIBLE | HOST_COHERENT | HOST_CACHED), coherent"
+    );
+}
+
+#[test]
+fn the_line_names_a_cached_type_that_is_invalidated() {
+    let flags = F::HOST_VISIBLE | F::HOST_CACHED;
+    assert_eq!(
+        read_back_buffer_line(12052800, 3, flags, false),
+        "m2v: read-back buffer: 12052800 bytes on memory type 3 \
+         (HOST_VISIBLE | HOST_CACHED), invalidated after each copy"
+    );
+}
+
+#[test]
+fn the_line_says_so_for_a_type_with_no_known_flag() {
+    let line = read_back_buffer_line(4096, 0, F::empty(), false);
+    assert_eq!(
+        line,
+        "m2v: read-back buffer: 4096 bytes on memory type 0 (no known flag), \
+         invalidated after each copy"
+    );
+    assert!(line.is_ascii() && !line.contains('\n'));
+}
+
+#[test]
+fn the_line_lists_every_flag_in_a_fixed_order() {
+    let flags = F::DEVICE_LOCAL | F::HOST_VISIBLE | F::LAZILY_ALLOCATED | F::PROTECTED;
+    assert_eq!(
+        read_back_buffer_line(1, 7, flags, true),
+        "m2v: read-back buffer: 1 bytes on memory type 7 \
+         (HOST_VISIBLE | DEVICE_LOCAL | LAZILY_ALLOCATED | PROTECTED), coherent"
+    );
+}
 
 /// Block `id` of `size` bytes, as a test's stand-in.
 type Block = (u32, u64);
