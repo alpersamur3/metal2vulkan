@@ -1416,7 +1416,9 @@ impl Memory {
     /// `allowed` (the types both the pointer and the resource take): its placement at offset 0,
     /// whose `mapped` is `pointer`. The block is never pooled and is freed with the placement,
     /// as a dedicated block is (`host_memory.rs`). Refused when no type of `class` is among
-    /// `allowed`, else with the failure of the last type tried.
+    /// `allowed`, else with the failure of the last type tried. A refusal says what it compared
+    /// (`host_import_note.rs`): `of` is the types the pointer allows and the types the resource
+    /// allows, which `allowed` is the common part of, and every type tried is told with its answer.
     ///
     /// # Safety
     ///
@@ -1427,10 +1429,13 @@ impl Memory {
         device: &ash::Device,
         pointer: NonNull<u8>,
         size: u64,
-        allowed: u32,
-        class: MemoryClass,
+        (allowed, class): (u32, MemoryClass),
+        of: (u32, u32),
     ) -> Result<Placement, ImportFailure> {
         let mut failure = ImportFailure::NoMemoryType;
+        // What each type tried answered, for a refusal's note: empty (and unallocated) unless a
+        // type failed.
+        let mut answers: Vec<(u32, vk::Result)> = Vec::new();
         for type_index in candidates(&self.types, allowed, class, self.unified) {
             let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
@@ -1463,10 +1468,58 @@ impl Memory {
                         .add(size, true, block, size);
                     return Ok(self.placement((Holds::Buffers, type_index), index, 0, size, false));
                 }
-                Err(error) => failure = ImportFailure::Vulkan(error),
+                Err(error) => {
+                    answers.push((type_index, error));
+                    failure = ImportFailure::Vulkan(error);
+                }
             }
         }
+        self.note_host_refusal(&answers, (allowed, class), of, size);
         Err(failure)
+    }
+
+    /// Say why [`Memory::import_host`] imported `size` bytes nowhere (`host_import_note.rs`): no
+    /// type of `class` among `allowed` (the common part of the types `of` the pointer and the
+    /// resource), or the answer of each type it tried, `answers`.
+    fn note_host_refusal(
+        &self,
+        answers: &[(u32, vk::Result)],
+        (allowed, class): (u32, MemoryClass),
+        (pointer_types, buffer_types): (u32, u32),
+        size: u64,
+    ) {
+        use super::host_import_note::note;
+        let types = || {
+            let listed = (self.types.iter().enumerate())
+                .map(|(index, ty)| format!("{index}:0x{:x}", ty.property_flags.as_raw()))
+                .collect::<Vec<_>>();
+            listed.join(" ")
+        };
+        if answers.is_empty() {
+            note("no-memory-type", || {
+                let wanted = candidates(&self.types, !0, class, self.unified);
+                format!(
+                    "host-pointer types 0x{pointer_types:x}, buffer types 0x{buffer_types:x}, \
+                     both 0x{allowed:x}, class {class:?} takes types {wanted:?} of [{}], \
+                     candidates []",
+                    types()
+                )
+            });
+            return;
+        }
+        note("allocate", || {
+            let tried = (answers.iter())
+                .map(|&(index, result)| {
+                    let flags = self.type_flags(index).map_or(0, |flags| flags.as_raw());
+                    format!("type {index} flags 0x{flags:x} {result:?}")
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "class {class:?}, size 0x{size:x}, host-pointer types 0x{pointer_types:x}, \
+                 buffer types 0x{buffer_types:x}: {}",
+                tried.join(", ")
+            )
+        });
     }
 
     /// Import the dma-buf `fd`, `size` bytes, as memory of the best type of `class` among

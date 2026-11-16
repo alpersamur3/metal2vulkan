@@ -17,6 +17,7 @@ use super::device::lock;
 use super::error::MemoryKind;
 use super::error::{internal, invalid, nil, vulkan, Error, Problem, RuntimeGap};
 use super::heap::{Heap, HeapProblem};
+use super::host_import_note::note;
 use super::host_memory::{
     based_size, binds_in, buffer_base, import_refused, import_window, not_importable,
     refuse_unwritable, refused, Deallocator, HostMemory, HostRelease, ImportWindow, Importer,
@@ -780,7 +781,12 @@ impl Device {
                     .push_next(&mut external),
             );
             // SAFETY: the device is live and `info` and its chain valid.
-            let raw = unsafe { raw_device.create_buffer(&info, None) }.map_err(vulkan)?;
+            let raw = unsafe { raw_device.create_buffer(&info, None) }.map_err(|result| {
+                note("buffer", || {
+                    format!("vkCreateBuffer of 0x{size:x} bytes, base 0x{base:x}: {result:?}")
+                });
+                vulkan(result)
+            })?;
             shared.counts.buffer_made(info.usage);
             // SAFETY: `raw` is a live buffer of this device.
             let requirements = unsafe { raw_device.get_buffer_memory_requirements(raw) };
@@ -792,7 +798,12 @@ impl Device {
             })
         };
         let make = |base: u64| {
-            let padded = based_size(base, length).ok_or_else(not_importable)?;
+            let padded = based_size(base, length).ok_or_else(|| {
+                note("buffer", || {
+                    format!("the padded size of 0x{length:x} bytes from base 0x{base:x} overflows")
+                });
+                not_importable()
+            })?;
             // The window from `base` bytes below the buffer's bytes to its end: where it binds
             // (`binds_in`), the room it has.
             let whole = window.size - window.offset + base;
@@ -815,6 +826,19 @@ impl Device {
         unsafe { release::object(raw_device, first.raw) };
         let buffer = make(base)?;
         if buffer_base(window.offset, buffer.requirements.alignment) != base {
+            note("buffer", || {
+                format!(
+                    "the buffer's memory alignment changed with its size: offset 0x{:x}, base \
+                     0x{base:x} at alignment 0x{:x}, then alignment 0x{:x} (size 0x{:x}, \
+                     requirements size 0x{:x}, type bits 0x{:x})",
+                    window.offset,
+                    first.requirements.alignment,
+                    buffer.requirements.alignment,
+                    buffer.size,
+                    buffer.requirements.size,
+                    buffer.requirements.memory_type_bits
+                )
+            });
             // SAFETY: the buffer is unused.
             unsafe { release::object(raw_device, buffer.raw) };
             return Err(not_importable());
@@ -854,7 +878,25 @@ impl Device {
                 Err(error) if refused(&error) => error,
                 Err(error) => return Err(error),
             },
-            false => not_importable(),
+            false => {
+                // A gather source never has the pointer imported first; that is no refusal.
+                if !source.as_ref().is_some_and(gathers) {
+                    note("skipped", || {
+                        format!(
+                            "the pointer 0x{:x} of 0x{length:x} bytes was not imported: window \
+                             0x{:x} size 0x{:x} is not covered by the device's import alignment \
+                             0x{:x} (host page 0x{:x}); dma-buf source: {}",
+                            pointer.as_ptr() as u64,
+                            window.start,
+                            window.size,
+                            importer.alignment,
+                            importer.page,
+                            source.is_some()
+                        )
+                    });
+                }
+                not_importable()
+            }
         };
         source.map(Err).ok_or(refusal)
     }
@@ -1059,11 +1101,35 @@ impl Device {
     ) -> Result<Placement, Error> {
         let raw_device = self.shared().vk();
         let requirements = &buffer.requirements;
-        let at = binds_in(window, buffer.base, buffer.size, requirements)
-            .map_err(|_| not_importable())?;
-        let start = NonNull::new(start).ok_or_else(not_importable)?;
+        let at = binds_in(window, buffer.base, buffer.size, requirements).map_err(|kind| {
+            note("binding", || {
+                format!(
+                    "{kind:?}: window offset 0x{:x} size 0x{:x}, buffer base 0x{:x} size 0x{:x}, \
+                     requirements size 0x{:x} alignment 0x{:x}",
+                    window.offset,
+                    window.size,
+                    buffer.base,
+                    buffer.size,
+                    requirements.size,
+                    requirements.alignment
+                )
+            });
+            not_importable()
+        })?;
+        let start = NonNull::new(start).ok_or_else(|| {
+            note("binding", || "the window starts at address 0".to_owned());
+            not_importable()
+        })?;
         // SAFETY: `start` is host memory aligned to the import alignment (the window's).
-        let types = unsafe { importer.memory_types(raw_device, start) }.map_err(import_refused)?;
+        let types = unsafe { importer.memory_types(raw_device, start) }.map_err(|result| {
+            note("pointer-types", || {
+                format!(
+                    "vkGetMemoryHostPointerPropertiesEXT at 0x{:x}: {result:?}",
+                    start.as_ptr() as u64
+                )
+            });
+            import_refused(result)
+        })?;
         let allowed = types & requirements.memory_type_bits;
         // An allocation past the device's, refused before the driver sees it.
         let largest = self
@@ -1071,15 +1137,32 @@ impl Device {
             .allocation()
             .max_memory_allocation_size;
         if window.size > largest {
+            note("max-allocation", || {
+                format!(
+                    "window size 0x{:x} is past maxMemoryAllocationSize 0x{largest:x}",
+                    window.size
+                )
+            });
             return Err(Error::OutOfMemory(MemoryKind::Device));
         }
         // SAFETY: the caller's contract keeps the window mapped until the placement is freed,
         // and the buffer is unbound.
-        unsafe { self.import_now(buffer.raw, start, window.size, allowed, class, at) }
+        unsafe {
+            self.import_now(
+                buffer.raw,
+                start,
+                window.size,
+                (allowed, class),
+                (types, requirements.memory_type_bits),
+                at,
+            )
+        }
     }
 
     /// Import `size` bytes of host pages at `start` as memory of `class` among the types
     /// `allowed`, and bind `raw` in them `at` bytes in: the placement. Released again on failure.
+    /// `of` is the types the pointer allows and the types the buffer allows, which `allowed` is
+    /// the common part of: told in the note of a refusal.
     ///
     /// # Safety
     ///
@@ -1091,19 +1174,20 @@ impl Device {
         raw: vk::Buffer,
         start: NonNull<u8>,
         size: u64,
-        allowed: u32,
-        class: MemoryClass,
+        (allowed, class): (u32, MemoryClass),
+        of: (u32, u32),
         at: u64,
     ) -> Result<Placement, Error> {
         let shared = self.shared();
         let raw_device = shared.vk();
         // SAFETY: the caller's contract keeps the pages mapped until the placement is freed.
-        let placement =
-            unsafe { lock(&shared.memory).import_host(raw_device, start, size, allowed, class) }
-                .map_err(|failure| match failure {
-                    ImportFailure::NoMemoryType => not_importable(),
-                    ImportFailure::Vulkan(error) => import_refused(error),
-                })?;
+        let placement = unsafe {
+            lock(&shared.memory).import_host(raw_device, start, size, (allowed, class), of)
+        }
+        .map_err(|failure| match failure {
+            ImportFailure::NoMemoryType => not_importable(),
+            ImportFailure::Vulkan(error) => import_refused(error),
+        })?;
         // SAFETY: the placement is the pages' memory, the buffer's size and requirements of it
         // available from `at` (the caller's), and the buffer is unbound.
         let bound =
@@ -1114,6 +1198,13 @@ impl Device {
                 Ok(placement)
             }
             Err(error) => {
+                note("bind", || {
+                    format!(
+                        "vkBindBufferMemory at 0x{:x} of memory imported as type {}: {error:?}",
+                        placement.offset + at,
+                        placement.type_index()
+                    )
+                });
                 lock(&shared.memory).free(raw_device, &placement);
                 Err(vulkan(error))
             }
@@ -1148,12 +1239,28 @@ fn host_window(
 ) -> Result<HostWindow, Error> {
     let source = source.filter(|source| usable_source(importer, source));
     let at = pointer.as_ptr() as u64;
-    let window = import_window(at, length, importer.page, 1)
-        .map_err(|_| nil(call, Problem::BufferLength { length }))?;
+    let window = import_window(at, length, importer.page, 1).map_err(|kind| {
+        note("window", || {
+            format!(
+                "pointer 0x{at:x} length 0x{length:x} page 0x{:x}: {kind:?}",
+                importer.page
+            )
+        });
+        nil(call, Problem::BufferLength { length })
+    })?;
     // Gathered pages are never imported by their pointer first (`gather.rs`): the pointer is no
     // mapping of them until the source answers it is.
-    let by_pointer = import_window(at, length, importer.page, importer.alignment).is_ok()
-        && !source.as_ref().is_some_and(gathers);
+    let aligned = import_window(at, length, importer.page, importer.alignment);
+    let gathered = source.as_ref().is_some_and(gathers);
+    let by_pointer = aligned.is_ok() && !gathered;
+    if let (Err(kind), false) = (aligned, gathered) {
+        note("alignment", || {
+            format!(
+                "pointer 0x{at:x} length 0x{length:x} page 0x{:x} alignment 0x{:x}: {kind:?}",
+                importer.page, importer.alignment
+            )
+        });
+    }
     if !by_pointer && source.is_none() {
         return Err(not_importable());
     }

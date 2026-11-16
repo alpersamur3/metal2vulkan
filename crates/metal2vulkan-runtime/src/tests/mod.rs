@@ -76,6 +76,7 @@ mod held_depth;
 mod host_aliases;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod host_import_counts;
+mod host_import_note;
 mod host_memory;
 #[cfg(all(any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
 mod host_residency;

@@ -20,7 +20,8 @@
 //!   what this device cannot import exactly (`Unsupported`, `not_representable`): an import
 //!   alignment above the host page whose rounding would take pages the range does not touch, an
 //!   offset in the pages that misses the buffer's memory alignment, no memory type both allow, or
-//!   a driver that refuses the pointer.
+//!   a driver that refuses the pointer. Each refusal says which check refused, with its numbers
+//!   (`host_import_note.rs`, `take_host_import_notes`).
 //! - **Pages the process cannot write** are refused typed on Linux, before the buffer's own import
 //!   ([`refuse_unwritable`] asks the kernel for the process's own mappings over the window, with
 //!   `PROCMAP_QUERY` on `/proc/self/maps`, a file kept open for them (`kept_maps`), or reads
@@ -102,6 +103,8 @@ use super::dma_buf::DmaBufSource;
 use super::gather::{Chunks, GatherSource};
 use super::error::{vulkan, Error};
 use super::exit_guard;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use super::host_import_note::note;
 use super::loader_word::LoaderWord;
 use super::program_objects::ProgramObject;
 use super::work_counts::Counters;
@@ -505,10 +508,27 @@ pub(super) fn refuse_unwritable(window: &ImportWindow, counts: &Counters) -> Res
     counts.host_mappings_queried(asked);
     match answer {
         Some(true) => Ok(()),
-        Some(false) => Err(not_importable()),
-        None => Err(Error::Unsupported(Unsupported::not_implemented(
-            Feature::HostMemory,
-        ))),
+        Some(false) => {
+            note("unwritable", || {
+                format!(
+                    "window 0x{:x} size 0x{:x}: a page is unmapped or not writable ({asked} mappings \
+                     asked)",
+                    window.start, window.size
+                )
+            });
+            Err(not_importable())
+        }
+        None => {
+            note("unwritable", || {
+                format!(
+                    "window 0x{:x} size 0x{:x}: the process's mappings cannot be read",
+                    window.start, window.size
+                )
+            });
+            Err(Error::Unsupported(Unsupported::not_implemented(
+                Feature::HostMemory,
+            )))
+        }
     }
 }
 

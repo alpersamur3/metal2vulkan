@@ -76,6 +76,7 @@ use super::buffer_descriptor::HostBuffer;
 use super::device::lock;
 use super::error::{internal, invalid, vulkan, Error, MemoryKind, Problem};
 use super::exit_guard::{self, Call};
+use super::host_import_note::note;
 use super::host_memory::{based_size, import_refused, not_importable, ImportWindow, Importer};
 use super::host_residency::Again;
 use super::image_plan::{ImageFacts, ImagePlan};
@@ -448,6 +449,9 @@ impl Device {
         keep: bool,
     ) -> Result<(HostBuffer, Placement, Option<Again>), Error> {
         if !self.imports_dma_buf_buffers(vk::BufferCreateFlags::empty()) {
+            note("dma-buf", || {
+                "the device imports no dma-buf for a buffer of the runtime's usage".to_owned()
+            });
             return Err(not_importable());
         }
         // The window starts `window.offset` bytes before the pointer, in the pages it touches.
@@ -462,7 +466,16 @@ impl Device {
             length: window.size,
             granule,
         };
-        let chunks = source(request).map_err(|_| not_importable())?;
+        let chunks = source(request).map_err(|error| {
+            note("dma-buf", || {
+                format!(
+                    "the source refused 0x{:x} bytes from 0x{:x}, granule 0x{granule:x}: {error}",
+                    window.size,
+                    start.as_ptr() as u64
+                )
+            });
+            not_importable()
+        })?;
         if !answers(&chunks, &request, importer.page) {
             return Err(invalid(call, Problem::DmaBuf));
         }
@@ -683,14 +696,28 @@ impl Device {
         let mut imported = Vec::with_capacity(chunks.len());
         for DmaBufChunk { fd, length } in chunks {
             // SAFETY: the importer is this device's, and the descriptor a dma-buf.
-            let types = unsafe { importer.dma_buf_types(raw_device, fd.as_fd()) }
-                .map_err(import_refused)?;
+            let types =
+                unsafe { importer.dma_buf_types(raw_device, fd.as_fd()) }.map_err(|result| {
+                    note("dma-buf", || {
+                        format!("vkGetMemoryFdPropertiesKHR of a chunk of 0x{length:x}: {result:?}")
+                    });
+                    import_refused(result)
+                })?;
             let allowed = types & requirements.memory_type_bits;
             let (memory, type_index) = lock(&shared.memory)
                 .import_dma_buf(raw_device, fd, length, (allowed, class), None)
-                .map_err(|failure| match failure {
-                    ImportFailure::NoMemoryType => not_importable(),
-                    ImportFailure::Vulkan(error) => import_refused(error),
+                .map_err(|failure| {
+                    note("dma-buf", || {
+                        format!(
+                            "a chunk of 0x{length:x} was not imported as {class:?} memory: \
+                             dma-buf types 0x{types:x}, buffer types 0x{:x}, {failure:?}",
+                            requirements.memory_type_bits
+                        )
+                    });
+                    match failure {
+                        ImportFailure::NoMemoryType => not_importable(),
+                        ImportFailure::Vulkan(error) => import_refused(error),
+                    }
                 })?;
             pages.hold(memory);
             imported.push((memory, type_index));
