@@ -116,6 +116,8 @@ mod host_import_note;
 pub use host_import_note::take_host_import_notes;
 mod host_memory;
 #[cfg(unix)]
+mod host_probe;
+#[cfg(unix)]
 mod host_residency;
 mod image_barrier;
 mod image_plan;

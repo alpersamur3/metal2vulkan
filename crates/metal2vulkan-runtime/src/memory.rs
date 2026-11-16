@@ -1642,6 +1642,15 @@ impl Memory {
         Err(failure)
     }
 
+    /// The property flags of each memory type of the device, as bits, in the types' order (the
+    /// import probe's facts, `host_probe.rs`).
+    #[cfg(unix)]
+    pub(super) fn type_flag_bits(&self) -> Vec<u32> {
+        (self.types.iter())
+            .map(|memory_type| memory_type.property_flags.as_raw())
+            .collect()
+    }
+
     /// The property flags of memory type `index`, where the device has it.
     pub(super) fn type_flags(&self, index: u32) -> Option<vk::MemoryPropertyFlags> {
         self.types
