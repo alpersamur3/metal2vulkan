@@ -78,10 +78,14 @@ mod host_aliases;
 mod host_import_counts;
 mod host_import_note;
 mod host_memory;
+#[cfg(all(any(m2v_gpu, m2v_cpu_icd), unix))]
+mod host_probe;
 #[cfg(all(any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
 mod host_residency;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod host_step_neutrals;
+#[cfg(all(any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
+mod host_superset;
 mod image_barriers;
 mod image_plan;
 mod inbox;

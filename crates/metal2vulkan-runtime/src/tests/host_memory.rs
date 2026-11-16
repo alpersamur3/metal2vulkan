@@ -3,7 +3,7 @@
 
 use crate::host_memory::{
     based_size, binds_in, buffer_base, host_page, import_refused, import_window, refused,
-    ImportWindow, WindowRefusal,
+    superset_window, ImportWindow, WindowRefusal,
 };
 use crate::memory::{candidates, MemoryClass};
 use crate::{Error, MemoryKind, VkResultCode};
@@ -96,6 +96,160 @@ fn a_range_past_the_address_space_is_refused() {
         import_window(u64::MAX - PAGE + 1, 100, PAGE, PAGE),
         Err(WindowRefusal::Overflow),
         "the last page's end does not fit in 64 bits"
+    );
+}
+
+/// The shape that failed on a Mali-G1-Ultra phone, which a device of a larger import alignment
+/// than the host page meets: 13 pages of 16 KiB (0x34000 bytes), at a pointer that is not at the
+/// alignment.
+const MALI_BYTES: u64 = 0x34000;
+
+#[test]
+fn the_aligned_superset_of_a_range_is_the_range_rounded_out_to_the_alignment() {
+    let base = 0x2_0000_0000;
+    // (alignment, pointer offset from a multiple of 64 KiB, length, start offset, size)
+    let table: [(u64, u64, u64, u64, u64); 9] = [
+        // A 4-KiB device on a 4-KiB host: the pages the range touches, as `import_window`.
+        (4096, 0, MALI_BYTES, 0, MALI_BYTES),
+        (4096, 0x2000, MALI_BYTES, 0x2000, MALI_BYTES),
+        (4096, 0x2010, 0x100, 0x2000, 0x1000),
+        // 16 KiB: a pointer at the alignment holds its 13 units; 0x2000 in is rounded both ways.
+        (16 << 10, 0, MALI_BYTES, 0, MALI_BYTES),
+        (16 << 10, 0x2000, MALI_BYTES, 0, 0x38000),
+        (16 << 10, 0x3ff0, 0x20, 0, 0x8000),
+        // 64 KiB: the range's 0x34000 bytes are 48 KiB short of a unit from 0, and end 0x2000
+        // past 0x34000 from 0x2000; from 0xc000 they end on the unit's boundary.
+        (64 << 10, 0, MALI_BYTES, 0, 0x40000),
+        (64 << 10, 0x2000, MALI_BYTES, 0, 0x40000),
+        (64 << 10, 0xc000, MALI_BYTES, 0, 0x40000),
+    ];
+    for (alignment, in_unit, length, from_base, size) in table {
+        let pointer = base + in_unit;
+        let window = superset_window(pointer, length, 4096, alignment).unwrap();
+        let name = format!("alignment {alignment:#x} pointer +{in_unit:#x} length {length:#x}");
+        assert_eq!(window.start, base + from_base, "{name}");
+        assert_eq!(window.size, size, "{name}");
+        assert_eq!(window.offset, pointer - window.start, "{name}");
+    }
+    // One more unit when the range ends at 0xc000 + 0x34000 = 0x40000: a unit boundary, no more.
+    let window = superset_window(base + 0xc000, MALI_BYTES, 4096, 64 << 10).unwrap();
+    assert_eq!(window.start + window.size, base + 0x40000);
+    let window = superset_window(base + 0xc001, MALI_BYTES, 4096, 64 << 10).unwrap();
+    assert_eq!(window.start + window.size, base + 0x50000);
+}
+
+#[test]
+fn the_superset_is_the_import_window_where_the_alignment_is_no_larger_than_the_page() {
+    let base = 0x2_0000_0000;
+    for page in [4096, PAGE] {
+        for alignment in [1, 16, 4096, PAGE] {
+            if alignment > page {
+                continue;
+            }
+            for offset in [0, 1, 16, page - 16, page, page + 16, 3 * page - 1] {
+                for length in [1, 16, page, page + 1, MALI_BYTES, 5 * page + 3] {
+                    assert_eq!(
+                        superset_window(base + offset, length, page, alignment),
+                        import_window(base + offset, length, page, alignment),
+                        "page {page:#x} alignment {alignment:#x} +{offset:#x} length {length:#x}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_superset_always_covers_the_range_and_the_pages_it_touches_in_whole_units() {
+    let base = 0x7f00_0000_0000;
+    for page in [4096, PAGE] {
+        for alignment in [4096, PAGE, 64 << 10, 2 << 20] {
+            let unit = page.max(alignment);
+            for offset in [0, 1, 16, 4095, 4096, 8192 + 5, unit - 1, unit, unit + 7] {
+                for length in [1, 15, 4096, 4097, MALI_BYTES, unit, unit + 1, 3 * unit - 5] {
+                    let pointer = base + offset;
+                    let window = superset_window(pointer, length, page, alignment).unwrap();
+                    let name = format!("{page:#x} {alignment:#x} +{offset:#x} {length:#x}");
+                    // Whole units, from a unit boundary.
+                    assert_eq!(window.start % unit, 0, "{name}");
+                    assert_eq!(window.size % unit, 0, "{name}");
+                    // The pointer's offset in it kept, and the range inside it.
+                    assert_eq!(window.start + window.offset, pointer, "{name}");
+                    assert!(window.offset + length <= window.size, "{name}");
+                    // Less than a unit of it on each side of the range.
+                    assert!(window.offset < unit, "{name}");
+                    assert!(window.size - window.offset - length < unit, "{name}");
+                    // It holds the pages the range touches, which `import_window` imports.
+                    let pages = import_window(pointer, length, page, 1).unwrap();
+                    assert!(window.start <= pages.start, "{name}");
+                    assert!(
+                        window.start + window.size >= pages.start + pages.size,
+                        "{name}"
+                    );
+                    // Where `import_window` takes the unit's rounding, they are the same window.
+                    if let Ok(exact) = import_window(pointer, length, page, alignment) {
+                        assert_eq!(window, exact, "{name}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_range_the_import_window_refuses_beyond_its_pages_has_a_superset_with_more_pages() {
+    // The refusal the superset answers (`WindowRefusal::BeyondPages`): the superset is a window
+    // of more pages than the range touches, which is why it is imported only over pages the
+    // process maps.
+    let unit = 64 << 10;
+    let at = 0x2_0000_0000;
+    for (pointer, length) in [
+        (at, MALI_BYTES),
+        (at + 0x2000, MALI_BYTES),
+        (at + 4096, unit - 4096),
+    ] {
+        assert_eq!(
+            import_window(pointer, length, 4096, unit),
+            Err(WindowRefusal::BeyondPages)
+        );
+        let pages = import_window(pointer, length, 4096, 1).unwrap();
+        let window = superset_window(pointer, length, 4096, unit).unwrap();
+        assert!(window.size > pages.size, "{pointer:#x} {length:#x}");
+        assert_eq!(window.size % unit, 0);
+    }
+}
+
+#[test]
+fn a_superset_past_the_address_space_is_refused() {
+    let unit = 64 << 10;
+    // The range itself runs past the end.
+    assert_eq!(
+        superset_window(u64::MAX - 100, 200, 4096, unit),
+        Err(WindowRefusal::Overflow)
+    );
+    // The range ends inside the last unit, whose end does not fit in 64 bits.
+    assert_eq!(
+        superset_window(u64::MAX - unit + 1, 100, 4096, unit),
+        Err(WindowRefusal::Overflow)
+    );
+    assert_eq!(
+        superset_window(u64::MAX - 0x100, 0x80, 4096, unit),
+        Err(WindowRefusal::Overflow)
+    );
+    // A range that ends at the last unit boundary the space holds still has its window, and
+    // the last unit itself has none (its end is 2^64).
+    let last = u64::MAX - (unit - 1);
+    assert_eq!(
+        superset_window(last, unit, 4096, unit),
+        Err(WindowRefusal::Overflow)
+    );
+    assert_eq!(
+        superset_window(last - unit, unit, 4096, unit),
+        Ok(ImportWindow {
+            start: last - unit,
+            size: unit,
+            offset: 0,
+        })
     );
 }
 
