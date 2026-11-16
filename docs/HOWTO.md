@@ -225,6 +225,26 @@ used (no command reaches them unnamed yet), `host_rebind_imports_made` those reb
 `host_rebind_imports_covered` those whose pages lay within bytes a buffer over host pages lay over
 already.
 
+A driver whose GPU does not snoop the CPU's caches offers imported host memory only as a memory
+type that is host-visible without `HOST_COHERENT` (a Mali-G1-Ultra: the pointer goes to its cached
+type, not to its coherent one, which refused every import before). The runtime then imports into
+that type when no coherent type of the pointer's and the buffer's is left, maps the memory whole
+and follows Vulkan's contract for it: a buffer over such an import has its range flushed
+(`vkFlushMappedMemoryRanges`, whole `nonCoherentAtomSize` atoms of the buffer's reach) as each
+command buffer that uses it is first submitted, and, if the GPU may have written it, flushed again
+and invalidated (`vkInvalidateMappedMemoryRanges`) as that command buffer's last batch completes,
+before its events, handlers and the runtime's own host reads. A CPU write that lands between that
+last flush and the invalidate is lost (Vulkan has no clean-and-invalidate); a map that fails leaves
+the import usable with no maintenance and says so (`host import unsynced at noncoherent-map`).
+`METAL2VULKAN_HOST_SYNC`, read once per device, is `full` (the default), `flush` (flush only) or
+`off` (no maintenance). Counted: `WorkCounts::host_flushes`, `host_flush_bytes`, `host_invalidates`,
+`host_invalidate_bytes`, `noncoherent_imports_made`; the device tells once on stderr when an import
+first lands in such memory, and the import probe's facts line carries `noncoherent_imports=N`. Not
+covered: a GPU read or write through a pointer stored in a buffer, a device's own submission that
+reads an import, and the CPU's writes between a command buffer's first submission and its later
+batches. A device that imports into coherent memory pays one relaxed load at three places and
+counts nothing.
+
 A texture over a no-copy buffer's host pages, imported by their pointer or as dma-bufs, is a
 shadow (`shadowed-texture`) on every device, whatever its usage and row pitch: an optimal image of
 the runtime's own memory, its texels copied in from the pages before a use and merged back after a
