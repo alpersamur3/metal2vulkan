@@ -25,6 +25,7 @@ use super::host_memory::{
 };
 #[cfg(unix)]
 use super::host_residency::Again;
+use super::host_sync::ImportSync;
 use super::memory::{ImportFailure, MemoryClass, Placement};
 use super::rebind::RebindProblem;
 use super::texture::stand_in::TextureImages;
@@ -1269,6 +1270,17 @@ impl Device {
         match bound {
             Ok(()) => {
                 shared.counts.host_pointer_import_made(size);
+                // An import in memory that is not coherent is maintained at its command buffers'
+                // submission and completion (`host_sync.rs`): counted, and told once.
+                let sync = placement.import_sync();
+                if sync != ImportSync::Coherent {
+                    shared.counts.noncoherent_import_made();
+                    let type_index = placement.type_index();
+                    let flags = lock(&shared.memory).type_flags(type_index);
+                    shared
+                        .host_sync
+                        .imported(sync, type_index, flags.unwrap_or_default());
+                }
                 Ok(placement)
             }
             Err(error) => {

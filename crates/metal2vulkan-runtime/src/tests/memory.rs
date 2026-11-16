@@ -1,7 +1,7 @@
 use crate::memory::{
-    candidates, host_cached, host_cached_placement, host_incoherent, invalidation_range,
-    readback_candidates, readback_requirements, MemoryClass, Pool, KEPT_EMPTY_BLOCKS,
-    KEPT_EMPTY_FOR,
+    candidates, host_cached, host_cached_placement, host_incoherent, import_candidates,
+    import_refusal, invalidation_range, mapped_range, readback_candidates, readback_requirements,
+    second_tier_opens, MemoryClass, Pool, KEPT_EMPTY_BLOCKS, KEPT_EMPTY_FOR,
 };
 use ash::vk;
 use std::time::Instant;
@@ -665,4 +665,281 @@ fn an_image_read_takes_the_buffer_only_from_uncached_memory_with_a_cached_type_f
     assert!(!through(&uncached, true, 2));
     // A type the device does not have.
     assert!(!through(&g720, true, 9));
+}
+
+/// The memory types of the devices whose reports the tests above quote, and the shapes the import
+/// ranking meets.
+fn import_devices() -> Vec<(&'static str, Vec<vk::MemoryType>)> {
+    vec![
+        ("Adreno 830", listed(&[0x7, 0xf, 0xb, 0x11])),
+        (
+            "Adreno 825",
+            listed(&[0x1, 0x1, 0x1, 0xb, 0x7, 0x7, 0xf, 0x21, 0x11]),
+        ),
+        (
+            "Xclipse 550",
+            listed(&[0x7, 0xf, 0x1, 0x21, 0x7, 0xf, 0x1, 0x21]),
+        ),
+        (
+            "RADV 780M",
+            listed(&[
+                0x1, 0x1, 0x6, 0x7, 0x7, 0xe, 0xe, 0x21, 0x21, 0x21, 0x21, 0x20, 0x20, 0xc1, 0xc6,
+                0xc7, 0xce,
+            ]),
+        ),
+        ("ANV Iris Xe", listed(&[0x1, 0x7, 0xf])),
+        // ANV on an Arrow Lake: a cached type that is not coherent, beside the coherent ones.
+        ("ANV Arrow Lake", listed(&[0x1, 0x7, 0xf, 0xb])),
+        ("RTX 3090", listed(&[0x0, 0x1, 0x1, 0x6, 0xe, 0x7])),
+        ("MoltenVK", listed(&[0x1, 0xf, 0x11])),
+        ("lavapipe", listed(&[0xf])),
+        ("cached both ways", listed(&[0x7, 0xb, 0xf])),
+        ("cached coherent last", listed(&[0x1, 0x6, 0xb, 0xe])),
+        // Mali-G720 MC7 (issue 51) and the Mali-G1-Ultra of the field report: 0x7 uncached
+        // coherent, 0xb cached not coherent, 0x11 lazily allocated, 0x21 protected.
+        ("Mali-G720", listed(&[0x7, 0xb, 0x11, 0x21])),
+        ("Mali-G1-Ultra", listed(&[0x7, 0xb, 0x11, 0x21])),
+    ]
+}
+
+/// The first tier of an import's types is `candidates`, unchanged and in its order, none of it
+/// needing maintenance: over every device above, every set of allowed types and every class an
+/// import may take (`Shared`, `Managed`, `WriteCombined`), with unified memory or without. So a
+/// device that imports where it did before takes the same type, whatever else it lists.
+#[test]
+fn an_import_s_first_tier_is_exactly_the_coherent_candidates() {
+    use vk::MemoryPropertyFlags as P;
+    for (name, types) in import_devices() {
+        for allowed in 0..1u32 << types.len() {
+            for class in [
+                MemoryClass::Shared,
+                MemoryClass::Managed,
+                MemoryClass::WriteCombined,
+            ] {
+                for unified in [false, true] {
+                    let ranked = import_candidates(&types, allowed, class, unified);
+                    let first: Vec<u32> = (ranked.iter())
+                        .filter(|&&(_, sync)| !sync)
+                        .map(|&(index, _)| index)
+                        .collect();
+                    let wanted = candidates(&types, allowed, class, unified);
+                    let at = format!("{name} allowed {allowed:#b} {class:?} unified {unified}");
+                    assert_eq!(first, wanted, "{at}");
+                    // The first tier leads the list, whole.
+                    assert!(
+                        ranked
+                            .iter()
+                            .take(wanted.len())
+                            .all(|&(index, sync)| !sync && wanted.contains(&index)),
+                        "{at}: {ranked:?}"
+                    );
+                    // Every second-tier type is allowed, host-visible, not coherent, not lazily
+                    // allocated, not protected, and listed once.
+                    let mut seen = Vec::new();
+                    for &(index, _) in ranked.iter().filter(|&&(_, sync)| sync) {
+                        let flags = types[index as usize].property_flags;
+                        assert!(allowed & (1 << index) != 0, "{at}");
+                        assert!(flags.contains(P::HOST_VISIBLE), "{at}");
+                        let never = P::HOST_COHERENT | P::LAZILY_ALLOCATED | P::PROTECTED;
+                        assert!(
+                            !flags.intersects(never),
+                            "{at}: type {index} flags {:#x}",
+                            flags.as_raw()
+                        );
+                        assert!(!seen.contains(&index), "{at}");
+                        seen.push(index);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A device whose host-visible types are all coherent has no second tier, however the types are
+/// allowed: nothing about an import on lavapipe, NVIDIA, RADV, MoltenVK, ANV or Samsung's driver can
+/// change. Turnip's and ANV Arrow Lake's cached type that is not coherent is a second tier behind
+/// their coherent ones (`second_tier_opens`: only where every coherent type was refused).
+#[test]
+fn a_device_with_only_coherent_host_visible_types_has_no_second_tier() {
+    let devices = import_devices();
+    let named = |name: &str| devices.iter().find(|(device, _)| *device == name).unwrap();
+    for name in [
+        "Xclipse 550",
+        "RADV 780M",
+        "ANV Iris Xe",
+        "RTX 3090",
+        "MoltenVK",
+        "lavapipe",
+    ] {
+        let (_, types) = named(name);
+        assert_eq!(host_incoherent(types), 0, "{name}");
+        for allowed in 0..1u32 << types.len() {
+            let ranked = import_candidates(types, allowed, MemoryClass::Shared, true);
+            assert!(ranked.iter().all(|&(_, sync)| !sync), "{name} {allowed:#b}");
+        }
+    }
+    // These list a cached type that is not coherent, which no import takes while a coherent type
+    // among the allowed ones is not refused.
+    for name in ["Adreno 830", "Adreno 825", "ANV Arrow Lake"] {
+        let (_, types) = named(name);
+        assert_ne!(host_incoherent(types), 0, "{name}");
+        let all = (1u32 << types.len()) - 1;
+        let ranked = import_candidates(types, all, MemoryClass::Shared, true);
+        let first = ranked.iter().take_while(|&&(_, sync)| !sync).count();
+        assert!(first > 0 && first < ranked.len(), "{name}: {ranked:?}");
+        assert!(ranked[first..].iter().all(|&(_, sync)| sync), "{name}");
+    }
+}
+
+/// The second tier opens where the first has no type, or where every type of it was refused as the
+/// pointer, and not for any other failure (out of memory, a lost device): a device that imports
+/// as before, or fails as before for another reason, never reaches it.
+#[test]
+fn the_second_tier_opens_only_where_the_first_has_none_or_refused_the_pointer() {
+    use vk::Result as R;
+    assert!(second_tier_opens(0, &[]));
+    assert!(second_tier_opens(0, &[R::ERROR_OUT_OF_DEVICE_MEMORY]));
+    assert!(second_tier_opens(1, &[R::ERROR_INVALID_EXTERNAL_HANDLE]));
+    assert!(second_tier_opens(
+        2,
+        &[R::ERROR_INVALID_EXTERNAL_HANDLE, R::ERROR_UNKNOWN]
+    ));
+    assert!(!second_tier_opens(
+        2,
+        &[
+            R::ERROR_INVALID_EXTERNAL_HANDLE,
+            R::ERROR_OUT_OF_HOST_MEMORY
+        ]
+    ));
+    assert!(!second_tier_opens(1, &[R::ERROR_OUT_OF_DEVICE_MEMORY]));
+    assert!(!second_tier_opens(1, &[R::ERROR_DEVICE_LOST]));
+}
+
+/// The Mali-G1-Ultra of the field report: the host pointer allows type 1 alone (mask 0x2), which
+/// is cached and not coherent, and the buffer allows types 0 and 1. The first tier (type 0, the
+/// coherent one) is not among what both allow, so the import is made in the second.
+#[test]
+fn a_mali_s_host_pointer_import_takes_its_cached_type_in_the_second_tier() {
+    let mali = listed(&[0x7, 0xb, 0x11, 0x21]);
+    let shared = MemoryClass::Shared;
+    // The report's numbers: pointer types 0x2, buffer types 0x3, both 0x2.
+    assert_eq!(candidates(&mali, 0x2, shared, true), Vec::<u32>::new());
+    assert_eq!(import_candidates(&mali, 0x2, shared, true), [(1, true)]);
+    // Where both types are allowed the coherent one is tried first, as it always was, and the
+    // cached one after it.
+    assert_eq!(
+        import_candidates(&mali, 0x3, shared, true),
+        [(0, false), (1, true)]
+    );
+    // The coherent type alone, and types the second tier never takes.
+    assert_eq!(import_candidates(&mali, 0x1, shared, true), [(0, false)]);
+    assert!(import_candidates(&mali, 0xc, shared, true).is_empty());
+    assert!(import_candidates(&mali, 0x4, shared, true).is_empty());
+    assert!(import_candidates(&mali, 0x8, shared, true).is_empty());
+    // Whatever class, with unified memory or without.
+    for class in [
+        MemoryClass::Shared,
+        MemoryClass::Managed,
+        MemoryClass::WriteCombined,
+    ] {
+        for unified in [false, true] {
+            assert_eq!(import_candidates(&mali, 0x2, class, unified), [(1, true)]);
+        }
+    }
+}
+
+/// Where several types are not coherent, a host-cached one goes first, and among equals the lowest
+/// index, whatever the order the device lists them in. Lazily allocated, protected and AMD
+/// device-coherent types never.
+#[test]
+fn the_second_tier_prefers_a_cached_type_then_the_lowest_index() {
+    use vk::MemoryPropertyFlags as P;
+    let hv = P::HOST_VISIBLE;
+    let types = [
+        ty(P::DEVICE_LOCAL),                       // 0: not host-visible
+        ty(hv),                                    // 1: uncached
+        ty(hv | P::HOST_CACHED),                   // 2: cached
+        ty(hv | P::HOST_CACHED | P::DEVICE_LOCAL), // 3: cached too
+        ty(hv),                                    // 4: uncached
+        ty(hv | P::HOST_CACHED | P::PROTECTED),    // 5: protected
+        ty(hv | P::LAZILY_ALLOCATED),              // 6: lazy
+        ty(hv | P::DEVICE_COHERENT_AMD),           // 7: not allocatable
+        ty(hv | P::HOST_COHERENT),                 // 8: coherent: the first tier's
+    ];
+    let all = 0b1_1111_1111;
+    assert_eq!(
+        import_candidates(&types, all, MemoryClass::Shared, false),
+        [(8, false), (2, true), (3, true), (1, true), (4, true)]
+    );
+    // Without the coherent type the second tier is alone.
+    assert_eq!(
+        import_candidates(&types, all & !(1 << 8), MemoryClass::Shared, false),
+        [(2, true), (3, true), (1, true), (4, true)]
+    );
+    // Only the uncached ones allowed: still ranked by index.
+    assert_eq!(
+        import_candidates(&types, 0b1_0010, MemoryClass::Shared, false),
+        [(1, true), (4, true)]
+    );
+    // The same list in the opposite order ranks by the same rule.
+    let reversed: Vec<vk::MemoryType> = types.iter().rev().copied().collect();
+    let got = import_candidates(&reversed, 0b1_1111_1111, MemoryClass::Shared, false);
+    assert_eq!(
+        got,
+        [(0, false), (5, true), (6, true), (4, true), (7, true)]
+    );
+}
+
+/// Only a failure the driver gives a pointer it will not take opens the second tier.
+#[test]
+fn only_a_refusal_of_the_pointer_opens_the_second_tier() {
+    assert!(import_refusal(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE));
+    assert!(import_refusal(vk::Result::ERROR_UNKNOWN));
+    assert!(!import_refusal(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+    assert!(!import_refusal(vk::Result::ERROR_OUT_OF_HOST_MEMORY));
+    assert!(!import_refusal(vk::Result::ERROR_DEVICE_LOST));
+}
+
+/// A range flushed or invalidated is whole atoms of the memory, the last one cut at the memory's
+/// end, where Vulkan allows a range that is no multiple of the atom
+/// (`VUID-VkMappedMemoryRange-size-01390`): a buffer at an unaligned offset in its import, the
+/// import's last atom, a memory that is no multiple of the atom, and bytes past its end.
+#[test]
+fn a_flushed_range_is_whole_atoms_cut_at_the_end_of_the_memory() {
+    // A page of a Mali's import: 4 KiB, atom 64. A buffer 100 bytes from the start, 300 long.
+    assert_eq!(mapped_range(100, 300, 64, 4096), (64, 384));
+    // At an unaligned offset deep in the import, from the last but one atom into the last.
+    assert_eq!(mapped_range(4096 - 70, 60, 64, 4096), (3968, 128));
+    // Wholly inside the last atom.
+    assert_eq!(mapped_range(4096 - 30, 10, 64, 4096), (4032, 64));
+    // The last atom whole: end exactly at the memory's end.
+    assert_eq!(mapped_range(4000, 96, 64, 4096), (3968, 128));
+    // A memory that is no multiple of the atom: the last atom is cut where the memory ends.
+    assert_eq!(mapped_range(100, 400, 64, 520), (64, 448));
+    assert_eq!(mapped_range(500, 20, 64, 520), (448, 72));
+    // A range that reaches past the memory is cut, one wholly past it is empty, one of 0 bytes
+    // is empty.
+    assert_eq!(mapped_range(4000, 1 << 20, 64, 4096), (3968, 128));
+    assert_eq!(mapped_range(5000, 10, 64, 4096).1, 0);
+    assert_eq!(mapped_range(100, 0, 64, 4096).1, 0);
+    // An atom of 1 rounds nothing.
+    assert_eq!(mapped_range(7, 5, 1, 4096), (7, 5));
+    for atom in [1u64, 64, 128, 256] {
+        for memory in [4096u64, 4160, 65_536, 1 << 20] {
+            for offset in [0u64, 1, 63, 64, 100, 4095] {
+                for len in [1u64, 63, 64, 65, 1000, 70_000] {
+                    let (start, size) = mapped_range(offset, len, atom, memory);
+                    if size == 0 {
+                        assert!(offset >= memory, "{atom} {memory} {offset} {len}");
+                        continue;
+                    }
+                    let end = start + size;
+                    assert_eq!(start % atom, 0);
+                    assert!(end % atom == 0 || end == memory, "{atom} {memory}: {end}");
+                    assert!(end <= memory);
+                    assert!(start <= offset && end >= (offset + len).min(memory));
+                }
+            }
+        }
+    }
 }

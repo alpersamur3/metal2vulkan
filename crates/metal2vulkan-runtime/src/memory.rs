@@ -16,9 +16,11 @@
 //!   [`MemoryClass`]; [`Memory::free`] with the placement it gave. Buffers use it in step 1;
 //!   textures and heaps add their classes and callers in their own steps. Imported host memory
 //!   has its own entry, [`Memory::import_host`]: one dedicated block per import, never
-//!   pooled, freed through the same [`Memory::free`]. A dma-buf's import
-//!   (`Memory::import_dma_buf`) is in no block: the placement in it keeps it, and frees it as it
-//!   goes (`dma_buf.rs`'s `DmaBufPages`).
+//!   pooled, freed through the same [`Memory::free`]; of a host-visible coherent type
+//!   ([`candidates`]), or, where the pointer allows none, of one that is not coherent, mapped
+//!   whole at once and maintained by its command buffers ([`import_candidates`], `host_sync.rs`).
+//!   A dma-buf's import (`Memory::import_dma_buf`) is in no block: the placement in it keeps it,
+//!   and frees it as it goes (`dma_buf.rs`'s `DmaBufPages`).
 //!
 //! - **Addresses** ([`allocate_addressed`]). A buffer placed for a device address gets it from its
 //!   block: a block that holds such a buffer has one buffer over its whole memory with the
@@ -47,6 +49,7 @@ use super::device::lock;
 use super::dma_buf::DmaBufPages;
 use super::error::{internal, vulkan, Error, MemoryKind};
 use super::freed_memory::{Parked, Parking};
+use super::host_sync::ImportSync;
 use super::memory_log::{self, MemoryLog};
 use super::range::RangeAllocator;
 use super::sharing::Sharing;
@@ -307,6 +310,66 @@ pub(super) fn candidates(
     ranked.into_iter().map(|(_, index)| index).collect()
 }
 
+/// The memory types an import of host memory (`Memory::import_host`) may use among `types` (the bits
+/// of `allowed`: the types both the pointer and the buffer take), best first, each with whether its
+/// ranges need cache maintenance (`host_sync.rs`).
+///
+/// Two tiers, one list. The first is [`candidates`] of `class`, unchanged and in its order, none of
+/// it needing maintenance: host-visible coherent memory, which every driver measured to import host
+/// pointers (Turnip, NVIDIA, RADV, ANV, lavapipe) lists. The second is for a driver whose GPU does
+/// not snoop the CPU's caches: it offers imported host memory (the caller's cached CPU memory) only
+/// as a type that is host-visible without `HOST_COHERENT` (a Mali-G1-Ultra: the pointer allows its
+/// type 1, `DEVICE_LOCAL | HOST_VISIBLE | HOST_CACHED`, and the coherent type 0 not at all, so the
+/// first tier is empty there and the import was refused). It lists the types of `allowed` that
+/// are host-visible, not coherent, not lazily allocated, not protected and that the runtime may
+/// allocate, host-cached ones first and the lowest index among equals, each needing maintenance.
+/// The caller tries the second only where the first has no type, or where every type of the first
+/// was refused (`ImportFailure`): a device whose first tier imports never meets it.
+pub(super) fn import_candidates(
+    types: &[vk::MemoryType],
+    allowed: u32,
+    class: MemoryClass,
+    unified: bool,
+) -> Vec<(u32, bool)> {
+    use vk::MemoryPropertyFlags as P;
+    let mut list: Vec<(u32, bool)> = (candidates(types, allowed, class, unified).into_iter())
+        .map(|index| (index, false))
+        .collect();
+    let mut second: Vec<(bool, u32)> = (types.iter().enumerate())
+        .filter(|&(index, ty)| {
+            let flags = ty.property_flags;
+            allowed & (1 << index) != 0
+                && allocatable(flags)
+                && flags.contains(P::HOST_VISIBLE)
+                && !flags.intersects(P::HOST_COHERENT | P::LAZILY_ALLOCATED | P::PROTECTED)
+                && !list.iter().any(|&(first, _)| first as usize == index)
+        })
+        .map(|(index, ty)| (!ty.property_flags.contains(P::HOST_CACHED), index as u32))
+        .collect();
+    // Host-cached types first (`false` sorts first), then the lowest index.
+    second.sort_unstable();
+    list.extend(second.into_iter().map(|(_, index)| (index, true)));
+    list
+}
+
+/// Whether an allocation that failed with `error` was refused as the memory it was asked to import
+/// (`host_memory.rs`'s `import_refused`): the answers a driver gives a pointer it will not take.
+/// Only such a failure of every type of an import's first tier opens its second.
+pub(super) fn import_refusal(error: vk::Result) -> bool {
+    matches!(
+        error,
+        vk::Result::ERROR_INVALID_EXTERNAL_HANDLE | vk::Result::ERROR_UNKNOWN
+    )
+}
+
+/// Whether an import tries the second tier of [`import_candidates`] after its first tier of
+/// `first_tier` types failed with `failures`: where the first has no type, or every type of it
+/// was refused as the pointer ([`import_refusal`]). Any other failure (out of memory, a lost
+/// device) is the import's answer, as it was.
+pub(super) fn second_tier_opens(first_tier: usize, failures: &[vk::Result]) -> bool {
+    first_tier == 0 || failures.iter().all(|&error| import_refusal(error))
+}
+
 /// The memory types a [`MemoryClass::Readback`] buffer may use among `types` (the bits of
 /// `allowed`), best first. Where `Shared` memory has a type the host caches and keeps coherent
 /// (`HOST_VISIBLE | HOST_COHERENT | HOST_CACHED`: Turnip's, RADV's, ANV's, NVIDIA's) that is
@@ -382,6 +445,88 @@ pub(super) fn invalidation_range(offset: u64, len: u64, atom: u64) -> (u64, u64)
     let start = offset - offset % atom;
     let end = (offset + len).div_ceil(atom) * atom;
     (start, end - start)
+}
+
+/// The range `vkFlushMappedMemoryRanges` or `vkInvalidateMappedMemoryRanges` takes for the `len`
+/// bytes at `offset` of a memory of `memory_size` bytes: [`invalidation_range`]'s whole atoms,
+/// their end clipped to the memory's, where Vulkan allows a range that is not a multiple of the
+/// atom only if it ends there (`VUID-VkMappedMemoryRange-size-01390`). `(offset, 0)` where the
+/// bytes lie past the memory: there is nothing to maintain.
+pub(super) fn mapped_range(offset: u64, len: u64, atom: u64, memory_size: u64) -> (u64, u64) {
+    if len == 0 {
+        return (offset, 0);
+    }
+    let (start, size) = invalidation_range(offset, len, atom);
+    let end = start.saturating_add(size).min(memory_size);
+    (start, end.saturating_sub(start))
+}
+
+/// Whether a test makes every host import count as one in memory that is not coherent, on lavapipe
+/// and the like, which list coherent types alone (`host_sync::forced`).
+fn test_forces_noncoherent() -> bool {
+    #[cfg(test)]
+    {
+        super::host_sync::forced::noncoherent()
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Map the whole of `memory`, imported from `pointer` in a type that is not coherent, so that its
+/// ranges may be flushed and invalidated (`VUID-VkMappedMemoryRange-memory-00684`): kept mapped
+/// until the memory is freed, which unmaps it. A map that fails, or answers a pointer other than
+/// the imported one, leaves the import as it was and says so (a `noncoherent-map` note): it is
+/// used unsynced ([`ImportSync::Unsynced`]), as the engine that booted a Mali phone used such
+/// memory before, and never refused.
+///
+/// # Safety
+///
+/// `memory` is a live import of `pointer` in `type_index`, a host-visible type of the device that
+/// `device` is of; it is not mapped, and nothing else maps or uses it concurrently.
+unsafe fn map_import(
+    device: &ash::Device,
+    memory: vk::DeviceMemory,
+    pointer: NonNull<u8>,
+    type_index: u32,
+) -> ImportSync {
+    use super::host_import_note::note_as;
+    #[cfg(test)]
+    let forced_failure = super::host_sync::forced::map_fails();
+    #[cfg(not(test))]
+    let forced_failure = false;
+    let mapped = match forced_failure {
+        true => Err(vk::Result::ERROR_MEMORY_MAP_FAILED),
+        // SAFETY: the caller's contract; mapped whole, once.
+        false => unsafe {
+            device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        },
+    };
+    match mapped {
+        Ok(at) if at.cast::<u8>() == pointer.as_ptr() => ImportSync::Maintained,
+        Ok(other) => {
+            // Left mapped, where the memory's free unmaps it: no ranges are maintained.
+            note_as("unsynced", "noncoherent-map", || {
+                format!(
+                    "vkMapMemory of the import of 0x{:x} in type {type_index} answered 0x{:x}, \
+                     not the imported pointer",
+                    pointer.as_ptr() as usize,
+                    other as usize
+                )
+            });
+            ImportSync::Unsynced
+        }
+        Err(error) => {
+            note_as("unsynced", "noncoherent-map", || {
+                format!(
+                    "vkMapMemory of the import of 0x{:x} in type {type_index}: {error:?}",
+                    pointer.as_ptr() as usize
+                )
+            });
+            ImportSync::Unsynced
+        }
+    }
 }
 
 /// `requirements` of a readback buffer made to meet the device's `atom`: its size and alignment
@@ -757,6 +902,10 @@ pub(super) struct Placement {
     /// freed, the source dropped, when their last holder goes.
     #[cfg(unix)]
     dma_buf: Option<Arc<DmaBufPages>>,
+    /// How the host's view of the placement is kept in step with the GPU's: only an import of
+    /// host memory in a type that is not coherent is anything but [`ImportSync::Coherent`]
+    /// (`host_sync.rs`).
+    import_sync: ImportSync,
 }
 
 impl Placement {
@@ -781,6 +930,7 @@ impl Placement {
             address: None,
             #[cfg(unix)]
             dma_buf: None,
+            import_sync: ImportSync::Coherent,
         }
     }
 
@@ -808,6 +958,7 @@ impl Placement {
             mapped: Some(Mapped(mapped)),
             address: None,
             dma_buf: Some(pages),
+            import_sync: ImportSync::Coherent,
         }
     }
 
@@ -867,7 +1018,13 @@ impl Placement {
             address: self.address,
             #[cfg(unix)]
             dma_buf: self.dma_buf.clone(),
+            import_sync: self.import_sync,
         }
+    }
+
+    /// How the host's view of the placement is kept in step with the GPU's (`host_sync.rs`).
+    pub(super) fn import_sync(&self) -> ImportSync {
+        self.import_sync
     }
 }
 
@@ -1264,6 +1421,7 @@ impl Memory {
                 .map(|addresses| addresses.address + offset),
             #[cfg(unix)]
             dma_buf: None,
+            import_sync: ImportSync::Coherent,
         }
     }
 
@@ -1415,10 +1573,19 @@ impl Memory {
     /// import alignment), as a dedicated block of the best memory type of `class` among
     /// `allowed` (the types both the pointer and the resource take): its placement at offset 0,
     /// whose `mapped` is `pointer`. The block is never pooled and is freed with the placement,
-    /// as a dedicated block is (`host_memory.rs`). Refused when no type of `class` is among
-    /// `allowed`, else with the failure of the last type tried. A refusal says what it compared
-    /// (`host_import_note.rs`): `of` is the types the pointer allows and the types the resource
-    /// allows, which `allowed` is the common part of, and every type tried is told with its answer.
+    /// as a dedicated block is (`host_memory.rs`). Refused when no type is among `allowed`, else
+    /// with the failure of the last type of the first tier tried (the failure of the second's
+    /// where the first has none). A refusal says what it compared (`host_import_note.rs`): `of`
+    /// is the types the pointer allows and the types the resource allows, which `allowed` is the
+    /// common part of, and every type tried is told with its answer.
+    ///
+    /// The types are [`import_candidates`]': first the host-visible coherent types of `class`,
+    /// exactly as [`candidates`] ranks them, which every device that imported before this takes;
+    /// and only where there is none among `allowed`, or each was refused as the pointer
+    /// ([`import_refusal`]), the host-visible types that are not coherent (a Mali's, whose
+    /// pointer imports go to its cached type alone). An import there is mapped whole at once and
+    /// its placement says how it is maintained (`Placement::import_sync`, `host_sync.rs`): the
+    /// caller counts it and tells the process.
     ///
     /// # Safety
     ///
@@ -1436,7 +1603,19 @@ impl Memory {
         // What each type tried answered, for a refusal's note: empty (and unallocated) unless a
         // type failed.
         let mut answers: Vec<(u32, vk::Result)> = Vec::new();
-        for type_index in candidates(&self.types, allowed, class, self.unified) {
+        let ranked = import_candidates(&self.types, allowed, class, self.unified);
+        let first_tier = (ranked.iter())
+            .filter(|&&(_, needs_sync)| !needs_sync)
+            .count();
+        for (at, &(type_index, needs_sync)) in ranked.iter().enumerate() {
+            // The second tier opens where the first has no type, or each type of it was refused
+            // the pointer: a device that imports as before never reaches it.
+            if at == first_tier {
+                let failures: Vec<vk::Result> = answers.iter().map(|&(_, error)| error).collect();
+                if !second_tier_opens(first_tier, &failures) {
+                    break;
+                }
+            }
             let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
                 .host_pointer(pointer.as_ptr().cast());
@@ -1466,11 +1645,23 @@ impl Memory {
                     let index = self
                         .pool(Holds::Buffers, type_index)
                         .add(size, true, block, size);
-                    return Ok(self.placement((Holds::Buffers, type_index), index, 0, size, false));
+                    let mut placement =
+                        self.placement((Holds::Buffers, type_index), index, 0, size, false);
+                    if needs_sync || test_forces_noncoherent() {
+                        // SAFETY: the memory is the imported pointer's, host-visible (a type of
+                        // the second tier, or the type a test forces as one), unmapped, and
+                        // nothing uses it yet.
+                        placement.import_sync =
+                            unsafe { map_import(device, memory, pointer, type_index) };
+                    }
+                    return Ok(placement);
                 }
                 Err(error) => {
                     answers.push((type_index, error));
-                    failure = ImportFailure::Vulkan(error);
+                    // The first tier's last failure stays the answer where it had types.
+                    if at < first_tier || first_tier == 0 {
+                        failure = ImportFailure::Vulkan(error);
+                    }
                 }
             }
         }
@@ -1479,8 +1670,9 @@ impl Memory {
     }
 
     /// Say why [`Memory::import_host`] imported `size` bytes nowhere (`host_import_note.rs`): no
-    /// type of `class` among `allowed` (the common part of the types `of` the pointer and the
-    /// resource), or the answer of each type it tried, `answers`.
+    /// type among `allowed` (the common part of the types `of` the pointer and the resource), in
+    /// either tier of [`import_candidates`], or the answer of each type it tried, `answers`, with
+    /// the tier of each.
     fn note_host_refusal(
         &self,
         answers: &[(u32, vk::Result)],
@@ -1495,13 +1687,26 @@ impl Memory {
                 .collect::<Vec<_>>();
             listed.join(" ")
         };
+        // The types of each tier among `bits`.
+        let tiers = |bits: u32| {
+            let list = import_candidates(&self.types, bits, class, self.unified);
+            let tier = |second: bool| {
+                (list.iter())
+                    .filter(|&&(_, needs_sync)| needs_sync == second)
+                    .map(|&(index, _)| index)
+                    .collect::<Vec<_>>()
+            };
+            (tier(false), tier(true))
+        };
         if answers.is_empty() {
             note("no-memory-type", || {
-                let wanted = candidates(&self.types, !0, class, self.unified);
+                let (wanted, second_wanted) = tiers(!0);
+                let (first, second) = tiers(allowed);
                 format!(
                     "host-pointer types 0x{pointer_types:x}, buffer types 0x{buffer_types:x}, \
                      both 0x{allowed:x}, class {class:?} takes types {wanted:?} of [{}], \
-                     candidates []",
+                     candidates {first:?}, second tier (not coherent) takes types \
+                     {second_wanted:?}, candidates {second:?}",
                     types()
                 )
             });
@@ -1511,7 +1716,11 @@ impl Memory {
             let tried = (answers.iter())
                 .map(|&(index, result)| {
                     let flags = self.type_flags(index).map_or(0, |flags| flags.as_raw());
-                    format!("type {index} flags 0x{flags:x} {result:?}")
+                    let second = (self.type_flags(index)).is_some_and(|flags| {
+                        !flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+                    });
+                    let tier = if second { " (second tier)" } else { "" };
+                    format!("type {index} flags 0x{flags:x}{tier} {result:?}")
                 })
                 .collect::<Vec<_>>();
             format!(

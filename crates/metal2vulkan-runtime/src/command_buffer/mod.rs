@@ -578,6 +578,10 @@ pub(super) struct State {
     /// submission (`rebind::SubmittedHolds`): let go as its work completes, before its
     /// completed handlers, so a detach waiting for it goes on once its GPU work ended.
     submitted_holds: Vec<SubmittedHolds>,
+    /// The cache maintenance its buffers over host pages in memory that is not coherent need:
+    /// flushed at its first submission, invalidated at its completion (`host_sync.rs`). Empty
+    /// where the device has no such import.
+    host_sync: crate::host_sync::SyncPlan,
     /// The encoders its commit's failure failed (`commit_failed`'s, Metal's own from a render
     /// pass, or a faulted encoder's: [`State::fail`]): a submission none of whose encoders
     /// runs so is spared its rebound verdict (`first_submission.rs`).
@@ -1429,6 +1433,7 @@ impl CommandBuffer {
                 failing: Vec::new(),
                 unrunnable: BTreeSet::new(),
                 submitted_holds: Vec::new(),
+                host_sync: Default::default(),
                 failed_at_commit: None,
                 check: None,
                 checks: None,

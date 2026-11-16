@@ -66,7 +66,16 @@ fn the_probe_answers_a_line_for_each_shape_and_leaves_the_device_as_it_was() {
     for field in [" alignment=0x", " dma_buf=", " types=[0:0x"] {
         assert!(facts.contains(field), "{field}: {facts}");
     }
-    assert!(facts.ends_with(']'), "{facts}");
+    // The memory types, then how many of the probe's imports lay in a type that is not coherent:
+    // none on a device whose host-visible types are all coherent (lavapipe).
+    let (types, noncoherent) = facts
+        .rsplit_once(" noncoherent_imports=")
+        .unwrap_or_else(|| panic!("{facts}"));
+    assert!(types.ends_with(']'), "{facts}");
+    let noncoherent: u64 = noncoherent.parse().unwrap_or_else(|_| panic!("{facts}"));
+    if cfg!(m2v_cpu_icd) {
+        assert_eq!(noncoherent, 0, "{facts}");
+    }
     // A line for each shape, in order, an answer of one of three kinds.
     for (line, id) in lines[1..].iter().zip(IDS) {
         let answer = line

@@ -11,7 +11,11 @@
 //!   (`window`, `alignment`, `skipped`, `unwritable`, `superset`, `buffer`, `binding`,
 //!   `pointer-types`, `max-allocation`, `no-memory-type`, `allocate`, `bind`, `dma-buf`), and the
 //!   numbers are the ones the check compared, in hex, so a refusal is read without the code at
-//!   hand. A note is one line, at most [`LONGEST`] characters.
+//!   hand. A note is one line, at most [`LONGEST`] characters. The one note that is no refusal
+//!   is `host import unsynced at noncoherent-map: ...` ([`note_as`]): an import in memory that is
+//!   not coherent whose `vkMapMemory` failed or answered another pointer, made all the same and
+//!   used with no cache maintenance (`host_sync.rs`). `no-memory-type` and `allocate` tell both
+//!   tiers of the types an import tries (`memory.rs`'s `import_candidates`).
 //! - **Where it goes.** To the calling thread's last [`KEPT`] notes, which
 //!   [`take_host_import_notes`] drains (the caller reads them when it reports the refusal, on
 //!   the thread that made the call: every refusal is made there), and once to stderr as
@@ -117,7 +121,14 @@ pub(crate) fn one_line(text: String) -> String {
 /// gives the numbers it compared. Keeps the note on this thread ([`take_host_import_notes`]) and
 /// prints it once to stderr, as the module says.
 pub(crate) fn note(stage: &'static str, detail: impl FnOnce() -> String) {
-    let line = one_line(format!("host import refused at {stage}: {}", detail()));
+    note_as("refused", stage, detail);
+}
+
+/// [`note`] of an import that is not refused but made with a caveat: `host import <outcome> at
+/// <stage>: <numbers>`. The only one so far is `unsynced` at `noncoherent-map`: an import in
+/// memory that is not coherent whose map failed, used with no cache maintenance (`host_sync.rs`).
+pub(crate) fn note_as(outcome: &'static str, stage: &'static str, detail: impl FnOnce() -> String) {
+    let line = one_line(format!("host import {outcome} at {stage}: {}", detail()));
     // A thread that is ending keeps none.
     let _ = NOTES.try_with(|ring| ring.borrow_mut().push(line.clone()));
     let mut stderr = std::io::stderr().lock();

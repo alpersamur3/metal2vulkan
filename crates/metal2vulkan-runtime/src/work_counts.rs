@@ -190,6 +190,11 @@ pub(crate) struct Counters {
     host_keep_alives_kept: AtomicU64,
     host_keep_alives_covered: AtomicU64,
     host_mappings_queried: AtomicU64,
+    host_flushes: AtomicU64,
+    host_flush_bytes: AtomicU64,
+    host_invalidates: AtomicU64,
+    host_invalidate_bytes: AtomicU64,
+    noncoherent_imports_made: AtomicU64,
     dma_buf_imports: AtomicU64,
     dma_buf_memories_live: AtomicU64,
     dma_buf_image_memories_live: AtomicU64,
@@ -1329,6 +1334,30 @@ impl Counters {
             self.host_mappings_queried
                 .fetch_add(mappings, Ordering::Relaxed);
         }
+    }
+
+    /// `ranges` ranges of host imports in memory that is not coherent, `bytes` bytes in all,
+    /// were flushed (`host_sync.rs`): the host's writes made visible to the GPU, at a command
+    /// buffer's first submission, and the range of each written buffer cleaned just before it is
+    /// invalidated.
+    pub(crate) fn host_flushed(&self, ranges: u64, bytes: u64) {
+        self.host_flushes.fetch_add(ranges, Ordering::Relaxed);
+        self.host_flush_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// `ranges` ranges of host imports in memory that is not coherent, `bytes` bytes in all,
+    /// were invalidated (`host_sync.rs`): the GPU's writes made visible to the host, as a command
+    /// buffer completed.
+    pub(crate) fn host_invalidated(&self, ranges: u64, bytes: u64) {
+        self.host_invalidates.fetch_add(ranges, Ordering::Relaxed);
+        self.host_invalidate_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A host import was made in memory that is not coherent (`host_sync.rs`).
+    pub(crate) fn noncoherent_import_made(&self) {
+        self.noncoherent_imports_made
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// `chunks` chunks of host pages a caller's source made were imported as dma-buf memory, and
@@ -2828,6 +2857,21 @@ pub struct WorkCounts {
     /// buffer made over the same bytes as a live one, which lies in its import, asks about none.
     /// None off Linux.
     pub host_mappings_queried: u64,
+    /// Ranges of host imports in memory that is not coherent that were flushed (one call's range
+    /// each), at a command buffer's first submission and, cleaned just before an invalidation,
+    /// at its completion (`host_sync.rs`). 0 where no import lies in such memory (a Mali's
+    /// cached type), whatever the device imports.
+    pub host_flushes: u64,
+    /// The bytes of those ranges: whole atoms of each buffer's reach in its pages.
+    pub host_flush_bytes: u64,
+    /// Ranges of host imports in memory that is not coherent that were invalidated, once for each
+    /// of a command buffer's buffers the GPU may have written, when its last batch finished.
+    pub host_invalidates: u64,
+    /// The bytes of those ranges.
+    pub host_invalidate_bytes: u64,
+    /// Host imports made in a memory type that is not coherent, `unsynced` ones (whose map failed)
+    /// included, the imports made again after a release too.
+    pub noncoherent_imports_made: u64,
     /// Chunks of host pages imported as dma-buf memory from a caller's source
     /// (`HostMemory::with_dma_buf`), where the device refused the pages' pointer: no-copy
     /// buffers', heaps' and rebinds' alike, one per chunk. None where every pointer was imported.
@@ -3564,6 +3608,11 @@ impl Device {
             host_keep_alives_kept: counters.host_keep_alives_kept.load(Ordering::Relaxed),
             host_keep_alives_covered: counters.host_keep_alives_covered.load(Ordering::Relaxed),
             host_mappings_queried: counters.host_mappings_queried.load(Ordering::Relaxed),
+            host_flushes: counters.host_flushes.load(Ordering::Relaxed),
+            host_flush_bytes: counters.host_flush_bytes.load(Ordering::Relaxed),
+            host_invalidates: counters.host_invalidates.load(Ordering::Relaxed),
+            host_invalidate_bytes: counters.host_invalidate_bytes.load(Ordering::Relaxed),
+            noncoherent_imports_made: counters.noncoherent_imports_made.load(Ordering::Relaxed),
             dma_buf_imports: counters.dma_buf_imports.load(Ordering::Relaxed),
             dma_buf_memories_live: counters.dma_buf_memories_live.load(Ordering::Relaxed),
             dma_buf_image_memories_live: counters

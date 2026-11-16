@@ -119,6 +119,7 @@ mod host_memory;
 mod host_probe;
 #[cfg(unix)]
 mod host_residency;
+mod host_sync;
 mod image_barrier;
 mod image_plan;
 mod index_bounds;

@@ -377,6 +377,9 @@ pub(super) struct DeviceShared {
     pub(super) heap_keys: super::heap::HeapKeys,
     /// The buffers over host pages, and the holds of uncommitted command buffers on them.
     pub(super) rebinds: super::rebind::Rebinds,
+    /// The cache maintenance of host imports in memory that is not coherent, and its mode
+    /// (`host_sync.rs`).
+    pub(super) host_sync: super::host_sync::HostSync,
     /// The no-copy buffers by the host memory they were made over (`host_aliases.rs`).
     pub(super) aliases: super::host_aliases::HostAliases,
     /// The new textures that read zero where Metal reads its pattern, until a command observes
@@ -1659,6 +1662,7 @@ impl Device {
             interop: Interop::default(),
             heap_keys: Default::default(),
             rebinds: Default::default(),
+            host_sync: super::host_sync::HostSync::new(limits.non_coherent_atom_size),
             aliases: Default::default(),
             fresh: Default::default(),
             owners: Default::default(),

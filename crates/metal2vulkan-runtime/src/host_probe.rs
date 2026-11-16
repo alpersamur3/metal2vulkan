@@ -260,8 +260,11 @@ impl Device {
     /// cannot be run on.
     ///
     /// The first line is the importer's facts, `facts: page=0x.. alignment=0x.. dma_buf=..
-    /// types=[index:flags ...]`: the host page, the driver's import alignment, whether the device
-    /// imports dma-bufs, and the property flags of each of its memory types. Then one line for
+    /// types=[index:flags ...] noncoherent_imports=N`: the host page, the driver's import
+    /// alignment, whether the device imports dma-bufs, the property flags of each of its memory
+    /// types, and how many of the imports the probe made were in a type that is not coherent
+    /// (`WorkCounts::noncoherent_imports_made`, `host_sync.rs`: 0 where every import took a
+    /// coherent type; an `ok` line is also one that succeeded in such a type). Then one line for
     /// each of eight shapes of memory the probe maps itself, `P1` to `P8`: private and shared
     /// pages, one mapping and thirteen, the same pages twice, bytes inside an import, bytes
     /// imported again after the import went, 24 MiB. A line is `<id> <name>: ok`; or `<id> <name>:
@@ -293,6 +296,7 @@ impl Device {
             importer.imports_dma_bufs(),
             types.join(" ")
         )];
+        let noncoherent_before = self.work_counts().noncoherent_imports_made;
         // What the shapes hold: the buffers, dropped first, and the mappings.
         let mut buffers: Vec<Buffer> = Vec::new();
         let mut held: Vec<Mapping> = Vec::new();
@@ -402,6 +406,9 @@ impl Device {
         let made = large_anonymous(&mut held, unit);
         buffers.extend(shape("P8", "anonymous private, 24 MiB", made));
 
+        // The imports the shapes made in memory that is not coherent, counted while they live.
+        let noncoherent = self.work_counts().noncoherent_imports_made - noncoherent_before;
+        lines[0].push_str(&format!(" noncoherent_imports={noncoherent}"));
         // Every buffer first, then every mapping.
         drop(buffers);
         drop(held);

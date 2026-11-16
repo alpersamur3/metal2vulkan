@@ -291,6 +291,9 @@ impl State {
         let mut moved = false;
         let mut replays = false;
         let mut holds = SubmittedHolds::new(device);
+        // The device has an import in memory that is not coherent: its buffers over host pages
+        // are planned for flushing and invalidating (`host_sync.rs`); one load otherwise.
+        let sync = shared.host_sync.active();
         {
             let mut submitting = shared.rebinds.submitting();
             if buffer.reencode_pending() {
@@ -302,22 +305,36 @@ impl State {
                 ended,
                 recorded,
                 retained,
+                host_sync,
                 ..
             } = self;
+            let mut plan = sync.then_some(host_sync);
             for (at, record) in ended.iter_mut().enumerate() {
-                let found = submitting.submit(&mut record.taken, retained, &mut holds);
+                let found =
+                    submitting.submit(&mut record.taken, retained, &mut holds, plan.as_deref_mut());
                 moved |= found.moved;
                 judge(&mut verdicts, at, found.failure());
             }
             for part in recorded.iter_mut() {
                 let segments = part.segments.iter_mut().filter_map(|s| s.recorded.as_mut());
                 for done in segments {
-                    let found = submitting.submit(&mut done.taken, retained, &mut holds);
+                    let found = submitting.submit(
+                        &mut done.taken,
+                        retained,
+                        &mut holds,
+                        plan.as_deref_mut(),
+                    );
                     moved |= found.moved;
                     judge(&mut verdicts, part.encoder, found.failure());
                     replays |= !done.taken.resolved().is_empty();
                 }
             }
+        }
+        // What the commands read of host memory the CPU wrote is made visible to the GPU before
+        // any batch of the command buffer goes to a queue: once, here, with the rebind lock
+        // let go.
+        if sync {
+            self.host_sync.flush(device);
         }
         if !holds.is_empty() {
             self.submitted_holds.push(holds);
@@ -442,19 +459,34 @@ impl State {
         let range = self.batch_range(index);
         let mut later = BTreeMap::new();
         let mut holds = SubmittedHolds::new(device);
+        let sync = device.shared().host_sync.active();
         {
             let mut submitting = device.shared().rebinds.submitting();
             let State {
-                recorded, retained, ..
+                recorded,
+                retained,
+                host_sync,
+                ..
             } = self;
+            let mut plan = sync.then_some(host_sync);
             for part in &mut recorded[range.clone()] {
                 let segments = part.segments.iter_mut().filter_map(|s| s.recorded.as_mut());
                 for done in segments {
-                    let found = submitting.submit(&mut done.taken, retained, &mut holds);
+                    let found = submitting.submit(
+                        &mut done.taken,
+                        retained,
+                        &mut holds,
+                        plan.as_deref_mut(),
+                    );
                     judge(&mut later, part.encoder, found.failure());
                     done.taken.judged();
                 }
             }
+        }
+        // The segments a host step recorded since the first submission, flushed as the first
+        // submission's were (`host_sync.rs`).
+        if sync {
+            self.host_sync.flush(device);
         }
         if !holds.is_empty() {
             self.submitted_holds.push(holds);

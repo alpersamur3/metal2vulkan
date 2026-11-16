@@ -338,7 +338,7 @@ impl EncoderCore {
             kept_leases: Vec::new(),
             heaps: Vec::new(),
             holds: Holds::new(command_buffer.device()),
-            taken: Taken::default(),
+            taken: Taken::opened(shared.host_sync.active()),
             fails_command_buffer: None,
             faults: false,
             twin_writes: Vec::new(),
@@ -416,7 +416,7 @@ impl EncoderCore {
             kept_leases: Vec::new(),
             heaps: Vec::new(),
             holds: Holds::new(command_buffer.device()),
-            taken: Taken::default(),
+            taken: Taken::opened(command_buffer.device().shared().host_sync.active()),
             fails_command_buffer: None,
             faults: false,
             twin_writes: Vec::new(),
@@ -805,9 +805,15 @@ impl EncoderCore {
     /// through the resident set alone: every other key is named (`Taken`), where the device has
     /// a buffer over host pages.
     fn touch_reaching(&mut self, uses: &[Use<ResourceKey>], resident: &BTreeSet<ResourceKey>) {
-        let rebinds = self.device().shared().rebinds.any();
+        let shared = self.device().shared();
+        // The device has an import in memory that is not coherent: the keys a use writes are
+        // noted, for the invalidation of the buffers the GPU may have written (`host_sync.rs`).
+        let (rebinds, writes) = (shared.rebinds.any(), shared.host_sync.active());
         for (at, used) in uses.iter().enumerate() {
             let key = used.key;
+            if writes && !used.write.is_empty() {
+                self.taken.wrote(key);
+            }
             let named = rebinds && !resident.contains(&key);
             let before = self.touched.get(at).copied();
             if before.map(|(touched, _)| touched) != Some(key) && self.keys.insert(key) && rebinds {
@@ -827,8 +833,13 @@ impl EncoderCore {
     /// Keep `keys`, those of resources a command uses (its own uses', or its bindings', which
     /// it may not read), holding each buffer over host pages among them as `touch` does.
     pub(super) fn touch_keys(&mut self, keys: impl IntoIterator<Item = ResourceKey>) {
-        let rebinds = self.device().shared().rebinds.any();
+        let shared = self.device().shared();
+        let (rebinds, writes) = (shared.rebinds.any(), shared.host_sync.active());
         for key in keys {
+            // Of unknown access: the GPU may write it (`host_sync.rs`).
+            if writes {
+                self.taken.wrote(key);
+            }
             if self.keys.insert(key) && rebinds {
                 self.hold(key);
             }
@@ -840,10 +851,16 @@ impl EncoderCore {
     /// in, which it holds from its open (`render.rs`). Free while the device has no buffer over
     /// host pages.
     pub(super) fn hold_bytes(&mut self, keys: impl IntoIterator<Item = ResourceKey>) {
-        if !self.device().shared().rebinds.any() {
+        let shared = self.device().shared();
+        if !shared.rebinds.any() {
             return;
         }
+        let writes = shared.host_sync.active();
         for key in keys {
+            // A pass's attachments: the GPU may write them (`host_sync.rs`).
+            if writes {
+                self.taken.wrote(key);
+            }
             self.hold(key);
         }
     }
@@ -899,11 +916,16 @@ impl EncoderCore {
 
     /// Note `heaps`, which a command the encoder recorded reached through what it made resident.
     pub(super) fn touch_heaps(&mut self, heaps: impl IntoIterator<Item = Heap>) {
-        let rebinds = self.device().shared().rebinds.any();
+        let shared = self.device().shared();
+        let (rebinds, writes) = (shared.rebinds.any(), shared.host_sync.active());
         for heap in heaps {
             if !self.heaps.contains(&heap) {
                 // A heap over host pages is held as its resources' uses are.
                 let key = heap.bytes().map(|bytes| bytes.identity().key);
+                // Made resident, of unknown access: the GPU may write it (`host_sync.rs`).
+                if let Some(key) = key.filter(|_| writes) {
+                    self.taken.wrote(key);
+                }
                 if let Some(key) = key.filter(|&key| rebinds && self.keys.insert(key)) {
                     self.hold(key);
                 }

@@ -33,6 +33,7 @@ use super::host_aliases::Alias;
 use super::host_memory::{KeepAlive, Release};
 #[cfg(unix)]
 use super::host_residency::{Again, Residency};
+use super::host_sync::{ImportSync, Span};
 use super::memory::{Mapped, MemoryClass, Placement, BLOCK_BYTES};
 use super::program_objects::ProgramObject;
 use super::rebind::{ImportHold, Unexact};
@@ -1049,6 +1050,26 @@ impl HostImport {
             #[cfg(unix)]
             Objects::Releasable(residency) => residency.listing().map(ImportPages::Held),
         }
+    }
+
+    /// The range of its memory a command buffer that used it flushes at its first submission and
+    /// invalidates at its completion (`host_sync.rs`), where it lies in memory that is not
+    /// coherent and mapped: the `VkBuffer`'s whole reach, which starts `base` bytes before the
+    /// buffer's bytes and holds the pages after them it can address, rounded out to atoms of
+    /// `atom` and clipped to the memory. `None` for any other import, and while a releasable one
+    /// is released (no command reaches it then; the next one imports it again and holds it). Reads
+    /// the import without exposing it ([`HostImport::listing`]).
+    pub(super) fn sync_span(&self, atom: u64) -> Option<Span> {
+        let pages = self.listing()?;
+        let placement = &pages.memory.placement;
+        if placement.import_sync() != ImportSync::Maintained {
+            return None;
+        }
+        let start = placement
+            .offset
+            .saturating_add(pages.offset.saturating_sub(pages.base));
+        let len = pages.base.saturating_add(pages.reach);
+        Span::of(placement.memory, (start, len), (atom, placement.size()))
     }
 
     /// Keep it imported for good from now on, for `reason` (`host_residency.rs`): whether it was

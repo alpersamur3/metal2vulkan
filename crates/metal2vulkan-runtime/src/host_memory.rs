@@ -9,7 +9,12 @@
 //! - **The import.** The runtime imports the same pages, rounded out to the larger of the host page
 //!   and the device's `minImportedHostPointerAlignment` ([`import_window`]), as one dedicated
 //!   `VkDeviceMemory` of a host-visible coherent type both the pointer and the buffer allow, and
-//!   binds the buffer at the pointer's offset in them. Pages are mapped whole, so the caller's
+//!   binds the buffer at the pointer's offset in them. Where the pointer and the buffer allow no
+//!   such type (a Mali-G1-Ultra: the pointer goes to its cached type 1, which is not coherent), or
+//!   every one refused it, the import is made in a host-visible type that is not coherent, mapped
+//!   whole, and its command buffers flush it at their first submission and invalidate what the
+//!   GPU may have written at their completion (`host_sync.rs`); a device that imports as before
+//!   never does. Pages are mapped whole, so the caller's
 //!   guarantee for its bytes covers every page they touch; the GPU can reach the rest of those
 //!   pages through an out-of-range access, as on Metal. The `VkBuffer` holds the rest of the
 //!   pages from the pointer where the device's requirements of it fit them, and a copy out of

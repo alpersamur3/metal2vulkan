@@ -407,6 +407,11 @@ calls! {
     AllocateMemory => c"vkAllocateMemory",
     BindBufferMemory => c"vkBindBufferMemory",
     MapMemory => c"vkMapMemory",
+    // A host import in memory that is not coherent, maintained as its command buffers are first
+    // submitted and complete (`host_sync.rs`): the host's writes flushed to the GPU, then, cleaned
+    // again, its writes invalidated for the host.
+    FlushMappedMemoryRanges => c"vkFlushMappedMemoryRanges",
+    InvalidateMappedMemoryRanges => c"vkInvalidateMappedMemoryRanges",
     GetBufferDeviceAddress => c"vkGetBufferDeviceAddress",
     CreateImageView => c"vkCreateImageView",
     CreateBufferView => c"vkCreateBufferView",
@@ -573,7 +578,7 @@ pub(crate) const HOST_STEP: &[Call] = &[
 ];
 
 impl Call {
-    /// Its bit. The table fills 113 of the word's 128 (widened from 64): when it next outgrows the
+    /// Its bit. The table fills 118 of the word's 128 (widened from 64): when it next outgrows the
     /// word, widen the word (here, [`CALLED`], `PENDING` and the priming's calls); do not add a
     /// second table.
     pub(crate) fn bit(self) -> u128 {

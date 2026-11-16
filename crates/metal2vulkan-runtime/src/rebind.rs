@@ -65,6 +65,7 @@ use super::device::lock;
 use super::error::{invalid, Error, Problem};
 use super::heap::Heap;
 use super::host_memory::{Deallocator, HostMemory, HostRelease, KeepAlive};
+use super::host_sync::SyncPlan;
 use super::key_hash::KeyMap;
 use super::program_objects;
 use super::resource::{ObjectId, ResourceKey};
@@ -461,12 +462,15 @@ impl Submitting<'_> {
     /// buffer completes, counted in `holds` for a detach to wait for. Its named keys and
     /// resolved ranges stay for the caller. (Every key was named where the command buffer's root
     /// tables searched their own sets, past the search's capacity, which a set of any count no
-    /// longer meets.)
+    /// longer meets.) Each pages it retains is also noted in `sync`, where given (the device has
+    /// an import in memory that is not coherent), with whether the GPU may have written it, for
+    /// the cache maintenance of the command buffer's submission and completion (`host_sync.rs`).
     pub(super) fn submit(
         &mut self,
         taken: &mut Taken,
         retained: &mut Vec<Box<dyn Any + Send + Sync>>,
         holds: &mut SubmittedHolds,
+        mut sync: Option<&mut SyncPlan>,
     ) -> Found {
         let mut found = Found::default();
         for (key, pinned) in taken.pins.drain(..) {
@@ -499,6 +503,13 @@ impl Submitting<'_> {
                 entry.resident |= !moved && !detached;
                 entry.submitted += 1;
                 holds.keys.push(key);
+                // Planned for cache maintenance where the device has an import to maintain, the
+                // GPU's writes among them: a use of the key wrote or was of unknown access, or the
+                // encoder noted none (`Taken::wrote`, `Taken::opened`). The plan resolves its
+                // pages after this lock goes (`SyncPlan::flush`).
+                if let Some(plan) = sync.as_deref_mut() {
+                    plan.note(&pages, taken.blind || taken.wrote.contains(&key));
+                }
                 retained.push(Box::new(pages));
             }
         }
@@ -614,6 +625,17 @@ pub(super) struct Taken {
     /// The objects of releasable imports its blits took ([`ImportHold`]).
     imports: Vec<ImportHold>,
     named: BTreeSet<ResourceKey>,
+    /// The keys among them whose bytes the GPU may have written: a use with a write access, or a
+    /// use of unknown access (an argument table's buffer, a render pass's attachment bytes, a
+    /// heap). A buffer over host pages in memory that is not coherent is invalidated at its
+    /// command buffer's completion only if its key is here (`host_sync.rs`); recorded only while
+    /// the device has such an import. Never cleared with `named`: the submission reads it after.
+    wrote: BTreeSet<ResourceKey>,
+    /// The encoder opened before the device had an import in memory that is not coherent, so
+    /// its uses were not noted as above: every key of it counts as one the GPU may have written.
+    /// Set at its opening ([`Taken::opened`]), so on devices that never need it too, where nothing
+    /// reads it.
+    blind: bool,
     resolved: Vec<ResidentRange>,
     /// A command named a detached buffer, and the encoder recorded nothing from it on
     /// (`EncoderCore::skips`): its submission never runs.
@@ -662,6 +684,16 @@ impl ImportHold {
 }
 
 impl Taken {
+    /// What an encoder opened now takes: blind to which keys the GPU writes where the device has
+    /// no import in memory that is not coherent yet (`host_sync_active` false), since its uses
+    /// are not noted then, though a buffer it names may come to lie in one (a rebind's import).
+    pub(super) fn opened(host_sync_active: bool) -> Taken {
+        Taken {
+            blind: !host_sync_active,
+            ..Taken::default()
+        }
+    }
+
     /// Note `hold`, the objects of a releasable import a blit took.
     pub(super) fn hold_import(&mut self, hold: ImportHold) {
         self.imports.push(hold);
@@ -675,6 +707,11 @@ impl Taken {
     /// Note that a command named `key`.
     pub(super) fn name(&mut self, key: ResourceKey) {
         self.named.insert(key);
+    }
+
+    /// Note that the GPU may write the bytes of `key` (the `wrote` set).
+    pub(super) fn wrote(&mut self, key: ResourceKey) {
+        self.wrote.insert(key);
     }
 
     /// Whether a command named a buffer over host pages ([`named_pins`](Self::named_pins) holds
@@ -710,6 +747,8 @@ impl Taken {
     pub(super) fn join(&mut self, other: Taken) {
         self.pins.extend(other.pins);
         self.named.extend(other.named);
+        self.wrote.extend(other.wrote);
+        self.blind |= other.blind;
         self.resolved.extend(other.resolved);
         self.dead |= other.dead;
     }

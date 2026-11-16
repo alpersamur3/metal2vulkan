@@ -925,6 +925,21 @@ impl Primer<'_> {
                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
                 .map_err(vulkan)?;
             self.made(Call::MapMemory);
+            // The host's view of the mapped memory flushed and invalidated whole, as a host
+            // import's maintenance does over its ranges (`host_sync.rs`); a valid call on
+            // coherent memory too, where it does what the driver's cache upkeep needs.
+            let range = vk::MappedMemoryRange::default()
+                .memory(memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            device
+                .flush_mapped_memory_ranges(&[range])
+                .map_err(vulkan)?;
+            self.made(Call::FlushMappedMemoryRanges);
+            device
+                .invalidate_mapped_memory_ranges(&[range])
+                .map_err(vulkan)?;
+            self.made(Call::InvalidateMappedMemoryRanges);
             if device_addresses {
                 let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
                 device.get_buffer_device_address(&info);

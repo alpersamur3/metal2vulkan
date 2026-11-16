@@ -86,6 +86,7 @@ mod host_residency;
 mod host_step_neutrals;
 #[cfg(all(any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
 mod host_superset;
+mod host_sync;
 mod image_barriers;
 mod image_plan;
 mod inbox;

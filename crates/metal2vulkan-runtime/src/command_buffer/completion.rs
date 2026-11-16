@@ -389,6 +389,17 @@ fn finish(watch: &Watch, lists: &mut FenceLists, finished: Vec<(usize, Submitted
     else {
         return true;
     };
+    // The GPU's writes into host imports in memory that is not coherent are made visible to the
+    // host as a command buffer's last batch finishes, before anything of it is seen: its events
+    // reached below (a thread that waits on one reads the bytes next), its completed handlers,
+    // the runtime's own reads (`host_sync.rs`). One load where the device has no such import.
+    if device.shared().host_sync.active() {
+        for (_, batch) in &finished {
+            if batch.last {
+                lock(&batch.buffer.state).host_sync.complete(&device);
+            }
+        }
+    }
     // Their event signals are seen before the scheduler looks again: a batch whose submission
     // checks wait for a GPU signal to land may now go.
     for (_, batch) in &finished {
