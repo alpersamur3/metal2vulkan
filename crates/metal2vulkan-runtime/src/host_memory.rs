@@ -16,12 +16,21 @@
 //!   the buffer reads them past its length, the caller's bytes, as plain Metal reads them
 //!   (`Buffer::copy_reach`). The import is never a dedicated allocation in Vulkan's sense
 //!   (`VkMemoryDedicatedAllocateInfo`), which host memory cannot be.
+//! - **An import alignment above the host page.** Rounding the range out to it may take pages the
+//!   range does not touch. A caller's buffer (not a heap's, nor a rebind's) is then imported over
+//!   the rounding, the aligned superset ([`superset_window`]), on Linux and Android where the
+//!   process maps every page of it writable (`refuse_unwritable`), with the buffer's bytes at
+//!   their offset in it; where it does not, or the driver refuses it, the pages the range
+//!   touches are imported as dma-bufs where the caller gave a source, and else refused as below.
+//!   The pages the superset adds are not the caller's to vouch for: nothing keeps them mapped
+//!   but the caller's neighbours.
 //! - **What it refuses**, typed: a device without the extension (`Unsupported` naming it), and
 //!   what this device cannot import exactly (`Unsupported`, `not_representable`): an import
-//!   alignment above the host page whose rounding would take pages the range does not touch, an
-//!   offset in the pages that misses the buffer's memory alignment, no memory type both allow, or
-//!   a driver that refuses the pointer. Each refusal says which check refused, with its numbers
-//!   (`host_import_note.rs`, `take_host_import_notes`).
+//!   alignment above the host page whose rounding would take pages the range does not touch
+//!   (where the superset is not imported either), an offset in the pages that misses the buffer's
+//!   memory alignment, no memory type both allow, or a driver that refuses the pointer. Each
+//!   refusal says which check refused, with its numbers (`host_import_note.rs`,
+//!   `take_host_import_notes`).
 //! - **Pages the process cannot write** are refused typed on Linux, before the buffer's own import
 //!   ([`refuse_unwritable`] asks the kernel for the process's own mappings over the window, with
 //!   `PROCMAP_QUERY` on `/proc/self/maps`, a file kept open for them (`kept_maps`), or reads
@@ -373,6 +382,34 @@ pub(super) fn import_window(
     if start < page_start || window_end > page_end {
         return Err(WindowRefusal::BeyondPages);
     }
+    Ok(ImportWindow {
+        start,
+        size: window_end - start,
+        offset: pointer - start,
+    })
+}
+
+/// The aligned superset of the import of `length` bytes at `pointer`: the range rounded out to the
+/// larger of the host page and the device's import `alignment`, the pages it takes beyond those
+/// the range touches included, with the pointer's `offset` in it kept. Where `alignment` is at
+/// most the page it is [`import_window`]'s, which never takes such pages; above the page it is
+/// what a device that imports at that alignment can take of a range that [`import_window`]
+/// refuses (`WindowRefusal::BeyondPages`). The caller vouches for the bytes, not for the pages
+/// the superset adds: it imports them only where the process maps each of them, writable
+/// (`refuse_unwritable`), and that is no promise that they stay so while the import lives.
+/// Refused only past the end of the address space.
+pub(super) fn superset_window(
+    pointer: u64,
+    length: u64,
+    page: u64,
+    alignment: u64,
+) -> Result<ImportWindow, WindowRefusal> {
+    let unit = page.max(alignment).max(1);
+    let end = pointer.checked_add(length).ok_or(WindowRefusal::Overflow)?;
+    let window_end = end
+        .checked_next_multiple_of(unit)
+        .ok_or(WindowRefusal::Overflow)?;
+    let start = pointer - pointer % unit;
     Ok(ImportWindow {
         start,
         size: window_end - start,
@@ -763,6 +800,10 @@ impl Importer {
         // SAFETY: the caller's contract; the structure belongs to an enabled extension.
         unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
         let alignment = host.min_imported_host_pointer_alignment;
+        // A test makes a device that imports at a larger alignment than its driver says, to run
+        // the imports that alignment changes (`tests/host_superset.rs`).
+        #[cfg(test)]
+        let alignment = forced::alignment().unwrap_or(alignment);
         let info = vk::PhysicalDeviceExternalBufferInfo::default()
             .usage(usage)
             .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
@@ -929,6 +970,49 @@ impl Release {
             exit_guard::program_release(move || {
                 deallocator.run(|deallocator| deallocator(pointer, length));
             });
+        }
+    }
+}
+
+/// What a test forces on the devices its thread makes: an import alignment above the host page,
+/// which no driver of the machines the tests run on has (`tests/host_superset.rs`), and the
+/// measured fact that a driver's pointer imports follow their address, which their release and
+/// import again need (`host_residency.rs`) on a driver whose identity is not measured. Never
+/// compiled outside the crate's tests.
+#[cfg(test)]
+pub(crate) mod forced {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<(Option<u64>, bool)> = const { Cell::new((None, false)) };
+    }
+
+    /// The import alignment forced on this thread's new devices, if any.
+    pub(crate) fn alignment() -> Option<u64> {
+        FORCED.with(Cell::get).0
+    }
+
+    /// Whether this thread's new buffers take the driver's pointer imports to follow their
+    /// address, whatever the driver is measured to do.
+    pub(crate) fn follows() -> bool {
+        FORCED.with(Cell::get).1
+    }
+
+    /// Force `alignment` and `follows` on what this thread makes until the guard is dropped.
+    #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+    pub(crate) fn force(alignment: u64, follows: bool) -> Forced {
+        FORCED.with(|forced| forced.set((Some(alignment), follows)));
+        Forced
+    }
+
+    /// Ends the forcing when dropped.
+    #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+    pub(crate) struct Forced;
+
+    #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            FORCED.with(|forced| forced.set((None, false)));
         }
     }
 }

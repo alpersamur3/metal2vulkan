@@ -221,6 +221,9 @@ impl Again {
     ) -> Option<Again> {
         let follows = (device.properties().driver_facts)
             .contains(&DriverFact::PointerImportsFollowTheirAddress);
+        // A test takes a driver of an identity not measured to follow, for the import made again.
+        #[cfg(test)]
+        let follows = follows || crate::host_memory::forced::follows();
         follows.then(|| Again {
             device: device.clone(),
             from: AgainFrom::Pointer(ImportedAt(pointer)),

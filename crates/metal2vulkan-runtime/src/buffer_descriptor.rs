@@ -20,8 +20,8 @@ use super::heap::{Heap, HeapProblem};
 use super::host_import_note::note;
 use super::host_memory::{
     based_size, binds_in, buffer_base, import_refused, import_window, not_importable,
-    refuse_unwritable, refused, Deallocator, HostMemory, HostRelease, ImportWindow, Importer,
-    KeepAlive, Source,
+    refuse_unwritable, refused, superset_window, Deallocator, HostMemory, HostRelease,
+    ImportWindow, Importer, KeepAlive, Source, WindowRefusal,
 };
 #[cfg(unix)]
 use super::host_residency::Again;
@@ -443,7 +443,8 @@ impl Device {
             .as_ref()
             .map_err(|unsupported| Error::Unsupported(unsupported.clone()))?;
         let (pointer, source) = memory.into_parts();
-        let host = host_window(call, importer, pointer, length, source)?;
+        // Only a caller's buffer may be imported over the pages its range does not touch.
+        let host = host_window(call, importer, pointer, length, source, !of_heap)?;
         let window = host.window;
         if of_heap && window.offset != 0 {
             let alignment = importer.page.max(importer.alignment);
@@ -482,26 +483,29 @@ impl Device {
         // while idle and import them again (`host_residency.rs`), as it may its own import of
         // the pointer where the driver's pointer imports follow their address; a heap's import
         // stays.
-        let (buffer, memory, again) =
-            match unsafe { self.import_by_pointer(importer, pointer, length, host, class) }? {
-                Ok((buffer, memory)) => {
-                    #[cfg(unix)]
-                    let again = (!of_heap)
-                        .then(|| Again::pointer(self, pointer, (length, window, class)))
-                        .flatten();
-                    #[cfg(not(unix))]
-                    let again = None;
-                    (buffer, memory, again)
-                }
-                // SAFETY: as above.
-                Err(source) => unsafe {
-                    let keep = !of_heap;
-                    let window = &window;
-                    self.import_from_any(
-                        call, importer, pointer, length, window, source, class, keep,
-                    )
-                }?,
-            };
+        // The pages the import took: `window`, but where it was the aligned superset of them
+        // (`HostWindow::superset`), that, which the buffer's offset in its memory and its import
+        // made again are the superset's.
+        let (buffer, memory, taken, again) = match unsafe {
+            self.import_by_pointer(importer, pointer, length, host, class)
+        }? {
+            Ok((buffer, memory, taken)) => {
+                #[cfg(unix)]
+                let again = (!of_heap)
+                    .then(|| Again::pointer(self, pointer, (length, taken, class)))
+                    .flatten();
+                #[cfg(not(unix))]
+                let again = None;
+                (buffer, memory, taken, again)
+            }
+            // SAFETY: as above.
+            Err(source) => unsafe {
+                let keep = !of_heap;
+                let window = &window;
+                self.import_from_any(call, importer, pointer, length, window, source, class, keep)
+            }
+            .map(|(buffer, memory, again)| (buffer, memory, window, again))?,
+        };
         let (address, reserved) = match self.place_window(placement, &window, length) {
             Ok(held) => held,
             Err(error) => {
@@ -512,7 +516,7 @@ impl Device {
         let buffer = self.buffer_of(BufferParts {
             raw: buffer.raw,
             memory,
-            offset: window.offset,
+            offset: taken.offset,
             base: buffer.base,
             length,
             reach: buffer.size - buffer.base,
@@ -584,7 +588,9 @@ impl Device {
             .as_ref()
             .map_err(|unsupported| Error::Unsupported(unsupported.clone()))?;
         let (pointer, source) = memory.into_parts();
-        let host = host_window(call, importer, pointer, length, source)?;
+        // A rebind imports the pages its range touches alone: the offsets of the textures over
+        // its bytes and of the heap's images are planned at that offset (`HostWindow::superset`).
+        let host = host_window(call, importer, pointer, length, source, false)?;
         let window = host.window;
         if heap.is_some() && window.offset != 0 {
             let alignment = importer.page.max(importer.alignment);
@@ -633,7 +639,7 @@ impl Device {
                 let (host, placement, remade) = match unsafe {
                     self.import_by_pointer(importer, pointer, length, host, class)
                 }? {
-                    Ok((host, placement)) => (host, placement, Remade::default()),
+                    Ok((host, placement, _)) => (host, placement, Remade::default()),
                     // The source is called with no lock of the runtime's held (`dma_buf.rs`):
                     // the textures over detached bytes are let go of meanwhile, and must be
                     // settled again after it.
@@ -847,11 +853,13 @@ impl Device {
     }
 
     /// The pointer's import of `host`'s window ([`Device::import_pointer`]), where the device's
-    /// import alignment covers it, exactly as ever; and where the device refuses it ([`refused`]:
-    /// no window, a buffer that does not fit it, no memory type, a driver refusal) and the caller
-    /// gave a dma-buf source the device can use, the source, uncalled (`Err`), for the caller to
-    /// call with no lock of the runtime's held (`Device::import_from_source`, `dma_buf.rs`). A
-    /// refusal without such a source is the pointer's.
+    /// import alignment covers it, exactly as ever; or of its aligned superset where it does not
+    /// and the superset exists and its pages are all mapped writable ([`Device::import_superset`]);
+    /// and where the device refuses it ([`refused`]: no window, a buffer that does not fit it, no
+    /// memory type, a driver refusal) and the caller gave a dma-buf source the device can use, the
+    /// source, uncalled (`Err`), for the caller to call with no lock of the runtime's held
+    /// (`Device::import_from_source`, `dma_buf.rs`). A refusal without such a source is the
+    /// pointer's. The window the import took comes with it: the host window, or its superset.
     ///
     /// # Safety
     ///
@@ -864,21 +872,31 @@ impl Device {
         length: u64,
         host: HostWindow,
         class: MemoryClass,
-    ) -> Result<Result<(HostBuffer, Placement), Source>, Error> {
+    ) -> Result<Result<(HostBuffer, Placement, ImportWindow), Source>, Error> {
         let HostWindow {
             window,
             by_pointer,
+            superset,
             source,
         } = host;
         let refusal = match by_pointer {
             // SAFETY: the caller's.
             true => match unsafe { self.import_pointer(importer, pointer, length, &window, class) }
             {
-                Ok(imported) => return Ok(Ok(imported)),
+                Ok((buffer, placement)) => return Ok(Ok((buffer, placement, window))),
                 Err(error) if refused(&error) => error,
                 Err(error) => return Err(error),
             },
             false => {
+                if let Some(superset) = superset {
+                    // SAFETY: the caller's; the superset's pages are mapped (checked there).
+                    let taken = unsafe {
+                        self.import_superset(importer, pointer, length, &superset, class)
+                    }?;
+                    if let Some((buffer, placement)) = taken {
+                        return Ok(Ok((buffer, placement, superset)));
+                    }
+                }
                 // A gather source never has the pointer imported first; that is no refusal.
                 if !source.as_ref().is_some_and(gathers) {
                     note("skipped", || {
@@ -899,6 +917,62 @@ impl Device {
             }
         };
         source.map(Err).ok_or(refusal)
+    }
+
+    /// The pointer's import of the aligned `superset` of a no-copy buffer's pages
+    /// ([`superset_window`]), where the device's import alignment is larger than the host page and
+    /// the buffer's own pages do not fill its rounding: the buffer, with its `VkBuffer`'s bytes at
+    /// their offset in the superset, and the placement, as [`Device::import_pointer`] makes them
+    /// over `superset`. `None`, with nothing made, where the process does not map every page of
+    /// the superset writable, or the device refuses the import ([`refused`]), for the buffer's
+    /// pages to be imported otherwise or refused as before; any other failure is the call's.
+    ///
+    /// The pages the superset adds to the buffer's own are not the caller's: its contract covers
+    /// the bytes it named, and the pages stay mapped as long as the caller's neighbours let them.
+    /// The GPU touches them only through an access out of the buffer's range, as it reaches the
+    /// rest of the buffer's last page on Metal, and the driver pins them for the import's life.
+    ///
+    /// # Safety
+    ///
+    /// The pages the buffer's bytes touch are host memory of this process that stays mapped until
+    /// the placement is freed (`HostMemory::new`).
+    unsafe fn import_superset(
+        &self,
+        importer: &Importer,
+        pointer: NonNull<u8>,
+        length: u64,
+        superset: &ImportWindow,
+        class: MemoryClass,
+    ) -> Result<Option<(HostBuffer, Placement)>, Error> {
+        let said = |why: &str, error: &Error| {
+            note("superset", || {
+                format!(
+                    "the aligned window 0x{:x} size 0x{:x} (offset 0x{:x}) of the pointer 0x{:x} \
+                     of 0x{length:x} bytes, alignment 0x{:x} over host page 0x{:x}, {why}: {error}",
+                    superset.start,
+                    superset.size,
+                    superset.offset,
+                    pointer.as_ptr() as u64,
+                    importer.alignment,
+                    importer.page
+                )
+            })
+        };
+        // Every page of it, the ones the caller did not name too.
+        if let Err(error) = refuse_unwritable(superset, &self.shared().counts) {
+            said("is not all mapped and writable", &error);
+            return Ok(None);
+        }
+        // SAFETY: the caller's contract keeps the buffer's bytes mapped, and the check above
+        // found every other page of the window mapped.
+        match unsafe { self.import_pointer(importer, pointer, length, superset, class) } {
+            Ok(imported) => Ok(Some(imported)),
+            Err(error) if refused(&error) => {
+                said("was refused", &error);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The `VkBuffer` of a no-copy buffer of `length` bytes at `pointer`, made for host
@@ -1220,22 +1294,38 @@ struct HostWindow {
     /// Whether the device's import alignment covers them, so that their pointer is imported
     /// first (`VK_EXT_external_memory_host`).
     by_pointer: bool,
+    /// Where the device's import alignment does not cover them, because it is larger than the
+    /// host page and rounding the pages out to it takes pages the range does not touch: that
+    /// rounding, the aligned superset ([`superset_window`]), which is imported by the pointer
+    /// instead where the process maps each page of it writable ([`Device::import_superset`]).
+    superset: Option<ImportWindow>,
     /// The caller's dma-buf source, where it gave one and the device imports dma-bufs.
     source: Option<Source>,
 }
+
+/// Whether the runtime can tell that the process maps a window's pages writable
+/// ([`refuse_unwritable`] asks the kernel on Linux and Android, and nothing elsewhere): only then
+/// is an import taken over pages the caller did not name.
+const CHECKS_PAGES: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
 /// The host pages a no-copy object of `length` bytes at `pointer` imports on the device of
 /// `importer`, for `call`: the pages the range touches ([`import_window`]), imported by their
 /// pointer where the device's import alignment covers them, else only as a dma-buf where the
 /// caller gave a source the device can use. A source the device cannot use is dropped uncalled.
-/// Refused: memory past the address space's end (`Nil`, as Metal makes no buffer over it); a
-/// range the import alignment cannot cover, with no usable source (`Unsupported`, `HostMemory`).
+/// Where the alignment is larger than the host page and the range's pages do not fill its
+/// rounding, the rounding is the window's aligned superset ([`superset_window`]) where
+/// `overreach` allows an import over pages the range does not touch, tried by pointer before any
+/// source: the caller's buffers, not a heap's own buffer or a rebind's (whose layouts the pages
+/// the range touches fix). Refused: memory past the address space's end (`Nil`, as Metal makes no
+/// buffer over it); a range the import alignment cannot cover, with no usable source and no
+/// superset (`Unsupported`, `HostMemory`).
 fn host_window(
     call: &'static str,
     importer: &Importer,
     pointer: NonNull<u8>,
     length: u64,
     source: Option<Source>,
+    overreach: bool,
 ) -> Result<HostWindow, Error> {
     let source = source.filter(|source| usable_source(importer, source));
     let at = pointer.as_ptr() as u64;
@@ -1253,7 +1343,14 @@ fn host_window(
     let aligned = import_window(at, length, importer.page, importer.alignment);
     let gathered = source.as_ref().is_some_and(gathers);
     let by_pointer = aligned.is_ok() && !gathered;
-    if let (Err(kind), false) = (aligned, gathered) {
+    let superset = match aligned {
+        Err(WindowRefusal::BeyondPages) if overreach && CHECKS_PAGES && !gathered => {
+            superset_window(at, length, importer.page, importer.alignment).ok()
+        }
+        _ => None,
+    };
+    // The superset's own import says what refused it, where it is refused.
+    if let (Err(kind), false, None) = (aligned, gathered, superset) {
         note("alignment", || {
             format!(
                 "pointer 0x{at:x} length 0x{length:x} page 0x{:x} alignment 0x{:x}: {kind:?}",
@@ -1261,12 +1358,13 @@ fn host_window(
             )
         });
     }
-    if !by_pointer && source.is_none() {
+    if !by_pointer && source.is_none() && superset.is_none() {
         return Err(not_importable());
     }
     Ok(HostWindow {
         window,
         by_pointer,
+        superset,
         source,
     })
 }
